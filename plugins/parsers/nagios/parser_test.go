@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
@@ -31,10 +30,10 @@ func TestGetExitCode(t *testing.T) {
 		{
 			name: "unexpected error type",
 			errF: func() error {
-				return errors.New("I am not *exec.ExitError")
+				return errors.New("not *exec.ExitError")
 			},
-			expCode: 0,
-			expErr:  errors.New("expected *exec.ExitError"),
+			expCode: 3,
+			expErr:  errors.New("not *exec.ExitError"),
 		},
 	}
 
@@ -90,10 +89,11 @@ func assertEqual(t *testing.T, exp, actual []telegraf.Metric) {
 
 func TestTryAddState(t *testing.T) {
 	tests := []struct {
-		name    string
-		runErrF func() error
-		metrics []telegraf.Metric
-		assertF func(*testing.T, []telegraf.Metric, error)
+		name          string
+		runErrF       func() error
+		runErrMessage []byte
+		metrics       []telegraf.Metric
+		assertF       func(*testing.T, []telegraf.Metric)
 	}{
 		{
 			name: "should append state=0 field to existing metric",
@@ -108,7 +108,7 @@ func TestTryAddState(t *testing.T) {
 					n("nagios_state").
 					f("service_output", "OK: system working").b(),
 			},
-			assertF: func(t *testing.T, metrics []telegraf.Metric, err error) {
+			assertF: func(t *testing.T, metrics []telegraf.Metric) {
 				exp := []telegraf.Metric{
 					mb().
 						n("nagios").
@@ -119,7 +119,6 @@ func TestTryAddState(t *testing.T) {
 						f("state", 0).b(),
 				}
 				assertEqual(t, exp, metrics)
-				require.NoError(t, err)
 			},
 		},
 		{
@@ -132,7 +131,7 @@ func TestTryAddState(t *testing.T) {
 					n("nagios").
 					f("perfdata", 0).b(),
 			},
-			assertF: func(t *testing.T, metrics []telegraf.Metric, err error) {
+			assertF: func(t *testing.T, metrics []telegraf.Metric) {
 				exp := []telegraf.Metric{
 					mb().
 						n("nagios").
@@ -142,7 +141,6 @@ func TestTryAddState(t *testing.T) {
 						f("state", 0).b(),
 				}
 				assertEqual(t, exp, metrics)
-				require.NoError(t, err)
 			},
 		},
 		{
@@ -150,8 +148,8 @@ func TestTryAddState(t *testing.T) {
 			runErrF: func() error {
 				return nil
 			},
-			metrics: []telegraf.Metric{},
-			assertF: func(t *testing.T, metrics []telegraf.Metric, err error) {
+			metrics: make([]telegraf.Metric, 0),
+			assertF: func(t *testing.T, metrics []telegraf.Metric) {
 				require.Len(t, metrics, 1)
 				m := metrics[0]
 				require.Equal(t, "nagios_state", m.Name())
@@ -159,49 +157,66 @@ func TestTryAddState(t *testing.T) {
 				require.True(t, ok)
 				require.Equal(t, int64(0), s)
 				require.WithinDuration(t, time.Now().UTC(), m.Time(), 10*time.Second)
-				require.NoError(t, err)
 			},
 		},
 		{
-			name: "should return original metrics and an error",
+			name: "should return metrics with state unknown and thrown error is service_output",
 			runErrF: func() error {
 				return errors.New("non parsable error")
 			},
 			metrics: []telegraf.Metric{
 				mb().
-					n("nagios").
-					f("perfdata", 0).b(),
+					n("nagios_state").b(),
 			},
-			assertF: func(t *testing.T, metrics []telegraf.Metric, err error) {
+			assertF: func(t *testing.T, metrics []telegraf.Metric) {
 				exp := []telegraf.Metric{
 					mb().
-						n("nagios").
-						f("perfdata", 0).b(),
+						n("nagios_state").
+						f("state", 3).
+						f("service_output", "non parsable error").b(),
 				}
-				expErr := "exec: get exit code: expected *exec.ExitError"
 
 				assertEqual(t, exp, metrics)
-				require.Equal(t, expErr, err.Error())
+			},
+		},
+		{
+			name: "should return metrics with state unknown and service_output error from error message parameter",
+			runErrF: func() error {
+				return errors.New("")
+			},
+			runErrMessage: []byte("some error message"),
+			metrics: []telegraf.Metric{
+				mb().
+					n("nagios_state").b(),
+			},
+			assertF: func(t *testing.T, metrics []telegraf.Metric) {
+				exp := []telegraf.Metric{
+					mb().
+						n("nagios_state").
+						f("state", 3).
+						f("service_output", "some error message").b(),
+				}
+				assertEqual(t, exp, metrics)
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			metrics, err := TryAddState(tt.runErrF(), tt.metrics)
-			tt.assertF(t, metrics, err)
+			metrics := AddState(tt.runErrF(), tt.runErrMessage, tt.metrics)
+			tt.assertF(t, metrics)
 		})
 	}
 }
 
 func assertNagiosState(t *testing.T, m telegraf.Metric, f map[string]interface{}) {
-	assert.Equal(t, map[string]string{}, m.Tags())
-	assert.Equal(t, f, m.Fields())
+	require.Equal(t, map[string]string{}, m.Tags())
+	require.Equal(t, f, m.Fields())
 }
 
 func TestParse(t *testing.T) {
-	parser := NagiosParser{
-		MetricName: "nagios_test",
+	parser := Parser{
+		metricName: "nagios_test",
 	}
 
 	tests := []struct {
@@ -219,11 +234,11 @@ with three lines
 				require.NoError(t, err)
 				require.Len(t, metrics, 3)
 				// rta
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"unit":     "ms",
 					"perfdata": "rta",
 				}, metrics[0].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value":       float64(0.298),
 					"warning_lt":  float64(0),
 					"warning_gt":  float64(4000),
@@ -233,11 +248,11 @@ with three lines
 				}, metrics[0].Fields())
 
 				// pl
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"unit":     "%",
 					"perfdata": "pl",
 				}, metrics[1].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value":       float64(0),
 					"warning_lt":  float64(0),
 					"warning_gt":  float64(80),
@@ -260,11 +275,11 @@ with three lines
 				require.NoError(t, err)
 				require.Len(t, metrics, 2)
 				// time
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"unit":     "s",
 					"perfdata": "time",
 				}, metrics[0].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value": float64(0.008457),
 					"min":   float64(0),
 					"max":   float64(10),
@@ -282,10 +297,10 @@ with three lines
 				require.NoError(t, err)
 				require.Len(t, metrics, 2)
 				// time
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"perfdata": "time",
 				}, metrics[0].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value": float64(0.008457),
 				}, metrics[0].Fields())
 
@@ -301,10 +316,10 @@ with three lines
 				require.NoError(t, err)
 				require.Len(t, metrics, 4)
 				// load1
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"perfdata": "load1",
 				}, metrics[0].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value":       float64(0.00),
 					"warning_lt":  MinFloat64,
 					"warning_gt":  float64(4),
@@ -314,10 +329,10 @@ with three lines
 				}, metrics[0].Fields())
 
 				// load5
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"perfdata": "load5",
 				}, metrics[1].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value":       float64(0.01),
 					"warning_gt":  float64(3),
 					"warning_lt":  float64(0),
@@ -327,10 +342,10 @@ with three lines
 				}, metrics[1].Fields())
 
 				// load15
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"perfdata": "load15",
 				}, metrics[2].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value":       float64(0.05),
 					"warning_lt":  float64(0),
 					"warning_gt":  float64(2),
@@ -382,11 +397,11 @@ with three lines
 				require.NoError(t, err)
 				require.Len(t, metrics, 5)
 				// /=2643MB;5948;5958;0;5968
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"unit":     "MB",
 					"perfdata": "/",
 				}, metrics[0].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value":       float64(2643),
 					"warning_lt":  float64(0),
 					"warning_gt":  float64(5948),
@@ -397,11 +412,11 @@ with three lines
 				}, metrics[0].Fields())
 
 				// /boot=68MB;88;93;0;98
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"unit":     "MB",
 					"perfdata": "/boot",
 				}, metrics[1].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value":       float64(68),
 					"warning_lt":  float64(0),
 					"warning_gt":  float64(88),
@@ -412,11 +427,11 @@ with three lines
 				}, metrics[1].Fields())
 
 				// /home=69357MB;253404;253409;0;253414
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"unit":     "MB",
 					"perfdata": "/home",
 				}, metrics[2].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value":       float64(69357),
 					"warning_lt":  float64(0),
 					"warning_gt":  float64(253404),
@@ -427,11 +442,11 @@ with three lines
 				}, metrics[2].Fields())
 
 				// /var/log=818MB;970;975;0;980
-				assert.Equal(t, map[string]string{
+				require.Equal(t, map[string]string{
 					"unit":     "MB",
 					"perfdata": "/var/log",
 				}, metrics[3].Tags())
-				assert.Equal(t, map[string]interface{}{
+				require.Equal(t, map[string]interface{}{
 					"value":       float64(818),
 					"warning_lt":  float64(0),
 					"warning_gt":  float64(970),
@@ -503,9 +518,60 @@ func TestParseThreshold(t *testing.T) {
 	}
 
 	for i := range tests {
-		min, max, err := parseThreshold(tests[i].input)
-		require.Equal(t, tests[i].eMin, min)
-		require.Equal(t, tests[i].eMax, max)
+		vmin, vmax, err := parseThreshold(tests[i].input)
+		require.InDelta(t, tests[i].eMin, vmin, testutil.DefaultDelta)
+		require.InDelta(t, tests[i].eMax, vmax, testutil.DefaultDelta)
 		require.Equal(t, tests[i].eErr, err)
+	}
+}
+
+const benchmarkData = `DISK OK - free space: / 3326 MB (56%); | /=2643MB;5948;5958;0;5968
+/ 15272 MB (77%);
+/boot 68 MB (69%);
+`
+
+func TestBenchmarkData(t *testing.T) {
+	plugin := &Parser{}
+
+	expected := []telegraf.Metric{
+		metric.New(
+			"nagios",
+			map[string]string{
+				"perfdata": "/",
+				"unit":     "MB",
+			},
+			map[string]interface{}{
+				"critical_gt": 5958.0,
+				"critical_lt": 0.0,
+				"min":         0.0,
+				"max":         5968.0,
+				"value":       2643.0,
+				"warning_gt":  5948.0,
+				"warning_lt":  0.0,
+			},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"nagios_state",
+			map[string]string{},
+			map[string]interface{}{
+				"long_service_output": "/ 15272 MB (77%);\n/boot 68 MB (69%);",
+				"service_output":      "DISK OK - free space: / 3326 MB (56%);",
+			},
+			time.Unix(0, 0),
+		),
+	}
+
+	actual, err := plugin.Parse([]byte(benchmarkData))
+	require.NoError(t, err)
+	testutil.RequireMetricsEqual(t, expected, actual, testutil.IgnoreTime(), testutil.SortMetrics())
+}
+
+func BenchmarkParsing(b *testing.B) {
+	plugin := &Parser{}
+
+	for n := 0; n < b.N; n++ {
+		//nolint:errcheck // Benchmarking so skip the error check to avoid the unnecessary operations
+		plugin.Parse([]byte(benchmarkData))
 	}
 }

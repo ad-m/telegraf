@@ -8,6 +8,7 @@ If you're using the HTTP output, this serializer knows how to batch the metrics 
 [splunk-format]: http://dev.splunk.com/view/event-collector/SP-CAAAFDN#json
 
 An example event looks like:
+
 ```javascript
 {
   "time": 1529708430,
@@ -22,7 +23,9 @@ An example event looks like:
   }
 }
 ```
+
 In the above snippet, the following keys are dimensions:
+
 * cpu
 * dc
 * user
@@ -53,6 +56,7 @@ you can send all of your CPU stats in one JSON struct, an example event looks li
   }
 }
 ```
+
 In order to enable this mode, there's a new option `splunkmetric_multimetric` that you set in the appropriate output module you plan on using.
 
 ## Using with the HTTP output
@@ -62,53 +66,58 @@ to manage the HEC authorization, here's a sample config for an HTTP output:
 
 ```toml
 [[outputs.http]]
-   ## URL is the address to send metrics to
-   url = "https://localhost:8088/services/collector"
+  ## URL is the address to send metrics to
+  url = "https://localhost:8088/services/collector"
 
-   ## Timeout for HTTP message
-   # timeout = "5s"
+  ## Timeout for HTTP message
+  # timeout = "5s"
 
-   ## HTTP method, one of: "POST" or "PUT"
-   # method = "POST"
+  ## HTTP method, one of: "POST" or "PUT"
+  # method = "POST"
 
-   ## HTTP Basic Auth credentials
-   # username = "username"
-   # password = "pa$$word"
+  ## HTTP Basic Auth credentials
+  # username = "username"
+  # password = "pa$$word"
 
-   ## Optional TLS Config
-   # tls_ca = "/etc/telegraf/ca.pem"
-   # tls_cert = "/etc/telegraf/cert.pem"
-   # tls_key = "/etc/telegraf/key.pem"
-   ## Use TLS but skip chain & host verification
-   # insecure_skip_verify = false
+  ## Optional TLS Config
+  # tls_ca = "/etc/telegraf/ca.pem"
+  # tls_cert = "/etc/telegraf/cert.pem"
+  # tls_key = "/etc/telegraf/key.pem"
+  ## Use TLS but skip chain & host verification
+  # insecure_skip_verify = false
 
-   ## Data format to output.
-   ## Each data format has it's own unique set of configuration options, read
-   ## more about them here:
-   ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_OUTPUT.md
-   data_format = "splunkmetric"
-    ## Provides time, index, source overrides for the HEC
-   splunkmetric_hec_routing = true
-   # splunkmetric_multimetric = true
+  ## Data format to output.
+  ## Each data format has it's own unique set of configuration options, read
+  ## more about them here:
+  ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_OUTPUT.md
+  data_format = "splunkmetric"
 
-   ## Additional HTTP headers
-    [outputs.http.headers]
-   # Should be set manually to "application/json" for json data_format
-      Content-Type = "application/json"
-      Authorization = "Splunk xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-      X-Splunk-Request-Channel = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  ## Provides time, index, source overrides for the HEC
+  splunkmetric_hec_routing = true
+  # splunkmetric_multimetric = true
+  # splunkmetric_omit_event_tag = false
+
+  ## Additional HTTP headers
+  [outputs.http.headers]
+    # Should be set manually to "application/json" for json data_format
+    Content-Type = "application/json"
+    Authorization = "Splunk xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    X-Splunk-Request-Channel = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
 ## Overrides
+
 You can override the default values for the HEC token you are using by adding additional tags to the config file.
 
 The following aspects of the token can be overridden with tags:
+
 * index
 * source
 
 You can either use `[global_tags]` or using a more advanced configuration as documented [here](https://github.com/influxdata/telegraf/blob/master/docs/CONFIGURATION.md).
 
 Such as this example which overrides the index just on the cpu metric:
+
 ```toml
 [[inputs.cpu]]
   percpu = false
@@ -122,6 +131,7 @@ Such as this example which overrides the index just on the cpu metric:
 You can use the file output when running telegraf on a machine with a Splunk forwarder.
 
 A sample event when `hec_routing` is false (or unset) looks like:
+
 ```javascript
 {
     "_value": 0.6,
@@ -132,6 +142,7 @@ A sample event when `hec_routing` is false (or unset) looks like:
     "time": 1529708430
 }
 ```
+
 Data formatted in this manner can be ingested with a simple `props.conf` file that
 looks like this:
 
@@ -164,6 +175,7 @@ An example configuration of a file based output is:
    data_format = "splunkmetric"
    splunkmetric_hec_routing = false
    splunkmetric_multimetric = true
+   splunkmetric_omit_event_tag = false
 ```
 
 ## Non-numeric metric values
@@ -171,7 +183,7 @@ An example configuration of a file based output is:
 Splunk supports only numeric field values, so serializer would silently drop metrics with the string values. For some cases it is possible to workaround using ENUM processor. Example, provided below doing this for the `docker_container_health.health_status` metric:
 
 ```toml
-# splunkmetric does not support sting values
+# splunkmetric does not support string values
 [[processors.enum]]
   namepass = ["docker_container_health"]
   [[processors.enum.mapping]]
@@ -183,4 +195,3 @@ Splunk supports only numeric field values, so serializer would silently drop met
     unhealthy = 2
     none = 3
 ```
-

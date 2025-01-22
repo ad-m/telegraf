@@ -2,10 +2,12 @@
 
 The Graphite data format is translated from Telegraf Metrics using either the
 template pattern or tag support method.  You can select between the two
-methods using the [`graphite_tag_support`](#graphite-tag-support) option.  When set, the tag support
-method is used, otherwise the [Template Pattern](templates) is used.
+methods using the [`graphite_tag_support`](#graphite_tag_support) option.  When set, the tag support
+method is used, otherwise the [Template Pattern][templates] is used.
 
-### Configuration
+[templates]: /docs/TEMPLATE_PATTERN.md
+
+## Configuration
 
 ```toml
 [[outputs.file]]
@@ -33,15 +35,27 @@ method is used, otherwise the [Template Pattern](templates) is used.
   #  "host.measurement.tags.field"
   #]
 
+  ## Strict sanitization regex
+  ## This is the default sanitization regex that is used on data passed to the
+  ## graphite serializer. Users can add additional characters here if required.
+  ## Be aware that the characters, '/' '@' '*' are always replaced with '_',
+  ## '..' is replaced with '.', and '\' is removed even if added to the
+  ## following regex.
+  # graphite_strict_sanitize_regex = '[^a-zA-Z0-9-:._=\p{L}]'
+
   ## Support Graphite tags, recommended to enable when using Graphite 1.1 or later.
   # graphite_tag_support = false
-  ## Enable Graphite tags to support the full list of allowed characters
-  # graphite_tag_new_sanitize = false
+
+  ## Applied sanitization mode when graphite tag support is enabled.
+  ## * strict - uses the regex specified above
+  ## * compatible - allows for greater number of characters
+  # graphite_tag_sanitize_mode = "strict"
+
   ## Character for separating metric name and field for Graphite tags
   # graphite_separator = "."
 ```
 
-#### graphite_tag_support
+### graphite_tag_support
 
 When the `graphite_tag_support` option is enabled, the template pattern is not
 used.  Instead, tags are encoded using
@@ -52,14 +66,17 @@ added in Graphite 1.1.  The `metric_path` is a combination of the optional
 The tag `name` is reserved by Graphite, any conflicting tags and will be encoded as `_name`.
 
 **Example Conversion**:
-```
+
+```text
 cpu,cpu=cpu-total,dc=us-east-1,host=tars usage_idle=98.09,usage_user=0.89 1455320660004257758
 =>
 cpu.usage_user;cpu=cpu-total;dc=us-east-1;host=tars 0.89 1455320690
 cpu.usage_idle;cpu=cpu-total;dc=us-east-1;host=tars 98.09 1455320690
 ```
+
 With set option `graphite_separator` to "_"
-```
+
+```text
 cpu,cpu=cpu-total,dc=us-east-1,host=tars usage_idle=98.09,usage_user=0.89 1455320660004257758
 =>
 cpu_usage_user;cpu=cpu-total;dc=us-east-1;host=tars 0.89 1455320690
@@ -71,8 +88,3 @@ The `graphite_tag_sanitize_mode` option defines how we should sanitize the tag n
 When in `strict` mode Telegraf uses the same rules as metrics when not using tags.
 When in `compatible` mode Telegraf allows more characters through, and is based on the Graphite specification:
 >Tag names must have a length >= 1 and may contain any ascii characters except `;!^=`. Tag values must also have a length >= 1, they may contain any ascii characters except `;` and the first character must not be `~`. UTF-8 characters may work for names and values, but they are not well tested and it is not recommended to use non-ascii characters in metric names or tags. Metric names get indexed under the special tag name, if a metric name starts with one or multiple ~ they simply get removed from the derived tag value because the ~ character is not allowed to be in the first position of the tag value. If a metric name consists of no other characters than ~, then it is considered invalid and may get dropped.
-
-
-
-
-[templates]: /docs/TEMPLATE_PATTERN.md

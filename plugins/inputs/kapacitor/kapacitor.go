@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package kapacitor
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,40 +15,23 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 const (
 	defaultURL = "http://localhost:9092/kapacitor/v1/debug/vars"
 )
 
 type Kapacitor struct {
-	URLs    []string `toml:"urls"`
-	Timeout config.Duration
+	URLs    []string        `toml:"urls"`
+	Timeout config.Duration `toml:"timeout"`
 	tls.ClientConfig
 
 	client *http.Client
 }
 
-func (*Kapacitor) Description() string {
-	return "Read Kapacitor-formatted JSON metrics from one or more HTTP endpoints"
-}
-
 func (*Kapacitor) SampleConfig() string {
-	return `
-  ## Multiple URLs from which to read Kapacitor-formatted JSON
-  ## Default is "http://localhost:9092/kapacitor/v1/debug/vars".
-  urls = [
-    "http://localhost:9092/kapacitor/v1/debug/vars"
-  ]
-
-  ## Time limit for http requests
-  timeout = "5s"
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-`
+	return sampleConfig
 }
 
 func (k *Kapacitor) Gather(acc telegraf.Accumulator) error {
@@ -64,7 +49,7 @@ func (k *Kapacitor) Gather(acc telegraf.Accumulator) error {
 		go func(url string) {
 			defer wg.Done()
 			if err := k.gatherURL(acc, url); err != nil {
-				acc.AddError(fmt.Errorf("[url=%s]: %s", url, err))
+				acc.AddError(fmt.Errorf("[url=%s]: %w", url, err))
 			}
 		}(u)
 	}
@@ -140,11 +125,13 @@ type stats struct {
 
 // Gathers data from a particular URL
 // Parameters:
-//     acc    : The telegraf Accumulator to use
-//     url    : endpoint to send request to
+//
+//	acc    : The telegraf Accumulator to use
+//	url    : endpoint to send request to
 //
 // Returns:
-//     error: Any error that may have occurred
+//
+//	error: Any error that may have occurred
 func (k *Kapacitor) gatherURL(
 	acc telegraf.Accumulator,
 	url string,

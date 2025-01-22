@@ -1,8 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package ipset
 
 import (
 	"bufio"
 	"bytes"
+	_ "embed"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -15,36 +17,36 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-// Ipsets is a telegraf plugin to gather packets and bytes counters from ipset
+//go:embed sample.conf
+var sampleConfig string
+
+var defaultTimeout = config.Duration(time.Second)
+
+const measurement = "ipset"
+
 type Ipset struct {
-	IncludeUnmatchedSets bool
-	UseSudo              bool
-	Timeout              config.Duration
-	lister               setLister
+	IncludeUnmatchedSets bool            `toml:"include_unmatched_sets"`
+	UseSudo              bool            `toml:"use_sudo"`
+	Timeout              config.Duration `toml:"timeout"`
+	CountPerIPEntries    bool
+
+	lister        setLister
+	entriesParser ipsetEntries
 }
 
 type setLister func(Timeout config.Duration, UseSudo bool) (*bytes.Buffer, error)
 
-const measurement = "ipset"
-
-var defaultTimeout = config.Duration(time.Second)
-
-// Description returns a short description of the plugin
-func (i *Ipset) Description() string {
-	return "Gather packets and bytes counters from Linux ipsets"
+func (*Ipset) SampleConfig() string {
+	return sampleConfig
 }
 
-// SampleConfig returns sample configuration options.
-func (i *Ipset) SampleConfig() string {
-	return `
-  ## By default, we only show sets which have already matched at least 1 packet.
-  ## set include_unmatched_sets = true to gather them all.
-  include_unmatched_sets = false
-  ## Adjust your sudo settings appropriately if using this option ("sudo ipset save")
-  use_sudo = false
-  ## The default timeout of 1s for ipset execution can be overridden here:
-  # timeout = "1s"
-`
+func (*Ipset) Init() error {
+	_, err := exec.LookPath("ipset")
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (i *Ipset) Gather(acc telegraf.Accumulator) error {
@@ -56,6 +58,11 @@ func (i *Ipset) Gather(acc telegraf.Accumulator) error {
 	scanner := bufio.NewScanner(out)
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		if i.CountPerIPEntries {
+			acc.AddError(i.entriesParser.addLine(line, acc))
+		}
+
 		// Ignore sets created without the "counters" option
 		nocomment := strings.Split(line, "\"")[0]
 		if !(strings.Contains(nocomment, "packets") &&
@@ -73,21 +80,37 @@ func (i *Ipset) Gather(acc telegraf.Accumulator) error {
 				"set":  data[1],
 				"rule": data[2],
 			}
-			packetsTotal, err := strconv.ParseUint(data[4], 10, 64)
-			if err != nil {
-				acc.AddError(err)
+
+			fields := make(map[string]interface{}, 3)
+			for i, field := range data {
+				switch field {
+				case "timeout":
+					val, err := strconv.ParseUint(data[i+1], 10, 64)
+					if err != nil {
+						acc.AddError(err)
+					}
+					fields["timeout"] = val
+				case "packets":
+					val, err := strconv.ParseUint(data[i+1], 10, 64)
+					if err != nil {
+						acc.AddError(err)
+					}
+					fields["packets_total"] = val
+				case "bytes":
+					val, err := strconv.ParseUint(data[i+1], 10, 64)
+					if err != nil {
+						acc.AddError(err)
+					}
+					fields["bytes_total"] = val
+				}
 			}
-			bytesTotal, err := strconv.ParseUint(data[6], 10, 64)
-			if err != nil {
-				acc.AddError(err)
-			}
-			fields := map[string]interface{}{
-				"packets_total": packetsTotal,
-				"bytes_total":   bytesTotal,
-			}
+
 			acc.AddCounter(measurement, fields, tags)
 		}
 	}
+
+	i.entriesParser.commit(acc)
+
 	return nil
 }
 
@@ -111,7 +134,7 @@ func setList(timeout config.Duration, useSudo bool) (*bytes.Buffer, error) {
 	cmd.Stdout = &out
 	err = internal.RunTimeout(cmd, time.Duration(timeout))
 	if err != nil {
-		return &out, fmt.Errorf("error running ipset save: %s", err)
+		return &out, fmt.Errorf("error running ipset save: %w", err)
 	}
 
 	return &out, nil

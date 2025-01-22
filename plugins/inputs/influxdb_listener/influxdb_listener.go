@@ -1,11 +1,15 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package influxdb_listener
 
 import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -13,11 +17,15 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal"
-	tlsint "github.com/influxdata/telegraf/plugins/common/tls"
+	common_tls "github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/plugins/parsers/influx"
+	"github.com/influxdata/telegraf/plugins/parsers/influx/influx_upstream"
 	"github.com/influxdata/telegraf/selfstat"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 const (
 	// defaultMaxBodySize is the default maximum request body size, in bytes.
@@ -28,16 +36,19 @@ const (
 type InfluxDBListener struct {
 	ServiceAddress string `toml:"service_address"`
 	port           int
-	tlsint.ServerConfig
+	common_tls.ServerConfig
 
 	ReadTimeout        config.Duration `toml:"read_timeout"`
 	WriteTimeout       config.Duration `toml:"write_timeout"`
 	MaxBodySize        config.Size     `toml:"max_body_size"`
-	MaxLineSize        config.Size     `toml:"max_line_size"` // deprecated in 1.14; ignored
+	MaxLineSize        config.Size     `toml:"max_line_size" deprecated:"1.14.0;1.35.0;parser now handles lines of unlimited length and option is ignored"`
 	BasicUsername      string          `toml:"basic_username"`
 	BasicPassword      string          `toml:"basic_password"`
+	TokenSharedSecret  string          `toml:"token_shared_secret"`
+	TokenUsername      string          `toml:"token_username"`
 	DatabaseTag        string          `toml:"database_tag"`
 	RetentionPolicyTag string          `toml:"retention_policy_tag"`
+	ParserType         string          `toml:"parser_type"`
 
 	timeFunc influx.TimeFunc
 
@@ -61,69 +72,23 @@ type InfluxDBListener struct {
 	mux http.ServeMux
 }
 
-const sampleConfig = `
-  ## Address and port to host InfluxDB listener on
-  service_address = ":8186"
-
-  ## maximum duration before timing out read of the request
-  read_timeout = "10s"
-  ## maximum duration before timing out write of the response
-  write_timeout = "10s"
-
-  ## Maximum allowed HTTP request body size in bytes.
-  ## 0 means to use the default of 32MiB.
-  max_body_size = "32MiB"
-
-  ## Optional tag name used to store the database.
-  ## If the write has a database in the query string then it will be kept in this tag name.
-  ## This tag can be used in downstream outputs.
-  ## The default value of nothing means it will be off and the database will not be recorded.
-  # database_tag = ""
-
-  ## If set the retention policy specified in the write query will be added as
-  ## the value of this tag name.
-  # retention_policy_tag = ""
-
-  ## Set one or more allowed client CA certificate file names to
-  ## enable mutually authenticated TLS connections
-  tls_allowed_cacerts = ["/etc/telegraf/clientca.pem"]
-
-  ## Add service certificate and key
-  tls_cert = "/etc/telegraf/cert.pem"
-  tls_key = "/etc/telegraf/key.pem"
-
-  ## Optional username and password to accept for HTTP basic authentication.
-  ## You probably want to make sure you have TLS configured above for this.
-  # basic_username = "foobar"
-  # basic_password = "barfoo"
-`
-
-func (h *InfluxDBListener) SampleConfig() string {
+func (*InfluxDBListener) SampleConfig() string {
 	return sampleConfig
 }
 
-func (h *InfluxDBListener) Description() string {
-	return "Accept metrics over InfluxDB 1.x HTTP API"
-}
-
-func (h *InfluxDBListener) Gather(_ telegraf.Accumulator) error {
+func (*InfluxDBListener) Gather(telegraf.Accumulator) error {
 	return nil
 }
 
-func (h *InfluxDBListener) routes() {
-	authHandler := internal.AuthHandler(h.BasicUsername, h.BasicPassword, "influxdb",
-		func(_ http.ResponseWriter) {
-			h.authFailures.Incr(1)
-		},
-	)
-
-	h.mux.Handle("/write", authHandler(h.handleWrite()))
-	h.mux.Handle("/query", authHandler(h.handleQuery()))
-	h.mux.Handle("/ping", h.handlePing())
-	h.mux.Handle("/", authHandler(h.handleDefault()))
-}
-
 func (h *InfluxDBListener) Init() error {
+	// Check the config setting
+	if (h.BasicUsername != "" || h.BasicPassword != "") && (h.TokenSharedSecret != "" || h.TokenUsername != "") {
+		return errors.New("cannot use basic-auth and tokens at the same time")
+	}
+	if h.TokenSharedSecret != "" && h.TokenUsername == "" || h.TokenSharedSecret == "" && h.TokenUsername != "" {
+		return errors.New("neither 'token_shared_secret' nor 'token_username' can be empty for token authentication")
+	}
+
 	tags := map[string]string{
 		"address": h.ServiceAddress,
 	}
@@ -142,10 +107,6 @@ func (h *InfluxDBListener) Init() error {
 		h.MaxBodySize = config.Size(defaultMaxBodySize)
 	}
 
-	if h.MaxLineSize != 0 {
-		h.Log.Warnf("Use of deprecated configuration: 'max_line_size'; parser now handles lines of unlimited length and option is ignored")
-	}
-
 	if h.ReadTimeout < config.Duration(time.Second) {
 		h.ReadTimeout = config.Duration(time.Second * 10)
 	}
@@ -156,7 +117,6 @@ func (h *InfluxDBListener) Init() error {
 	return nil
 }
 
-// Start starts the InfluxDB listener service.
 func (h *InfluxDBListener) Start(acc telegraf.Accumulator) error {
 	h.acc = acc
 
@@ -190,7 +150,7 @@ func (h *InfluxDBListener) Start(acc telegraf.Accumulator) error {
 
 	go func() {
 		err = h.server.Serve(h.listener)
-		if err != http.ErrServerClosed {
+		if !errors.Is(err, http.ErrServerClosed) {
 			h.Log.Infof("Error serving HTTP on %s", h.ServiceAddress)
 		}
 	}()
@@ -200,12 +160,33 @@ func (h *InfluxDBListener) Start(acc telegraf.Accumulator) error {
 	return nil
 }
 
-// Stop cleans up all resources
 func (h *InfluxDBListener) Stop() {
 	err := h.server.Shutdown(context.Background())
 	if err != nil {
 		h.Log.Infof("Error shutting down HTTP server: %v", err.Error())
 	}
+}
+
+func (h *InfluxDBListener) routes() {
+	var authHandler func(http.Handler) http.Handler
+	if h.TokenSharedSecret != "" {
+		authHandler = internal.JWTAuthHandler(h.TokenSharedSecret, h.TokenUsername,
+			func(_ http.ResponseWriter) {
+				h.authFailures.Incr(1)
+			},
+		)
+	} else {
+		authHandler = internal.BasicAuthHandler(h.BasicUsername, h.BasicPassword, "influxdb",
+			func(_ http.ResponseWriter) {
+				h.authFailures.Incr(1)
+			},
+		)
+	}
+
+	h.mux.Handle("/write", authHandler(h.handleWrite()))
+	h.mux.Handle("/query", authHandler(h.handleQuery()))
+	h.mux.Handle("/ping", h.handlePing())
+	h.mux.Handle("/", authHandler(h.handleDefault()))
 }
 
 func (h *InfluxDBListener) ServeHTTP(res http.ResponseWriter, req *http.Request) {
@@ -215,7 +196,7 @@ func (h *InfluxDBListener) ServeHTTP(res http.ResponseWriter, req *http.Request)
 }
 
 func (h *InfluxDBListener) handleQuery() http.HandlerFunc {
-	return func(res http.ResponseWriter, req *http.Request) {
+	return func(res http.ResponseWriter, _ *http.Request) {
 		defer h.queriesServed.Incr(1)
 		// Deliver a dummy response to the query endpoint, as some InfluxDB
 		// clients test endpoint availability with a query
@@ -239,7 +220,10 @@ func (h *InfluxDBListener) handlePing() http.HandlerFunc {
 		if verbose != "" && verbose != "0" && verbose != "false" {
 			res.Header().Set("Content-Type", "application/json")
 			res.WriteHeader(http.StatusOK)
-			b, _ := json.Marshal(map[string]string{"version": "1.0"}) // based on header set above
+			b, err := json.Marshal(map[string]string{"version": "1.0"}) // based on header set above
+			if err != nil {
+				h.Log.Debugf("error marshalling json in handlePing: %v", err)
+			}
 			if _, err := res.Write(b); err != nil {
 				h.Log.Debugf("error writing result in handlePing: %v", err)
 			}
@@ -258,112 +242,237 @@ func (h *InfluxDBListener) handleDefault() http.HandlerFunc {
 
 func (h *InfluxDBListener) handleWrite() http.HandlerFunc {
 	return func(res http.ResponseWriter, req *http.Request) {
-		defer h.writesServed.Incr(1)
-		// Check that the content length is not too large for us to handle.
-		if req.ContentLength > int64(h.MaxBodySize) {
-			if err := tooLarge(res); err != nil {
-				h.Log.Debugf("error in too-large: %v", err)
-			}
-			return
+		if h.ParserType == "upstream" {
+			h.handleWriteUpstreamParser(res, req)
+		} else {
+			h.handleWriteInternalParser(res, req)
 		}
+	}
+}
 
-		db := req.URL.Query().Get("db")
-		rp := req.URL.Query().Get("rp")
-
-		body := req.Body
-		body = http.MaxBytesReader(res, body, int64(h.MaxBodySize))
-		// Handle gzip request bodies
-		if req.Header.Get("Content-Encoding") == "gzip" {
-			var err error
-			body, err = gzip.NewReader(body)
-			if err != nil {
-				h.Log.Debugf("Error decompressing request body: %v", err.Error())
-				if err := badRequest(res, err.Error()); err != nil {
-					h.Log.Debugf("error in bad-request: %v", err)
-				}
-				return
-			}
-			defer body.Close()
+func (h *InfluxDBListener) handleWriteInternalParser(res http.ResponseWriter, req *http.Request) {
+	defer h.writesServed.Incr(1)
+	// Check that the content length is not too large for us to handle.
+	if req.ContentLength > int64(h.MaxBodySize) {
+		if err := tooLarge(res); err != nil {
+			h.Log.Debugf("error in too-large: %v", err)
 		}
+		return
+	}
 
-		parser := influx.NewStreamParser(body)
-		parser.SetTimeFunc(h.timeFunc)
+	db := req.URL.Query().Get("db")
+	rp := req.URL.Query().Get("rp")
 
-		precisionStr := req.URL.Query().Get("precision")
-		if precisionStr != "" {
-			precision := getPrecisionMultiplier(precisionStr)
-			parser.SetTimePrecision(precision)
-		}
-
-		var m telegraf.Metric
+	body := req.Body
+	body = http.MaxBytesReader(res, body, int64(h.MaxBodySize))
+	// Handle gzip request bodies
+	if req.Header.Get("Content-Encoding") == "gzip" {
 		var err error
-		var parseErrorCount int
-		var lastPos int
-		var firstParseErrorStr string
-		for {
-			select {
-			case <-req.Context().Done():
-				// Shutting down before parsing is finished.
-				res.WriteHeader(http.StatusServiceUnavailable)
-				return
-			default:
-			}
-
-			m, err = parser.Next()
-			pos := parser.Position()
-			h.bytesRecv.Incr(int64(pos - lastPos))
-			lastPos = pos
-
-			// Continue parsing metrics even if some are malformed
-			if parseErr, ok := err.(*influx.ParseError); ok {
-				parseErrorCount++
-				errStr := parseErr.Error()
-				if firstParseErrorStr == "" {
-					firstParseErrorStr = errStr
-				}
-				continue
-			} else if err != nil {
-				// Either we're exiting cleanly (err ==
-				// influx.EOF) or there's an unexpected error
-				break
-			}
-
-			if h.DatabaseTag != "" && db != "" {
-				m.AddTag(h.DatabaseTag, db)
-			}
-
-			if h.RetentionPolicyTag != "" && rp != "" {
-				m.AddTag(h.RetentionPolicyTag, rp)
-			}
-
-			h.acc.AddMetric(m)
-		}
-		if err != influx.EOF {
-			h.Log.Debugf("Error parsing the request body: %v", err.Error())
+		body, err = gzip.NewReader(body)
+		if err != nil {
+			h.Log.Debugf("Error decompressing request body: %v", err.Error())
 			if err := badRequest(res, err.Error()); err != nil {
 				h.Log.Debugf("error in bad-request: %v", err)
 			}
 			return
 		}
-		if parseErrorCount > 0 {
-			var partialErrorString string
-			switch parseErrorCount {
-			case 1:
-				partialErrorString = firstParseErrorStr
-			case 2:
-				partialErrorString = fmt.Sprintf("%s (and 1 other parse error)", firstParseErrorStr)
-			default:
-				partialErrorString = fmt.Sprintf("%s (and %d other parse errors)", firstParseErrorStr, parseErrorCount-1)
+		defer body.Close()
+	}
+
+	parser := influx.NewStreamParser(body)
+	parser.SetTimeFunc(h.timeFunc)
+
+	precisionStr := req.URL.Query().Get("precision")
+	if precisionStr != "" {
+		precision := getPrecisionMultiplier(precisionStr)
+		parser.SetTimePrecision(precision)
+	}
+
+	var m telegraf.Metric
+	var err error
+	var parseErrorCount int
+	var lastPos int
+	var firstParseErrorStr string
+	for {
+		select {
+		case <-req.Context().Done():
+			// Shutting down before parsing is finished.
+			res.WriteHeader(http.StatusServiceUnavailable)
+			return
+		default:
+		}
+
+		m, err = parser.Next()
+		pos := parser.Position()
+		h.bytesRecv.Incr(int64(pos - lastPos))
+		lastPos = pos
+
+		// Continue parsing metrics even if some are malformed
+		var parseErr *influx.ParseError
+		if errors.As(err, &parseErr) {
+			parseErrorCount++
+			errStr := parseErr.Error()
+			if firstParseErrorStr == "" {
+				firstParseErrorStr = errStr
 			}
-			if err := partialWrite(res, partialErrorString); err != nil {
-				h.Log.Debugf("error in partial-write: %v", err)
+			continue
+		} else if err != nil {
+			// Either we're exiting cleanly (err ==
+			// influx.EOF) or there's an unexpected error
+			break
+		}
+
+		if h.DatabaseTag != "" && db != "" {
+			m.AddTag(h.DatabaseTag, db)
+		}
+
+		if h.RetentionPolicyTag != "" && rp != "" {
+			m.AddTag(h.RetentionPolicyTag, rp)
+		}
+
+		h.acc.AddMetric(m)
+	}
+	if !errors.Is(err, influx.EOF) {
+		h.Log.Debugf("Error parsing the request body: %v", err.Error())
+		if err := badRequest(res, err.Error()); err != nil {
+			h.Log.Debugf("error in bad-request: %v", err)
+		}
+		return
+	}
+	if parseErrorCount > 0 {
+		var partialErrorString string
+		switch parseErrorCount {
+		case 1:
+			partialErrorString = firstParseErrorStr
+		case 2:
+			partialErrorString = firstParseErrorStr + " (and 1 other parse error)"
+		default:
+			partialErrorString = fmt.Sprintf("%s (and %d other parse errors)", firstParseErrorStr, parseErrorCount-1)
+		}
+		if err := partialWrite(res, partialErrorString); err != nil {
+			h.Log.Debugf("error in partial-write: %v", err)
+		}
+		return
+	}
+
+	// http request success
+	res.WriteHeader(http.StatusNoContent)
+}
+
+func (h *InfluxDBListener) handleWriteUpstreamParser(res http.ResponseWriter, req *http.Request) {
+	defer h.writesServed.Incr(1)
+	// Check that the content length is not too large for us to handle.
+	if req.ContentLength > int64(h.MaxBodySize) {
+		if err := tooLarge(res); err != nil {
+			h.Log.Debugf("error in too-large: %v", err)
+		}
+		return
+	}
+
+	db := req.URL.Query().Get("db")
+	rp := req.URL.Query().Get("rp")
+
+	body := req.Body
+	body = http.MaxBytesReader(res, body, int64(h.MaxBodySize))
+	// Handle gzip request bodies
+	if req.Header.Get("Content-Encoding") == "gzip" {
+		var err error
+		body, err = gzip.NewReader(body)
+		if err != nil {
+			h.Log.Debugf("Error decompressing request body: %v", err.Error())
+			if err := badRequest(res, err.Error()); err != nil {
+				h.Log.Debugf("error in bad-request: %v", err)
 			}
 			return
 		}
-
-		// http request success
-		res.WriteHeader(http.StatusNoContent)
+		defer body.Close()
 	}
+
+	parser := influx_upstream.NewStreamParser(body)
+	parser.SetTimeFunc(influx_upstream.TimeFunc(h.timeFunc))
+
+	precisionStr := req.URL.Query().Get("precision")
+	if precisionStr != "" {
+		precision := getPrecisionMultiplier(precisionStr)
+		err := parser.SetTimePrecision(precision)
+		if err != nil {
+			h.Log.Debugf("error in upstream parser: %v", err)
+			if err := badRequest(res, err.Error()); err != nil {
+				h.Log.Debugf("error in bad-request: %v", err)
+			}
+			return
+		}
+	}
+
+	if req.ContentLength >= 0 {
+		h.bytesRecv.Incr(req.ContentLength)
+	}
+
+	var m telegraf.Metric
+	var err error
+	var parseErrorCount int
+	var firstParseErrorStr string
+	for {
+		select {
+		case <-req.Context().Done():
+			// Shutting down before parsing is finished.
+			res.WriteHeader(http.StatusServiceUnavailable)
+			return
+		default:
+		}
+
+		m, err = parser.Next()
+
+		// Continue parsing metrics even if some are malformed
+		var parseErr *influx_upstream.ParseError
+		if errors.As(err, &parseErr) {
+			parseErrorCount++
+			errStr := parseErr.Error()
+			if firstParseErrorStr == "" {
+				firstParseErrorStr = errStr
+			}
+			continue
+		} else if err != nil {
+			// Either we're exiting cleanly (err ==
+			// influx.ErrEOF) or there's an unexpected error
+			break
+		}
+
+		if h.DatabaseTag != "" && db != "" {
+			m.AddTag(h.DatabaseTag, db)
+		}
+
+		if h.RetentionPolicyTag != "" && rp != "" {
+			m.AddTag(h.RetentionPolicyTag, rp)
+		}
+
+		h.acc.AddMetric(m)
+	}
+	if !errors.Is(err, io.EOF) {
+		h.Log.Debugf("Error parsing the request body: %v", err.Error())
+		if err := badRequest(res, err.Error()); err != nil {
+			h.Log.Debugf("error in bad-request: %v", err)
+		}
+		return
+	}
+	if parseErrorCount > 0 {
+		var partialErrorString string
+		switch parseErrorCount {
+		case 1:
+			partialErrorString = firstParseErrorStr
+		case 2:
+			partialErrorString = firstParseErrorStr + " (and 1 other parse error)"
+		default:
+			partialErrorString = fmt.Sprintf("%s (and %d other parse errors)", firstParseErrorStr, parseErrorCount-1)
+		}
+		if err := partialWrite(res, partialErrorString); err != nil {
+			h.Log.Debugf("error in partial-write: %v", err)
+		}
+		return
+	}
+
+	// http request success
+	res.WriteHeader(http.StatusNoContent)
 }
 
 func tooLarge(res http.ResponseWriter) error {
@@ -383,7 +492,7 @@ func badRequest(res http.ResponseWriter, errString string) error {
 	}
 	res.Header().Set("X-Influxdb-Error", errString)
 	res.WriteHeader(http.StatusBadRequest)
-	_, err := res.Write([]byte(fmt.Sprintf(`{"error":%q}`, errString)))
+	_, err := fmt.Fprintf(res, `{"error":%q}`, errString)
 	return err
 }
 
@@ -392,7 +501,7 @@ func partialWrite(res http.ResponseWriter, errString string) error {
 	res.Header().Set("X-Influxdb-Version", "1.0")
 	res.Header().Set("X-Influxdb-Error", errString)
 	res.WriteHeader(http.StatusBadRequest)
-	_, err := res.Write([]byte(fmt.Sprintf(`{"error":%q}`, errString)))
+	_, err := fmt.Fprintf(res, `{"error":%q}`, errString)
 	return err
 }
 

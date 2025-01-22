@@ -13,12 +13,19 @@ import (
 func TestAlignedTicker(t *testing.T) {
 	interval := 10 * time.Second
 	jitter := 0 * time.Second
+	offset := 0 * time.Second
 
-	clock := clock.NewMock()
-	since := clock.Now()
+	clk := clock.NewMock()
+	since := clk.Now()
 	until := since.Add(60 * time.Second)
 
-	ticker := newAlignedTicker(since, interval, jitter, clock)
+	ticker := &AlignedTicker{
+		interval:    interval,
+		jitter:      jitter,
+		offset:      offset,
+		minInterval: interval / 100,
+	}
+	ticker.start(since, clk)
 	defer ticker.Stop()
 
 	expected := []time.Time{
@@ -30,15 +37,13 @@ func TestAlignedTicker(t *testing.T) {
 		time.Unix(60, 0).UTC(),
 	}
 
-	actual := []time.Time{}
+	actual := make([]time.Time, 0)
+	clk.Add(10 * time.Second)
+	for !clk.Now().After(until) {
+		tm := <-ticker.Elapsed()
+		actual = append(actual, tm.UTC())
 
-	clock.Add(10 * time.Second)
-	for !clock.Now().After(until) {
-		select {
-		case tm := <-ticker.Elapsed():
-			actual = append(actual, tm.UTC())
-		}
-		clock.Add(10 * time.Second)
+		clk.Add(10 * time.Second)
 	}
 
 	require.Equal(t, expected, actual)
@@ -47,43 +52,94 @@ func TestAlignedTicker(t *testing.T) {
 func TestAlignedTickerJitter(t *testing.T) {
 	interval := 10 * time.Second
 	jitter := 5 * time.Second
+	offset := 0 * time.Second
 
-	clock := clock.NewMock()
-	since := clock.Now()
+	clk := clock.NewMock()
+	since := clk.Now()
 	until := since.Add(61 * time.Second)
 
-	ticker := newAlignedTicker(since, interval, jitter, clock)
+	ticker := &AlignedTicker{
+		interval:    interval,
+		jitter:      jitter,
+		offset:      offset,
+		minInterval: interval / 100,
+	}
+	ticker.start(since, clk)
 	defer ticker.Stop()
 
 	last := since
-	for !clock.Now().After(until) {
+	for !clk.Now().After(until) {
 		select {
 		case tm := <-ticker.Elapsed():
 			dur := tm.Sub(last)
 			// 10s interval + 5s jitter + up to 1s late firing.
-			require.True(t, dur <= 16*time.Second, "expected elapsed time to be less than 16 seconds, but was %s", dur)
-			require.True(t, dur >= 5*time.Second, "expected elapsed time to be more than 5 seconds, but was %s", dur)
+			require.LessOrEqual(t, dur, 16*time.Second, "expected elapsed time to be less than 16 seconds, but was %s", dur)
+			require.GreaterOrEqual(t, dur, 5*time.Second, "expected elapsed time to be more than 5 seconds, but was %s", dur)
 			last = last.Add(interval)
 		default:
 		}
-		clock.Add(1 * time.Second)
+		clk.Add(1 * time.Second)
 	}
+}
+
+func TestAlignedTickerOffset(t *testing.T) {
+	interval := 10 * time.Second
+	jitter := 0 * time.Second
+	offset := 3 * time.Second
+
+	clk := clock.NewMock()
+	since := clk.Now()
+	until := since.Add(61 * time.Second)
+
+	ticker := &AlignedTicker{
+		interval:    interval,
+		jitter:      jitter,
+		offset:      offset,
+		minInterval: interval / 100,
+	}
+	ticker.start(since, clk)
+	defer ticker.Stop()
+
+	expected := []time.Time{
+		time.Unix(13, 0).UTC(),
+		time.Unix(23, 0).UTC(),
+		time.Unix(33, 0).UTC(),
+		time.Unix(43, 0).UTC(),
+		time.Unix(53, 0).UTC(),
+	}
+
+	actual := make([]time.Time, 0)
+	clk.Add(10*time.Second + offset)
+	for !clk.Now().After(until) {
+		tm := <-ticker.Elapsed()
+		actual = append(actual, tm.UTC())
+		clk.Add(10 * time.Second)
+	}
+
+	require.Equal(t, expected, actual)
 }
 
 func TestAlignedTickerMissedTick(t *testing.T) {
 	interval := 10 * time.Second
 	jitter := 0 * time.Second
+	offset := 0 * time.Second
 
-	clock := clock.NewMock()
-	since := clock.Now()
+	clk := clock.NewMock()
+	since := clk.Now()
 
-	ticker := newAlignedTicker(since, interval, jitter, clock)
+	ticker := &AlignedTicker{
+		interval:    interval,
+		jitter:      jitter,
+		offset:      offset,
+		minInterval: interval / 100,
+	}
+	ticker.start(since, clk)
 	defer ticker.Stop()
 
-	clock.Add(25 * time.Second)
+	clk.Add(25 * time.Second)
 	tm := <-ticker.Elapsed()
 	require.Equal(t, time.Unix(10, 0).UTC(), tm.UTC())
-	clock.Add(5 * time.Second)
+	clk.Add(5 * time.Second)
 	tm = <-ticker.Elapsed()
 	require.Equal(t, time.Unix(30, 0).UTC(), tm.UTC())
 }
@@ -91,13 +147,19 @@ func TestAlignedTickerMissedTick(t *testing.T) {
 func TestUnalignedTicker(t *testing.T) {
 	interval := 10 * time.Second
 	jitter := 0 * time.Second
+	offset := 0 * time.Second
 
-	clock := clock.NewMock()
-	clock.Add(1 * time.Second)
-	since := clock.Now()
+	clk := clock.NewMock()
+	clk.Add(1 * time.Second)
+	since := clk.Now()
 	until := since.Add(60 * time.Second)
 
-	ticker := newUnalignedTicker(interval, jitter, clock)
+	ticker := &UnalignedTicker{
+		interval: interval,
+		jitter:   jitter,
+		offset:   offset,
+	}
+	ticker.start(clk)
 	defer ticker.Stop()
 
 	expected := []time.Time{
@@ -110,14 +172,14 @@ func TestUnalignedTicker(t *testing.T) {
 		time.Unix(61, 0).UTC(),
 	}
 
-	actual := []time.Time{}
-	for !clock.Now().After(until) {
+	actual := make([]time.Time, 0)
+	for !clk.Now().After(until) {
 		select {
 		case tm := <-ticker.Elapsed():
 			actual = append(actual, tm.UTC())
 		default:
 		}
-		clock.Add(10 * time.Second)
+		clk.Add(10 * time.Second)
 	}
 
 	require.Equal(t, expected, actual)
@@ -126,13 +188,19 @@ func TestUnalignedTicker(t *testing.T) {
 func TestRollingTicker(t *testing.T) {
 	interval := 10 * time.Second
 	jitter := 0 * time.Second
+	offset := 0 * time.Second
 
-	clock := clock.NewMock()
-	clock.Add(1 * time.Second)
-	since := clock.Now()
+	clk := clock.NewMock()
+	clk.Add(1 * time.Second)
+	since := clk.Now()
 	until := since.Add(60 * time.Second)
 
-	ticker := newUnalignedTicker(interval, jitter, clock)
+	ticker := &UnalignedTicker{
+		interval: interval,
+		jitter:   jitter,
+		offset:   offset,
+	}
+	ticker.start(clk)
 	defer ticker.Stop()
 
 	expected := []time.Time{
@@ -145,14 +213,14 @@ func TestRollingTicker(t *testing.T) {
 		time.Unix(61, 0).UTC(),
 	}
 
-	actual := []time.Time{}
-	for !clock.Now().After(until) {
+	actual := make([]time.Time, 0)
+	for !clk.Now().After(until) {
 		select {
 		case tm := <-ticker.Elapsed():
 			actual = append(actual, tm.UTC())
 		default:
 		}
-		clock.Add(10 * time.Second)
+		clk.Add(10 * time.Second)
 	}
 
 	require.Equal(t, expected, actual)
@@ -167,15 +235,48 @@ func TestAlignedTickerDistribution(t *testing.T) {
 
 	interval := 10 * time.Second
 	jitter := 5 * time.Second
+	offset := 0 * time.Second
 
-	clock := clock.NewMock()
-	since := clock.Now()
+	clk := clock.NewMock()
+	since := clk.Now()
 
-	ticker := newAlignedTicker(since, interval, jitter, clock)
+	ticker := &AlignedTicker{
+		interval:    interval,
+		jitter:      jitter,
+		offset:      offset,
+		minInterval: interval / 100,
+	}
+	ticker.start(since, clk)
 	defer ticker.Stop()
-	dist := simulatedDist(ticker, clock)
+	dist := simulatedDist(ticker, clk)
 	printDist(dist)
-	require.True(t, 350 < dist.Count)
+	require.Less(t, 350, dist.Count)
+	require.True(t, 9 < dist.Mean() && dist.Mean() < 11)
+}
+
+func TestAlignedTickerDistributionWithOffset(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+
+	interval := 10 * time.Second
+	jitter := 5 * time.Second
+	offset := 3 * time.Second
+
+	clk := clock.NewMock()
+	since := clk.Now()
+
+	ticker := &AlignedTicker{
+		interval:    interval,
+		jitter:      jitter,
+		offset:      offset,
+		minInterval: interval / 100,
+	}
+	ticker.start(since, clk)
+	defer ticker.Stop()
+	dist := simulatedDist(ticker, clk)
+	printDist(dist)
+	require.Less(t, 350, dist.Count)
 	require.True(t, 9 < dist.Mean() && dist.Mean() < 11)
 }
 
@@ -188,14 +289,44 @@ func TestUnalignedTickerDistribution(t *testing.T) {
 
 	interval := 10 * time.Second
 	jitter := 5 * time.Second
+	offset := 0 * time.Second
 
-	clock := clock.NewMock()
+	clk := clock.NewMock()
 
-	ticker := newUnalignedTicker(interval, jitter, clock)
+	ticker := &UnalignedTicker{
+		interval: interval,
+		jitter:   jitter,
+		offset:   offset,
+	}
+	ticker.start(clk)
 	defer ticker.Stop()
-	dist := simulatedDist(ticker, clock)
+	dist := simulatedDist(ticker, clk)
 	printDist(dist)
-	require.True(t, 350 < dist.Count)
+	require.Less(t, 350, dist.Count)
+	require.True(t, 9 < dist.Mean() && dist.Mean() < 11)
+}
+
+func TestUnalignedTickerDistributionWithOffset(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+
+	interval := 10 * time.Second
+	jitter := 5 * time.Second
+	offset := 3 * time.Second
+
+	clk := clock.NewMock()
+
+	ticker := &UnalignedTicker{
+		interval: interval,
+		jitter:   jitter,
+		offset:   offset,
+	}
+	ticker.start(clk)
+	defer ticker.Stop()
+	dist := simulatedDist(ticker, clk)
+	printDist(dist)
+	require.Less(t, 350, dist.Count)
 	require.True(t, 9 < dist.Mean() && dist.Mean() < 11)
 }
 
@@ -209,13 +340,17 @@ func TestRollingTickerDistribution(t *testing.T) {
 	interval := 10 * time.Second
 	jitter := 5 * time.Second
 
-	clock := clock.NewMock()
+	clk := clock.NewMock()
 
-	ticker := newRollingTicker(interval, jitter, clock)
+	ticker := &RollingTicker{
+		interval: interval,
+		jitter:   jitter,
+	}
+	ticker.start(clk)
 	defer ticker.Stop()
-	dist := simulatedDist(ticker, clock)
+	dist := simulatedDist(ticker, clk)
 	printDist(dist)
-	require.True(t, 275 < dist.Count)
+	require.Less(t, 275, dist.Count)
 	require.True(t, 12 < dist.Mean() && 13 > dist.Mean())
 }
 
@@ -237,14 +372,14 @@ func printDist(dist Distribution) {
 	fmt.Printf("Count: %d\n", dist.Count)
 }
 
-func simulatedDist(ticker Ticker, clock *clock.Mock) Distribution {
-	since := clock.Now()
+func simulatedDist(ticker Ticker, clk *clock.Mock) Distribution {
+	since := clk.Now()
 	until := since.Add(1 * time.Hour)
 
 	var dist Distribution
 
-	last := clock.Now()
-	for !clock.Now().After(until) {
+	last := clk.Now()
+	for !clk.Now().After(until) {
 		select {
 		case tm := <-ticker.Elapsed():
 			dist.Buckets[tm.Second()]++
@@ -252,7 +387,7 @@ func simulatedDist(ticker Ticker, clock *clock.Mock) Distribution {
 			dist.Waittime += tm.Sub(last).Seconds()
 			last = tm
 		default:
-			clock.Add(1 * time.Second)
+			clk.Add(1 * time.Second)
 		}
 	}
 

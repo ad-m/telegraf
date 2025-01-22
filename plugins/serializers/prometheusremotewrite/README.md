@@ -9,21 +9,21 @@ somewhat, but not fully, mitigated by using outputs that support writing in
 "batch format".  When using histogram and summary types, it is recommended to
 use only the `prometheus_client` output.
 
-### Configuration
+## Configuration
 
 ```toml
 [[outputs.http]]
   ## URL is the address to send metrics to
   url = "https://cortex/api/prom/push"
-  
+
   ## Optional TLS Config
   tls_ca = "/etc/telegraf/ca.pem"
   tls_cert = "/etc/telegraf/cert.pem"
   tls_key = "/etc/telegraf/key.pem"
-  
+
   ## Data format to output.
   data_format = "prometheusremotewrite"
-  
+
   [outputs.http.headers]
      Content-Type = "application/x-protobuf"
      Content-Encoding = "snappy"
@@ -42,3 +42,4 @@ it is not included in the final metric name.
 Prometheus labels are produced for each tag.
 
 **Note:** String fields are ignored and do not produce Prometheus metrics.
+Set **log_level** to `trace` to see all serialization issues.

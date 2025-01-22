@@ -1,12 +1,15 @@
 package override
 
 import (
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
-	"github.com/stretchr/testify/assert"
+	"github.com/influxdata/telegraf/testutil"
 )
 
 func createTestMetric() telegraf.Metric {
@@ -18,8 +21,8 @@ func createTestMetric() telegraf.Metric {
 	return m
 }
 
-func calculateProcessedTags(processor Override, metric telegraf.Metric) map[string]string {
-	processed := processor.Apply(metric)
+func calculateProcessedTags(processor Override, m telegraf.Metric) map[string]string {
+	processed := processor.Apply(m)
 	return processed[0].Tags()
 }
 
@@ -29,8 +32,8 @@ func TestRetainsTags(t *testing.T) {
 	tags := calculateProcessedTags(processor, createTestMetric())
 
 	value, present := tags["metric_tag"]
-	assert.True(t, present, "Tag of metric was not present")
-	assert.Equal(t, "from_metric", value, "Value of Tag was changed")
+	require.True(t, present, "Tag of metric was not present")
+	require.Equal(t, "from_metric", value, "Value of Tag was changed")
 }
 
 func TestAddTags(t *testing.T) {
@@ -39,9 +42,9 @@ func TestAddTags(t *testing.T) {
 	tags := calculateProcessedTags(processor, createTestMetric())
 
 	value, present := tags["added_tag"]
-	assert.True(t, present, "Additional Tag of metric was not present")
-	assert.Equal(t, "from_config", value, "Value of Tag was changed")
-	assert.Equal(t, 3, len(tags), "Should have one previous and two added tags.")
+	require.True(t, present, "Additional Tag of metric was not present")
+	require.Equal(t, "from_config", value, "Value of Tag was changed")
+	require.Len(t, tags, 3, "Should have one previous and two added tags.")
 }
 
 func TestOverwritesPresentTagValues(t *testing.T) {
@@ -50,9 +53,9 @@ func TestOverwritesPresentTagValues(t *testing.T) {
 	tags := calculateProcessedTags(processor, createTestMetric())
 
 	value, present := tags["metric_tag"]
-	assert.True(t, present, "Tag of metric was not present")
-	assert.Equal(t, 1, len(tags), "Should only have one tag.")
-	assert.Equal(t, "from_config", value, "Value of Tag was not changed")
+	require.True(t, present, "Tag of metric was not present")
+	require.Len(t, tags, 1, "Should only have one tag.")
+	require.Equal(t, "from_config", value, "Value of Tag was not changed")
 }
 
 func TestOverridesName(t *testing.T) {
@@ -60,7 +63,7 @@ func TestOverridesName(t *testing.T) {
 
 	processed := processor.Apply(createTestMetric())
 
-	assert.Equal(t, "overridden", processed[0].Name(), "Name was not overridden")
+	require.Equal(t, "overridden", processed[0].Name(), "Name was not overridden")
 }
 
 func TestNamePrefix(t *testing.T) {
@@ -68,7 +71,7 @@ func TestNamePrefix(t *testing.T) {
 
 	processed := processor.Apply(createTestMetric())
 
-	assert.Equal(t, "Pre-m1", processed[0].Name(), "Prefix was not applied")
+	require.Equal(t, "Pre-m1", processed[0].Name(), "Prefix was not applied")
 }
 
 func TestNameSuffix(t *testing.T) {
@@ -76,5 +79,86 @@ func TestNameSuffix(t *testing.T) {
 
 	processed := processor.Apply(createTestMetric())
 
-	assert.Equal(t, "m1-suff", processed[0].Name(), "Suffix was not applied")
+	require.Equal(t, "m1-suff", processed[0].Name(), "Suffix was not applied")
+}
+func TestTracking(t *testing.T) {
+	// Setup raw input and expected output
+	inputRaw := []telegraf.Metric{
+		metric.New(
+			"zero_uint64",
+			map[string]string{},
+			map[string]interface{}{"value": uint64(3)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"zero_int64",
+			map[string]string{},
+			map[string]interface{}{"value": int64(4)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"zero_float",
+			map[string]string{},
+			map[string]interface{}{"value": float64(5.5)},
+			time.Unix(0, 0),
+		),
+	}
+
+	expected := []telegraf.Metric{
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": uint64(3)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": int64(4)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": float64(5.5)},
+			time.Unix(0, 0),
+		),
+	}
+
+	// Create fake notification for testing
+	var mu sync.Mutex
+	delivered := make([]telegraf.DeliveryInfo, 0, len(inputRaw))
+	notify := func(di telegraf.DeliveryInfo) {
+		mu.Lock()
+		defer mu.Unlock()
+		delivered = append(delivered, di)
+	}
+
+	// Convert raw input to tracking metric
+	input := make([]telegraf.Metric, 0, len(inputRaw))
+	for _, m := range inputRaw {
+		tm, _ := metric.WithTracking(m, notify)
+		input = append(input, tm)
+	}
+
+	// Prepare and start the plugin
+	plugin := &Override{
+		NameOverride: "test",
+	}
+
+	// Process expected metrics and compare with resulting metrics
+	actual := plugin.Apply(input...)
+	testutil.RequireMetricsEqual(t, expected, actual)
+
+	// Simulate output acknowledging delivery
+	for _, m := range actual {
+		m.Accept()
+	}
+
+	// Check delivery
+	require.Eventuallyf(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(input) == len(delivered)
+	}, time.Second, 100*time.Millisecond, "%d delivered but %d expected", len(delivered), len(expected))
 }

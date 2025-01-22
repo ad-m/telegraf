@@ -1,10 +1,34 @@
 # Warp10 Output Plugin
 
-The `warp10` output plugin writes metrics to [Warp 10][].
+This plugin writes metrics to the [Warp 10][warp10] service.
 
-### Configuration
+⭐ Telegraf v1.14.0
+🏷️ cloud, datastore
+💻 all
 
-```toml
+[warp10]: https://www.warp10.io
+
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
+
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Secret-store support
+
+This plugin supports secrets from secret-stores for the `token` option.
+See the [secret-store documentation][SECRETSTORE] for more details on how
+to use them.
+
+[SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
+
+## Configuration
+
+```toml @sample.conf
+# Write metrics to Warp 10
 [[outputs.warp10]]
   # Prefix to add to the measurement.
   prefix = "telegraf."
@@ -32,7 +56,7 @@ The `warp10` output plugin writes metrics to [Warp 10][].
   # insecure_skip_verify = false
 ```
 
-### Output Format
+## Output Format
 
 Metrics are converted and sent using the [Geo Time Series][] (GTS) input format.
 
@@ -46,5 +70,4 @@ string types directly.  Unsigned integer fields will be capped to the largest
 
 Timestamps are sent in microsecond precision.
 
-[Warp 10]: https://www.warp10.io
 [Geo Time Series]: https://www.warp10.io/content/03_Documentation/03_Interacting_with_Warp_10/03_Ingesting_data/02_GTS_input_format

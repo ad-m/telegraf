@@ -1,6 +1,7 @@
 package apcupsd
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"net"
@@ -15,7 +16,6 @@ import (
 
 func TestApcupsdDocs(_ *testing.T) {
 	apc := &ApcUpsd{}
-	apc.Description()
 	apc.SampleConfig()
 }
 
@@ -45,22 +45,34 @@ func listen(ctx context.Context, t *testing.T, out [][]byte) (string, error) {
 					return
 				}
 				defer conn.Close()
-				require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Second)))
+
+				if err = conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+					t.Error(err)
+					return
+				}
 
 				in := make([]byte, 128)
 				n, err := conn.Read(in)
-				require.NoError(t, err, "failed to read from connection")
+				if err != nil {
+					t.Errorf("Failed to read to connection: %v", err)
+					return
+				}
 
 				status := []byte{0, 6, 's', 't', 'a', 't', 'u', 's'}
 				want, got := status, in[:n]
-				require.Equal(t, want, got)
+				if !bytes.Equal(want, got) {
+					t.Errorf("expected %q, got %q", want, got)
+					return
+				}
 
 				// Run against test function and append EOF to end of output bytes
 				out = append(out, []byte{0, 0})
 
 				for _, o := range out {
-					_, err := conn.Write(o)
-					require.NoError(t, err, "failed to write to connection")
+					if _, err := conn.Write(o); err != nil {
+						t.Errorf("Failed to write to connection: %v", err)
+						return
+					}
 				}
 			}()
 		}
@@ -128,21 +140,24 @@ func TestApcupsdGather(t *testing.T) {
 					"model":    "Model 12345",
 				},
 				fields: map[string]interface{}{
-					"status_flags":            uint64(8),
-					"battery_charge_percent":  float64(0),
-					"battery_voltage":         float64(0),
-					"input_frequency":         float64(0),
-					"input_voltage":           float64(0),
-					"internal_temp":           float64(0),
-					"load_percent":            float64(13),
-					"output_voltage":          float64(0),
-					"time_left_ns":            int64(2790000000000),
-					"time_on_battery_ns":      int64(0),
-					"nominal_input_voltage":   float64(230),
-					"nominal_battery_voltage": float64(12),
-					"nominal_power":           865,
-					"firmware":                "857.L3 .I USB FW:L3",
-					"battery_date":            "2016-09-06",
+					"status_flags":                  uint64(8),
+					"input_voltage":                 float64(0),
+					"load_percent":                  float64(13),
+					"battery_charge_percent":        float64(0),
+					"time_left_ns":                  int64(2790000000000),
+					"output_voltage":                float64(0),
+					"internal_temp":                 float64(0),
+					"battery_voltage":               float64(0),
+					"input_frequency":               float64(0),
+					"time_on_battery_ns":            int64(0),
+					"cumulative_time_on_battery_ns": int64(85000000000),
+					"nominal_input_voltage":         float64(230),
+					"nominal_battery_voltage":       float64(12),
+					"nominal_power":                 865,
+					"firmware":                      "857.L3 .I USB FW:L3",
+					"battery_date":                  "2016-09-06",
+					"last_transfer":                 "Low line voltage",
+					"number_transfers":              1,
 				},
 				out: genOutput,
 			},
@@ -198,11 +213,13 @@ func genOutput() [][]byte {
 		"MODEL    : Model 12345",
 		"DATE     : 2016-09-06 22:13:28 -0400",
 		"HOSTNAME : example",
-		"LOADPCT  :  13.0 Percent Load Capacity",
+		"LOADPCT  : 13.0 Percent Load Capacity",
 		"BATTDATE : 2016-09-06",
-		"TIMELEFT :  46.5 Minutes",
+		"TIMELEFT : 46.5 Minutes",
 		"TONBATT  : 0 seconds",
-		"NUMXFERS : 0",
+		"CUMONBATT: 85 seconds",
+		"LASTXFER : Low line voltage",
+		"NUMXFERS : 1",
 		"SELFTEST : NO",
 		"NOMINV   : 230 Volts",
 		"NOMBATTV : 12.0 Volts",
@@ -211,11 +228,10 @@ func genOutput() [][]byte {
 		"ALARMDEL : Low Battery",
 	}
 
-	var out [][]byte
+	out := make([][]byte, 0, 2*len(kvs))
 	for _, kv := range kvs {
 		lenb, kvb := kvBytes(kv)
-		out = append(out, lenb)
-		out = append(out, kvb)
+		out = append(out, lenb, kvb)
 	}
 
 	return out
@@ -226,11 +242,10 @@ func genBadOutput() [][]byte {
 		"STATFLAG : 0x08Status Flag",
 	}
 
-	var out [][]byte
+	out := make([][]byte, 0, 2*len(kvs))
 	for _, kv := range kvs {
 		lenb, kvb := kvBytes(kv)
-		out = append(out, lenb)
-		out = append(out, kvb)
+		out = append(out, lenb, kvb)
 	}
 
 	return out

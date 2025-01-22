@@ -1,51 +1,66 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package fail2ban
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
 	"os/exec"
-	"strings"
-
 	"strconv"
+	"strings"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 var (
-	execCommand = exec.Command // execCommand is used to mock commands in tests.
+	execCommand    = exec.Command // execCommand is used to mock commands in tests.
+	metricsTargets = []struct {
+		target string
+		field  string
+	}{
+		{
+			target: "Currently failed:",
+			field:  "failed",
+		},
+		{
+			target: "Currently banned:",
+			field:  "banned",
+		},
+	}
 )
 
+const cmd = "fail2ban-client"
+
 type Fail2ban struct {
+	UseSudo bool   `toml:"use_sudo"`
+	Socket  string `toml:"socket"`
 	path    string
-	UseSudo bool
 }
 
-var sampleConfig = `
-  ## Use sudo to run fail2ban-client
-  use_sudo = false
-`
-
-var metricsTargets = []struct {
-	target string
-	field  string
-}{
-	{
-		target: "Currently failed:",
-		field:  "failed",
-	},
-	{
-		target: "Currently banned:",
-		field:  "banned",
-	},
-}
-
-func (f *Fail2ban) Description() string {
-	return "Read metrics from fail2ban."
-}
-
-func (f *Fail2ban) SampleConfig() string {
+func (*Fail2ban) SampleConfig() string {
 	return sampleConfig
+}
+
+func (f *Fail2ban) Init() error {
+	// Set defaults
+	if f.path == "" {
+		path, err := exec.LookPath(cmd)
+		if err != nil {
+			return fmt.Errorf("looking up %q failed: %w", cmd, err)
+		}
+		f.path = path
+	}
+
+	// Check parameters
+	if f.path == "" {
+		return fmt.Errorf("%q not found", cmd)
+	}
+
+	return nil
 }
 
 func (f *Fail2ban) Gather(acc telegraf.Accumulator) error {
@@ -54,19 +69,22 @@ func (f *Fail2ban) Gather(acc telegraf.Accumulator) error {
 	}
 
 	name := f.path
-	var arg []string
+	var args []string
 
 	if f.UseSudo {
 		name = "sudo"
-		arg = append(arg, f.path)
+		args = append(args, f.path)
 	}
 
-	args := append(arg, "status")
+	if f.Socket != "" {
+		args = append(args, "--socket", f.Socket)
+	}
+	args = append(args, "status")
 
 	cmd := execCommand(name, args...)
 	out, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("failed to run command %s: %s - %s", strings.Join(cmd.Args, " "), err, string(out))
+		return fmt.Errorf("failed to run command %q: %w - %s", strings.Join(cmd.Args, " "), err, string(out))
 	}
 	lines := strings.Split(string(out), "\n")
 	const targetString = "Jail list:"
@@ -82,12 +100,15 @@ func (f *Fail2ban) Gather(acc telegraf.Accumulator) error {
 	}
 
 	for _, jail := range jails {
+		// Skip over empty jails
+		if jail == "" {
+			continue
+		}
 		fields := make(map[string]interface{})
-		args := append(arg, "status", jail)
-		cmd := execCommand(name, args...)
+		cmd := execCommand(name, append(args, jail)...)
 		out, err := cmd.Output()
 		if err != nil {
-			return fmt.Errorf("failed to run command %s: %s - %s", strings.Join(cmd.Args, " "), err, string(out))
+			return fmt.Errorf("failed to run command %q: %w - %s", strings.Join(cmd.Args, " "), err, string(out))
 		}
 
 		lines := strings.Split(string(out), "\n")
@@ -119,13 +140,7 @@ func extractCount(line string) (string, int) {
 }
 
 func init() {
-	f := Fail2ban{}
-	path, _ := exec.LookPath("fail2ban-client")
-	if len(path) > 0 {
-		f.path = path
-	}
 	inputs.Add("fail2ban", func() telegraf.Input {
-		f := f
-		return &f
+		return &Fail2ban{}
 	})
 }

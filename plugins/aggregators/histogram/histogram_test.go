@@ -5,21 +5,31 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/assert"
 )
 
 type fields map[string]interface{}
 type tags map[string]string
 
 // NewTestHistogram creates new test histogram aggregation with specified config
-func NewTestHistogram(cfg []config, reset bool, cumulative bool) telegraf.Aggregator {
+func NewTestHistogram(cfg []bucketConfig, reset, cumulative, pushOnlyOnUpdate bool) telegraf.Aggregator {
+	return NewTestHistogramWithExpirationInterval(cfg, reset, cumulative, pushOnlyOnUpdate, 0)
+}
+
+func NewTestHistogramWithExpirationInterval(
+	cfg []bucketConfig, reset, cumulative, pushOnlyOnUpdate bool, expirationInterval config.Duration,
+) telegraf.Aggregator {
 	htm := NewHistogramAggregator()
 	htm.Configs = cfg
 	htm.ResetBuckets = reset
 	htm.Cumulative = cumulative
+	htm.ExpirationInterval = expirationInterval
+	htm.PushOnlyOnUpdate = pushOnlyOnUpdate
 
 	return htm
 }
@@ -71,9 +81,9 @@ func BenchmarkApply(b *testing.B) {
 
 // TestHistogram tests metrics for one period and for one field
 func TestHistogram(t *testing.T) {
-	var cfg []config
-	cfg = append(cfg, config{Metric: "first_metric_name", Fields: []string{"a"}, Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}})
-	histogram := NewTestHistogram(cfg, false, true)
+	var cfg []bucketConfig
+	cfg = append(cfg, bucketConfig{Metric: "first_metric_name", Fields: []string{"a"}, Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}})
+	histogram := NewTestHistogram(cfg, false, true, false)
 
 	acc := &testutil.Accumulator{}
 
@@ -82,9 +92,7 @@ func TestHistogram(t *testing.T) {
 	histogram.Add(firstMetric2)
 	histogram.Push(acc)
 
-	if len(acc.Metrics) != 6 {
-		assert.Fail(t, "Incorrect number of metrics")
-	}
+	require.Len(t, acc.Metrics, 6, "Incorrect number of metrics")
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketRightTag: "0"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketRightTag: "10"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2)}, tags{bucketRightTag: "20"})
@@ -93,11 +101,11 @@ func TestHistogram(t *testing.T) {
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2)}, tags{bucketRightTag: bucketPosInf})
 }
 
-// TestHistogramNonCumulative tests metrics for one period and for one field
-func TestHistogramNonCumulative(t *testing.T) {
-	var cfg []config
-	cfg = append(cfg, config{Metric: "first_metric_name", Fields: []string{"a"}, Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}})
-	histogram := NewTestHistogram(cfg, false, false)
+// TestHistogram tests metrics for one period, for one field and push only on histogram update
+func TestHistogramPushOnUpdate(t *testing.T) {
+	var cfg []bucketConfig
+	cfg = append(cfg, bucketConfig{Metric: "first_metric_name", Fields: []string{"a"}, Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}})
+	histogram := NewTestHistogram(cfg, false, true, true)
 
 	acc := &testutil.Accumulator{}
 
@@ -106,9 +114,43 @@ func TestHistogramNonCumulative(t *testing.T) {
 	histogram.Add(firstMetric2)
 	histogram.Push(acc)
 
-	if len(acc.Metrics) != 6 {
-		assert.Fail(t, "Incorrect number of metrics")
-	}
+	require.Len(t, acc.Metrics, 6, "Incorrect number of metrics")
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketRightTag: "0"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketRightTag: "10"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2)}, tags{bucketRightTag: "20"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2)}, tags{bucketRightTag: "30"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2)}, tags{bucketRightTag: "40"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2)}, tags{bucketRightTag: bucketPosInf})
+
+	acc.ClearMetrics()
+	histogram.Push(acc)
+	require.Empty(t, acc.Metrics, "Incorrect number of metrics")
+	histogram.Add(firstMetric2)
+	histogram.Push(acc)
+
+	require.Len(t, acc.Metrics, 6, "Incorrect number of metrics")
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketRightTag: "0"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketRightTag: "10"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(3)}, tags{bucketRightTag: "20"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(3)}, tags{bucketRightTag: "30"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(3)}, tags{bucketRightTag: "40"})
+	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(3)}, tags{bucketRightTag: bucketPosInf})
+}
+
+// TestHistogramNonCumulative tests metrics for one period and for one field
+func TestHistogramNonCumulative(t *testing.T) {
+	var cfg []bucketConfig
+	cfg = append(cfg, bucketConfig{Metric: "first_metric_name", Fields: []string{"a"}, Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}})
+	histogram := NewTestHistogram(cfg, false, false, false)
+
+	acc := &testutil.Accumulator{}
+
+	histogram.Add(firstMetric1)
+	histogram.Reset()
+	histogram.Add(firstMetric2)
+	histogram.Push(acc)
+
+	require.Len(t, acc.Metrics, 6, "Incorrect number of metrics")
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketLeftTag: bucketNegInf, bucketRightTag: "0"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketLeftTag: "0", bucketRightTag: "10"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2)}, tags{bucketLeftTag: "10", bucketRightTag: "20"})
@@ -119,9 +161,9 @@ func TestHistogramNonCumulative(t *testing.T) {
 
 // TestHistogramWithReset tests metrics for one period and for one field, with reset between metrics adding
 func TestHistogramWithReset(t *testing.T) {
-	var cfg []config
-	cfg = append(cfg, config{Metric: "first_metric_name", Fields: []string{"a"}, Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}})
-	histogram := NewTestHistogram(cfg, true, true)
+	var cfg []bucketConfig
+	cfg = append(cfg, bucketConfig{Metric: "first_metric_name", Fields: []string{"a"}, Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}})
+	histogram := NewTestHistogram(cfg, true, true, false)
 
 	acc := &testutil.Accumulator{}
 
@@ -130,9 +172,7 @@ func TestHistogramWithReset(t *testing.T) {
 	histogram.Add(firstMetric2)
 	histogram.Push(acc)
 
-	if len(acc.Metrics) != 6 {
-		assert.Fail(t, "Incorrect number of metrics")
-	}
+	require.Len(t, acc.Metrics, 6, "Incorrect number of metrics")
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketRightTag: "0"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0)}, tags{bucketRightTag: "10"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(1)}, tags{bucketRightTag: "20"})
@@ -143,10 +183,11 @@ func TestHistogramWithReset(t *testing.T) {
 
 // TestHistogramWithAllFields tests two metrics for one period and for all fields
 func TestHistogramWithAllFields(t *testing.T) {
-	var cfg []config
-	cfg = append(cfg, config{Metric: "first_metric_name", Buckets: []float64{0.0, 15.5, 20.0, 30.0, 40.0}})
-	cfg = append(cfg, config{Metric: "second_metric_name", Buckets: []float64{0.0, 4.0, 10.0, 23.0, 30.0}})
-	histogram := NewTestHistogram(cfg, false, true)
+	cfg := []bucketConfig{
+		{Metric: "first_metric_name", Buckets: []float64{0.0, 15.5, 20.0, 30.0, 40.0}},
+		{Metric: "second_metric_name", Buckets: []float64{0.0, 4.0, 10.0, 23.0, 30.0}},
+	}
+	histogram := NewTestHistogram(cfg, false, true, false)
 
 	acc := &testutil.Accumulator{}
 
@@ -155,31 +196,77 @@ func TestHistogramWithAllFields(t *testing.T) {
 	histogram.Add(secondMetric)
 	histogram.Push(acc)
 
-	if len(acc.Metrics) != 12 {
-		assert.Fail(t, "Incorrect number of metrics")
-	}
-
+	require.Len(t, acc.Metrics, 12, "Incorrect number of metrics")
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketRightTag: "0"})
-	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(1), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketRightTag: "15.5"})
+	assertContainsTaggedField(
+		t,
+		acc,
+		"first_metric_name",
+		fields{"a_bucket": int64(1), "b_bucket": int64(0), "c_bucket": int64(0)},
+		tags{bucketRightTag: "15.5"},
+	)
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketRightTag: "20"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketRightTag: "30"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2), "b_bucket": int64(1), "c_bucket": int64(1)}, tags{bucketRightTag: "40"})
-	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2), "b_bucket": int64(1), "c_bucket": int64(1)}, tags{bucketRightTag: bucketPosInf})
+	assertContainsTaggedField(
+		t,
+		acc,
+		"first_metric_name",
+		fields{"a_bucket": int64(2), "b_bucket": int64(1), "c_bucket": int64(1)},
+		tags{bucketRightTag: bucketPosInf},
+	)
 
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketRightTag: "0"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketRightTag: "4"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketRightTag: "10"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketRightTag: "23"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketRightTag: "30"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(1), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketRightTag: bucketPosInf})
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "0"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "4"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "10"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "23"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "30"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(1), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: bucketPosInf},
+	)
 }
 
 // TestHistogramWithAllFieldsNonCumulative tests two metrics for one period and for all fields
 func TestHistogramWithAllFieldsNonCumulative(t *testing.T) {
-	var cfg []config
-	cfg = append(cfg, config{Metric: "first_metric_name", Buckets: []float64{0.0, 15.5, 20.0, 30.0, 40.0}})
-	cfg = append(cfg, config{Metric: "second_metric_name", Buckets: []float64{0.0, 4.0, 10.0, 23.0, 30.0}})
-	histogram := NewTestHistogram(cfg, false, false)
+	cfg := []bucketConfig{
+		{Metric: "first_metric_name", Buckets: []float64{0.0, 15.5, 20.0, 30.0, 40.0}},
+		{Metric: "second_metric_name", Buckets: []float64{0.0, 4.0, 10.0, 23.0, 30.0}},
+	}
+	histogram := NewTestHistogram(cfg, false, false, false)
 
 	acc := &testutil.Accumulator{}
 
@@ -188,31 +275,100 @@ func TestHistogramWithAllFieldsNonCumulative(t *testing.T) {
 	histogram.Add(secondMetric)
 	histogram.Push(acc)
 
-	if len(acc.Metrics) != 12 {
-		assert.Fail(t, "Incorrect number of metrics")
-	}
+	require.Len(t, acc.Metrics, 12, "Incorrect number of metrics")
+	assertContainsTaggedField(
+		t,
+		acc,
+		"first_metric_name",
+		fields{"a_bucket": int64(0), "b_bucket": int64(0), "c_bucket": int64(0)},
+		tags{bucketLeftTag: bucketNegInf, bucketRightTag: "0"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"first_metric_name",
+		fields{"a_bucket": int64(1), "b_bucket": int64(0), "c_bucket": int64(0)},
+		tags{bucketLeftTag: "0", bucketRightTag: "15.5"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"first_metric_name",
+		fields{"a_bucket": int64(1), "b_bucket": int64(0), "c_bucket": int64(0)},
+		tags{bucketLeftTag: "15.5", bucketRightTag: "20"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"first_metric_name",
+		fields{"a_bucket": int64(0), "b_bucket": int64(0), "c_bucket": int64(0)},
+		tags{bucketLeftTag: "20", bucketRightTag: "30"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"first_metric_name",
+		fields{"a_bucket": int64(0), "b_bucket": int64(1), "c_bucket": int64(1)},
+		tags{bucketLeftTag: "30", bucketRightTag: "40"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"first_metric_name",
+		fields{"a_bucket": int64(0), "b_bucket": int64(0), "c_bucket": int64(0)},
+		tags{bucketLeftTag: "40", bucketRightTag: bucketPosInf},
+	)
 
-	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketLeftTag: bucketNegInf, bucketRightTag: "0"})
-	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(1), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketLeftTag: "0", bucketRightTag: "15.5"})
-	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(1), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketLeftTag: "15.5", bucketRightTag: "20"})
-	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketLeftTag: "20", bucketRightTag: "30"})
-	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0), "b_bucket": int64(1), "c_bucket": int64(1)}, tags{bucketLeftTag: "30", bucketRightTag: "40"})
-	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(0), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketLeftTag: "40", bucketRightTag: bucketPosInf})
-
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketLeftTag: bucketNegInf, bucketRightTag: "0"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketLeftTag: "0", bucketRightTag: "4"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketLeftTag: "4", bucketRightTag: "10"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketLeftTag: "10", bucketRightTag: "23"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketLeftTag: "23", bucketRightTag: "30"})
-	assertContainsTaggedField(t, acc, "second_metric_name", fields{"a_bucket": int64(1), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)}, tags{bucketLeftTag: "30", bucketRightTag: bucketPosInf})
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketLeftTag: bucketNegInf, bucketRightTag: "0"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketLeftTag: "0", bucketRightTag: "4"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketLeftTag: "4", bucketRightTag: "10"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketLeftTag: "10", bucketRightTag: "23"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketLeftTag: "23", bucketRightTag: "30"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(1), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketLeftTag: "30", bucketRightTag: bucketPosInf},
+	)
 }
 
 // TestHistogramWithTwoPeriodsAndAllFields tests two metrics getting added with a push/reset in between (simulates
 // getting added in different periods) for all fields
 func TestHistogramWithTwoPeriodsAndAllFields(t *testing.T) {
-	var cfg []config
-	cfg = append(cfg, config{Metric: "first_metric_name", Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}})
-	histogram := NewTestHistogram(cfg, false, true)
+	var cfg []bucketConfig
+	cfg = append(cfg, bucketConfig{Metric: "first_metric_name", Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}})
+	histogram := NewTestHistogram(cfg, false, true, false)
 
 	acc := &testutil.Accumulator{}
 	histogram.Add(firstMetric1)
@@ -234,14 +390,20 @@ func TestHistogramWithTwoPeriodsAndAllFields(t *testing.T) {
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketRightTag: "20"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2), "b_bucket": int64(0), "c_bucket": int64(0)}, tags{bucketRightTag: "30"})
 	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2), "b_bucket": int64(1), "c_bucket": int64(1)}, tags{bucketRightTag: "40"})
-	assertContainsTaggedField(t, acc, "first_metric_name", fields{"a_bucket": int64(2), "b_bucket": int64(1), "c_bucket": int64(1)}, tags{bucketRightTag: bucketPosInf})
+	assertContainsTaggedField(
+		t,
+		acc,
+		"first_metric_name",
+		fields{"a_bucket": int64(2), "b_bucket": int64(1), "c_bucket": int64(1)},
+		tags{bucketRightTag: bucketPosInf},
+	)
 }
 
 // TestWrongBucketsOrder tests the calling panic with incorrect order of buckets
 func TestWrongBucketsOrder(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
-			assert.Equal(
+			require.Equal(
 				t,
 				"histogram buckets must be in increasing order: 90.00 >= 20.00, metrics: first_metric_name, field: a",
 				fmt.Sprint(r),
@@ -249,10 +411,78 @@ func TestWrongBucketsOrder(t *testing.T) {
 		}
 	}()
 
-	var cfg []config
-	cfg = append(cfg, config{Metric: "first_metric_name", Buckets: []float64{0.0, 90.0, 20.0, 30.0, 40.0}})
-	histogram := NewTestHistogram(cfg, false, true)
+	var cfg []bucketConfig
+	cfg = append(cfg, bucketConfig{Metric: "first_metric_name", Buckets: []float64{0.0, 90.0, 20.0, 30.0, 40.0}})
+	histogram := NewTestHistogram(cfg, false, true, false)
 	histogram.Add(firstMetric2)
+}
+
+// TestHistogram tests two metrics getting added and metric expiration
+func TestHistogramMetricExpiration(t *testing.T) {
+	currentTime := time.Unix(10, 0)
+	timeNow = func() time.Time {
+		return currentTime
+	}
+	defer func() {
+		timeNow = time.Now
+	}()
+
+	cfg := []bucketConfig{
+		{Metric: "first_metric_name", Fields: []string{"a"}, Buckets: []float64{0.0, 10.0, 20.0, 30.0, 40.0}},
+		{Metric: "second_metric_name", Buckets: []float64{0.0, 4.0, 10.0, 23.0, 30.0}},
+	}
+	histogram := NewTestHistogramWithExpirationInterval(cfg, false, true, false, config.Duration(30))
+
+	acc := &testutil.Accumulator{}
+
+	histogram.Add(firstMetric1)
+	currentTime = time.Unix(41, 0)
+	histogram.Add(secondMetric)
+	histogram.Push(acc)
+
+	require.Len(t, acc.Metrics, 6, "Incorrect number of metrics")
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "0"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "4"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "10"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "23"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(0), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: "30"},
+	)
+	assertContainsTaggedField(
+		t,
+		acc,
+		"second_metric_name",
+		fields{"a_bucket": int64(1), "ignoreme_bucket": int64(0), "andme_bucket": int64(0)},
+		tags{bucketRightTag: bucketPosInf},
+	)
 }
 
 // assertContainsTaggedField is help functions to test histogram data
@@ -291,12 +521,9 @@ func assertContainsTaggedField(t *testing.T, acc *testutil.Accumulator, metricNa
 		}
 
 		// check fields with their counts
-		if assert.Equal(t, fields, checkedMetric.Fields) {
-			return
-		}
-
-		assert.Fail(t, fmt.Sprintf("incorrect fields %v of metric %s", checkedMetric.Fields, metricName))
+		require.Equal(t, fields, checkedMetric.Fields)
+		return
 	}
 
-	assert.Fail(t, fmt.Sprintf("unknown measurement '%s' with tags: %v, fields: %v", metricName, tags, fields))
+	require.Fail(t, fmt.Sprintf("unknown measurement %q with tags: %v, fields: %v", metricName, tags, fields))
 }

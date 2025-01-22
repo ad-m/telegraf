@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/influxdata/telegraf/testutil"
 )
 
 const validJSON = `
@@ -97,7 +97,7 @@ type mockHTTPClient struct {
 // Mock implementation of MakeRequest. Usually returns an http.Response with
 // hard-coded responseBody and statusCode. However, if the request uses a
 // nonstandard method, it uses status code 405 (method not allowed)
-func (c *mockHTTPClient) MakeRequest(req *http.Request) (*http.Response, error) {
+func (c *mockHTTPClient) makeRequest(req *http.Request) (*http.Response, error) {
 	resp := http.Response{}
 	resp.StatusCode = c.statusCode
 
@@ -119,20 +119,22 @@ func (c *mockHTTPClient) MakeRequest(req *http.Request) (*http.Response, error) 
 	return &resp, nil
 }
 
-func (c *mockHTTPClient) SetHTTPClient(_ *http.Client) {
+func (*mockHTTPClient) setHTTPClient(*http.Client) {
 }
 
-func (c *mockHTTPClient) HTTPClient() *http.Client {
+func (*mockHTTPClient) httpClient() *http.Client {
 	return nil
 }
 
 // Generates a pointer to an HttpJson object that uses a mock HTTP client.
 // Parameters:
-//     response  : Body of the response that the mock HTTP client should return
-//     statusCode: HTTP status code the mock HTTP client should return
+//
+//	response  : Body of the response that the mock HTTP client should return
+//	statusCode: HTTP status code the mock HTTP client should return
 //
 // Returns:
-//     *HttpJson: Pointer to an HttpJson object that uses the generated mock HTTP client
+//
+//	*HttpJson: Pointer to an HttpJson object that uses the generated mock HTTP client
 func genMockGrayLog(response string, statusCode int) []*GrayLog {
 	return []*GrayLog{
 		{
@@ -172,8 +174,8 @@ func TestHttpJson500(t *testing.T) {
 	var acc testutil.Accumulator
 	err := acc.GatherError(graylog[0].Gather)
 
-	assert.Error(t, err)
-	assert.Equal(t, 0, acc.NFields())
+	require.Error(t, err)
+	require.Equal(t, 0, acc.NFields())
 }
 
 // Test response to malformed JSON
@@ -183,8 +185,8 @@ func TestHttpJsonBadJson(t *testing.T) {
 	var acc testutil.Accumulator
 	err := acc.GatherError(graylog[0].Gather)
 
-	assert.Error(t, err)
-	assert.Equal(t, 0, acc.NFields())
+	require.Error(t, err)
+	require.Equal(t, 0, acc.NFields())
 }
 
 // Test response to empty string as response objectgT
@@ -194,6 +196,6 @@ func TestHttpJsonEmptyResponse(t *testing.T) {
 	var acc testutil.Accumulator
 	err := acc.GatherError(graylog[0].Gather)
 
-	assert.Error(t, err)
-	assert.Equal(t, 0, acc.NFields())
+	require.Error(t, err)
+	require.Equal(t, 0, acc.NFields())
 }

@@ -1,34 +1,26 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package passenger
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/xml"
 	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
 
+	"golang.org/x/net/html/charset"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
-	"golang.org/x/net/html/charset"
 )
 
-type passenger struct {
-	Command string
-}
+//go:embed sample.conf
+var sampleConfig string
 
-func (p *passenger) parseCommand() (string, []string) {
-	var arguments []string
-	if !strings.Contains(p.Command, " ") {
-		return p.Command, arguments
-	}
-
-	arguments = strings.Split(p.Command, " ")
-	if len(arguments) == 1 {
-		return arguments[0], arguments[1:]
-	}
-
-	return arguments[0], arguments[1:]
+type Passenger struct {
+	Command string `toml:"command"`
 }
 
 type info struct {
@@ -85,6 +77,39 @@ type process struct {
 	ProcessGroupID      string `xml:"process_group_id"`
 }
 
+func (*Passenger) SampleConfig() string {
+	return sampleConfig
+}
+
+func (p *Passenger) Gather(acc telegraf.Accumulator) error {
+	if p.Command == "" {
+		p.Command = "passenger-status -v --show=xml"
+	}
+
+	cmd, args := p.parseCommand()
+	out, err := exec.Command(cmd, args...).Output()
+
+	if err != nil {
+		return err
+	}
+
+	return importMetric(out, acc)
+}
+
+func (p *Passenger) parseCommand() (string, []string) {
+	var arguments []string
+	if !strings.Contains(p.Command, " ") {
+		return p.Command, arguments
+	}
+
+	arguments = strings.Split(p.Command, " ")
+	if len(arguments) == 1 {
+		return arguments[0], arguments[1:]
+	}
+
+	return arguments[0], arguments[1:]
+}
+
 func (p *process) getUptime() int64 {
 	if p.Uptime == "" {
 		return 0
@@ -125,48 +150,13 @@ func (p *process) getUptime() int64 {
 	return uptime
 }
 
-var sampleConfig = `
-  ## Path of passenger-status.
-  ##
-  ## Plugin gather metric via parsing XML output of passenger-status
-  ## More information about the tool:
-  ##   https://www.phusionpassenger.com/library/admin/apache/overall_status_report.html
-  ##
-  ## If no path is specified, then the plugin simply execute passenger-status
-  ## hopefully it can be found in your PATH
-  command = "passenger-status -v --show=xml"
-`
-
-func (p *passenger) SampleConfig() string {
-	return sampleConfig
-}
-
-func (p *passenger) Description() string {
-	return "Read metrics of passenger using passenger-status"
-}
-
-func (p *passenger) Gather(acc telegraf.Accumulator) error {
-	if p.Command == "" {
-		p.Command = "passenger-status -v --show=xml"
-	}
-
-	cmd, args := p.parseCommand()
-	out, err := exec.Command(cmd, args...).Output()
-
-	if err != nil {
-		return err
-	}
-
-	return importMetric(out, acc)
-}
-
 func importMetric(stat []byte, acc telegraf.Accumulator) error {
 	var p info
 
 	decoder := xml.NewDecoder(bytes.NewReader(stat))
 	decoder.CharsetReader = charset.NewReaderLabel
 	if err := decoder.Decode(&p); err != nil {
-		return fmt.Errorf("cannot parse input with error: %v", err)
+		return fmt.Errorf("cannot parse input with error: %w", err)
 	}
 
 	tags := map[string]string{
@@ -208,7 +198,7 @@ func importMetric(stat []byte, acc telegraf.Accumulator) error {
 					"group_name":       group.Name,
 					"app_root":         group.AppRoot,
 					"supergroup_name":  sg.Name,
-					"pid":              fmt.Sprintf("%d", process.Pid),
+					"pid":              strconv.Itoa(process.Pid),
 					"code_revision":    process.CodeRevision,
 					"life_status":      process.LifeStatus,
 					"process_group_id": process.ProcessGroupID,
@@ -241,6 +231,6 @@ func importMetric(stat []byte, acc telegraf.Accumulator) error {
 
 func init() {
 	inputs.Add("passenger", func() telegraf.Input {
-		return &passenger{}
+		return &Passenger{}
 	})
 }

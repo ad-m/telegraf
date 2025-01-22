@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package lvm
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -13,29 +15,22 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 var (
 	execCommand = exec.Command
 )
 
-var sampleConfig = `
-## Use sudo to run LVM commands
-use_sudo = false
-`
-
 type LVM struct {
-	UseSudo bool `toml:"use_sudo"`
+	UseSudo   bool   `toml:"use_sudo"`
+	PVSBinary string `toml:"pvs_binary"`
+	VGSBinary string `toml:"vgs_binary"`
+	LVSBinary string `toml:"lvs_binary"`
 }
 
-func (lvm *LVM) Description() string {
-	return "Read metrics about LVM physical volumes, volume groups, logical volumes."
-}
-
-func (lvm *LVM) SampleConfig() string {
+func (*LVM) SampleConfig() string {
 	return sampleConfig
-}
-
-func (lvm *LVM) Init() error {
-	return nil
 }
 
 func (lvm *LVM) Gather(acc telegraf.Accumulator) error {
@@ -51,12 +46,11 @@ func (lvm *LVM) Gather(acc telegraf.Accumulator) error {
 }
 
 func (lvm *LVM) gatherPhysicalVolumes(acc telegraf.Accumulator) error {
-	pvsCmd := "/usr/sbin/pvs"
 	args := []string{
 		"--reportformat", "json", "--units", "b", "--nosuffix",
 		"-o", "pv_name,vg_name,pv_size,pv_free,pv_used",
 	}
-	out, err := lvm.runCmd(pvsCmd, args)
+	out, err := lvm.runCmd(lvm.PVSBinary, args)
 	if err != nil {
 		return err
 	}
@@ -64,7 +58,7 @@ func (lvm *LVM) gatherPhysicalVolumes(acc telegraf.Accumulator) error {
 	var report pvsReport
 	err = json.Unmarshal(out, &report)
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal physical volume JSON: %s", err)
+		return fmt.Errorf("failed to unmarshal physical volume JSON: %w", err)
 	}
 
 	if len(report.Report) > 0 {
@@ -106,12 +100,11 @@ func (lvm *LVM) gatherPhysicalVolumes(acc telegraf.Accumulator) error {
 }
 
 func (lvm *LVM) gatherVolumeGroups(acc telegraf.Accumulator) error {
-	cmd := "/usr/sbin/vgs"
 	args := []string{
 		"--reportformat", "json", "--units", "b", "--nosuffix",
 		"-o", "vg_name,pv_count,lv_count,snap_count,vg_size,vg_free",
 	}
-	out, err := lvm.runCmd(cmd, args)
+	out, err := lvm.runCmd(lvm.VGSBinary, args)
 	if err != nil {
 		return err
 	}
@@ -119,7 +112,7 @@ func (lvm *LVM) gatherVolumeGroups(acc telegraf.Accumulator) error {
 	var report vgsReport
 	err = json.Unmarshal(out, &report)
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal vol group JSON: %s", err)
+		return fmt.Errorf("failed to unmarshal vol group JSON: %w", err)
 	}
 
 	if len(report.Report) > 0 {
@@ -170,12 +163,11 @@ func (lvm *LVM) gatherVolumeGroups(acc telegraf.Accumulator) error {
 }
 
 func (lvm *LVM) gatherLogicalVolumes(acc telegraf.Accumulator) error {
-	cmd := "/usr/sbin/lvs"
 	args := []string{
 		"--reportformat", "json", "--units", "b", "--nosuffix",
 		"-o", "lv_name,vg_name,lv_size,data_percent,metadata_percent",
 	}
-	out, err := lvm.runCmd(cmd, args)
+	out, err := lvm.runCmd(lvm.LVSBinary, args)
 	if err != nil {
 		return err
 	}
@@ -183,7 +175,7 @@ func (lvm *LVM) gatherLogicalVolumes(acc telegraf.Accumulator) error {
 	var report lvsReport
 	err = json.Unmarshal(out, &report)
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal logical vol JSON: %s", err)
+		return fmt.Errorf("failed to unmarshal logical vol JSON: %w", err)
 	}
 
 	if len(report.Report) > 0 {
@@ -238,8 +230,7 @@ func (lvm *LVM) runCmd(cmd string, args []string) ([]byte, error) {
 	out, err := internal.StdOutputTimeout(execCmd, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"failed to run command %s: %s - %s",
-			strings.Join(execCmd.Args, " "), err, string(out),
+			"failed to run command %s: %w - %s", strings.Join(execCmd.Args, " "), err, string(out),
 		)
 	}
 
@@ -288,6 +279,10 @@ type lvsReport struct {
 
 func init() {
 	inputs.Add("lvm", func() telegraf.Input {
-		return &LVM{}
+		return &LVM{
+			PVSBinary: "/usr/sbin/pvs",
+			VGSBinary: "/usr/sbin/vgs",
+			LVSBinary: "/usr/sbin/lvs",
+		}
 	})
 }

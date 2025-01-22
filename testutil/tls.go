@@ -5,16 +5,24 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 
 	"github.com/influxdata/telegraf/plugins/common/tls"
 )
 
-type pki struct {
-	path string
+type PKIPaths struct {
+	ServerPem  string
+	ServerCert string
+	ServerKey  string
+	ClientCert string
 }
 
-func NewPKI(path string) *pki {
-	return &pki{path: path}
+type pki struct {
+	keyPath string
+}
+
+func NewPKI(keyPath string) *pki {
+	return &pki{keyPath: keyPath}
 }
 
 func (p *pki) TLSClientConfig() *tls.ClientConfig {
@@ -41,19 +49,19 @@ func (p *pki) ReadCACert() string {
 }
 
 func (p *pki) CACertPath() string {
-	return path.Join(p.path, "cacert.pem")
+	return path.Join(p.keyPath, "cacert.pem")
 }
 
-func (p *pki) CipherSuite() string {
+func (*pki) CipherSuite() string {
 	return "TLS_RSA_WITH_3DES_EDE_CBC_SHA"
 }
 
-func (p *pki) TLSMinVersion() string {
+func (*pki) TLSMinVersion() string {
 	return "TLS11"
 }
 
-func (p *pki) TLSMaxVersion() string {
-	return "TLS12"
+func (*pki) TLSMaxVersion() string {
+	return "TLS13"
 }
 
 func (p *pki) ReadClientCert() string {
@@ -61,7 +69,7 @@ func (p *pki) ReadClientCert() string {
 }
 
 func (p *pki) ClientCertPath() string {
-	return path.Join(p.path, "clientcert.pem")
+	return path.Join(p.keyPath, "clientcert.pem")
 }
 
 func (p *pki) ReadClientKey() string {
@@ -69,19 +77,27 @@ func (p *pki) ReadClientKey() string {
 }
 
 func (p *pki) ClientKeyPath() string {
-	return path.Join(p.path, "clientkey.pem")
+	return path.Join(p.keyPath, "clientkey.pem")
 }
 
 func (p *pki) ClientCertAndKeyPath() string {
-	return path.Join(p.path, "client.pem")
+	return path.Join(p.keyPath, "client.pem")
 }
 
 func (p *pki) ClientEncKeyPath() string {
-	return path.Join(p.path, "clientkeyenc.pem")
+	return path.Join(p.keyPath, "clientenckey.pem")
+}
+
+func (p *pki) ClientPKCS8KeyPath() string {
+	return path.Join(p.keyPath, "clientkey.pkcs8.pem")
+}
+
+func (p *pki) ClientEncPKCS8KeyPath() string {
+	return path.Join(p.keyPath, "clientenckey.pkcs8.pem")
 }
 
 func (p *pki) ClientCertAndEncKeyPath() string {
-	return path.Join(p.path, "clientenc.pem")
+	return path.Join(p.keyPath, "clientenc.pem")
 }
 
 func (p *pki) ReadServerCert() string {
@@ -89,7 +105,7 @@ func (p *pki) ReadServerCert() string {
 }
 
 func (p *pki) ServerCertPath() string {
-	return path.Join(p.path, "servercert.pem")
+	return path.Join(p.keyPath, "servercert.pem")
 }
 
 func (p *pki) ReadServerKey() string {
@@ -97,11 +113,37 @@ func (p *pki) ReadServerKey() string {
 }
 
 func (p *pki) ServerKeyPath() string {
-	return path.Join(p.path, "serverkey.pem")
+	return path.Join(p.keyPath, "serverkey.pem")
 }
 
 func (p *pki) ServerCertAndKeyPath() string {
-	return path.Join(p.path, "server.pem")
+	return path.Join(p.keyPath, "server.pem")
+}
+
+func (p *pki) AbsolutePaths() (*PKIPaths, error) {
+	tlsPem, err := filepath.Abs(p.ServerCertAndKeyPath())
+	if err != nil {
+		return nil, err
+	}
+	tlsCert, err := filepath.Abs(p.ServerCertPath())
+	if err != nil {
+		return nil, err
+	}
+	tlsKey, err := filepath.Abs(p.ServerKeyPath())
+	if err != nil {
+		return nil, err
+	}
+	cert, err := filepath.Abs(p.ClientCertPath())
+	if err != nil {
+		return nil, err
+	}
+
+	return &PKIPaths{
+		ServerPem:  tlsPem,
+		ServerCert: tlsCert,
+		ServerKey:  tlsKey,
+		ClientCert: cert,
+	}, nil
 }
 
 func readCertificate(filename string) string {

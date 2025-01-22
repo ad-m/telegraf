@@ -4,8 +4,10 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/influxdata/telegraf"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/model"
+
+	"github.com/influxdata/telegraf"
 )
 
 type Table struct {
@@ -54,35 +56,10 @@ var LabelNameTable = Table{
 	},
 }
 
-func isValid(name string, table Table) bool {
-	if name == "" {
-		return false
-	}
-
-	for i, r := range name {
-		switch {
-		case i == 0:
-			if !unicode.In(r, table.First) {
-				return false
-			}
-		default:
-			if !unicode.In(r, table.Rest) {
-				return false
-			}
-		}
-	}
-
-	return true
-}
-
 // Sanitize checks if the name is valid according to the table.  If not, it
 // attempts to replaces invalid runes with an underscore to create a valid
 // name.
 func sanitize(name string, table Table) (string, bool) {
-	if isValid(name, table) {
-		return name, true
-	}
-
 	var b strings.Builder
 
 	for i, r := range name {
@@ -104,7 +81,6 @@ func sanitize(name string, table Table) (string, bool) {
 	if name == "" {
 		return "", false
 	}
-
 	return name, true
 }
 
@@ -112,6 +88,9 @@ func sanitize(name string, table Table) (string, bool) {
 // not, it attempts to replaces invalid runes with an underscore to create a
 // valid name.
 func SanitizeMetricName(name string) (string, bool) {
+	if model.IsValidMetricName(model.LabelValue(name)) {
+		return name, true
+	}
 	return sanitize(name, MetricNameTable)
 }
 
@@ -119,6 +98,9 @@ func SanitizeMetricName(name string) (string, bool) {
 // not, it attempts to replaces invalid runes with an underscore to create a
 // valid name.
 func SanitizeLabelName(name string) (string, bool) {
+	if model.LabelName(name).IsValid() {
+		return name, true
+	}
 	return sanitize(name, LabelNameTable)
 }
 

@@ -6,15 +6,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/adal"
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
 )
 
 func TestAggregate(t *testing.T) {
@@ -47,7 +47,7 @@ func TestAggregate(t *testing.T) {
 			pushTime: time.Unix(3600, 0),
 			check: func(t *testing.T, plugin *AzureMonitor, metrics []telegraf.Metric) {
 				require.Equal(t, int64(1), plugin.MetricOutsideWindow.Get())
-				require.Len(t, metrics, 0)
+				require.Empty(t, metrics)
 			},
 		},
 		{
@@ -69,8 +69,8 @@ func TestAggregate(t *testing.T) {
 			},
 			addTime:  time.Unix(0, 0),
 			pushTime: time.Unix(0, 0),
-			check: func(t *testing.T, plugin *AzureMonitor, metrics []telegraf.Metric) {
-				require.Len(t, metrics, 0)
+			check: func(t *testing.T, _ *AzureMonitor, metrics []telegraf.Metric) {
+				require.Empty(t, metrics)
 			},
 		},
 		{
@@ -96,7 +96,7 @@ func TestAggregate(t *testing.T) {
 			},
 			addTime:  time.Unix(0, 0),
 			pushTime: time.Unix(3600, 0),
-			check: func(t *testing.T, plugin *AzureMonitor, metrics []telegraf.Metric) {
+			check: func(t *testing.T, _ *AzureMonitor, metrics []telegraf.Metric) {
 				expected := []telegraf.Metric{
 					testutil.MustMetric(
 						"cpu-value",
@@ -136,7 +136,7 @@ func TestAggregate(t *testing.T) {
 			},
 			addTime:  time.Unix(0, 0),
 			pushTime: time.Unix(3600, 0),
-			check: func(t *testing.T, plugin *AzureMonitor, metrics []telegraf.Metric) {
+			check: func(t *testing.T, _ *AzureMonitor, metrics []telegraf.Metric) {
 				expected := []telegraf.Metric{
 					testutil.MustMetric(
 						"cpu-value",
@@ -190,7 +190,7 @@ func TestAggregate(t *testing.T) {
 			},
 			addTime:  time.Unix(0, 0),
 			pushTime: time.Unix(3600, 0),
-			check: func(t *testing.T, plugin *AzureMonitor, metrics []telegraf.Metric) {
+			check: func(t *testing.T, _ *AzureMonitor, metrics []telegraf.Metric) {
 				expected := []telegraf.Metric{
 					testutil.MustMetric(
 						"cpu-value",
@@ -214,7 +214,7 @@ func TestAggregate(t *testing.T) {
 			msiEndpoint, err := adal.GetMSIVMEndpoint()
 			require.NoError(t, err)
 
-			os.Setenv("MSI_ENDPOINT", msiEndpoint)
+			t.Setenv("MSI_ENDPOINT", msiEndpoint)
 			err = tt.plugin.Connect()
 			require.NoError(t, err)
 
@@ -236,6 +236,13 @@ func TestAggregate(t *testing.T) {
 }
 
 func TestWrite(t *testing.T) {
+	// Set up a fake environment for Authorizer
+	// This used to fake an MSI environment, but since https://github.com/Azure/go-autorest/pull/670/files it's no longer possible,
+	// So we fake a user/password authentication
+	t.Setenv("AZURE_CLIENT_ID", "fake")
+	t.Setenv("AZURE_USERNAME", "fake")
+	t.Setenv("AZURE_PASSWORD", "fake")
+
 	readBody := func(r *http.Request) ([]*azureMonitorMetric, error) {
 		gz, err := gzip.NewReader(r.Body)
 		if err != nil {
@@ -285,7 +292,7 @@ func TestWrite(t *testing.T) {
 					time.Unix(0, 0),
 				),
 			},
-			handler: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			handler: func(t *testing.T, _ http.ResponseWriter, _ *http.Request) {
 				t.Fatal("should not call")
 			},
 		},
@@ -372,16 +379,4 @@ func TestWrite(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
-}
-
-func TestMain(m *testing.M) {
-	// Set up a fake environment for adal.getMSIType()
-	// Root cause: https://github.com/Azure/go-autorest/commit/def88ef859fb980eff240c755a70597bc9b490d0
-	err := os.Setenv("MSI_ENDPOINT", "fake.endpoint")
-
-	if err != nil {
-		panic(err)
-	}
-
-	os.Exit(m.Run())
 }

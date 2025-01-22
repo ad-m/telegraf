@@ -4,17 +4,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
-	"github.com/stretchr/testify/assert"
+	"github.com/influxdata/telegraf/plugins/serializers"
 )
-
-func MustMetric(v telegraf.Metric, err error) telegraf.Metric {
-	if err != nil {
-		panic(err)
-	}
-	return v
-}
 
 func TestSerializeMetricFloat(t *testing.T) {
 	// Test sub-second time
@@ -27,12 +22,12 @@ func TestSerializeMetricFloat(t *testing.T) {
 	}
 	m := metric.New("cpu", tags, fields, now)
 
-	s, _ := NewSerializer(false, false)
+	s := &Serializer{}
 	var buf []byte
 	buf, err := s.Serialize(m)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	expS := `{"_value":91.5,"cpu":"cpu0","metric_name":"cpu.usage_idle","time":1529875740.819}`
-	assert.Equal(t, expS, string(buf))
+	require.Equal(t, expS, string(buf))
 }
 
 func TestSerializeMetricFloatHec(t *testing.T) {
@@ -46,12 +41,12 @@ func TestSerializeMetricFloatHec(t *testing.T) {
 	}
 	m := metric.New("cpu", tags, fields, now)
 
-	s, _ := NewSerializer(true, false)
+	s := &Serializer{HecRouting: true}
 	var buf []byte
 	buf, err := s.Serialize(m)
-	assert.NoError(t, err)
-	expS := `{"time":1529875740.819,"fields":{"_value":91.5,"cpu":"cpu0","metric_name":"cpu.usage_idle"}}`
-	assert.Equal(t, expS, string(buf))
+	require.NoError(t, err)
+	expS := `{"time":1529875740.819,"event":"metric","fields":{"_value":91.5,"cpu":"cpu0","metric_name":"cpu.usage_idle"}}`
+	require.Equal(t, expS, string(buf))
 }
 
 func TestSerializeMetricInt(t *testing.T) {
@@ -64,13 +59,13 @@ func TestSerializeMetricInt(t *testing.T) {
 	}
 	m := metric.New("cpu", tags, fields, now)
 
-	s, _ := NewSerializer(false, false)
+	s := &Serializer{}
 	var buf []byte
 	buf, err := s.Serialize(m)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	expS := `{"_value":90,"cpu":"cpu0","metric_name":"cpu.usage_idle","time":0}`
-	assert.Equal(t, expS, string(buf))
+	require.Equal(t, expS, string(buf))
 }
 
 func TestSerializeMetricIntHec(t *testing.T) {
@@ -83,13 +78,13 @@ func TestSerializeMetricIntHec(t *testing.T) {
 	}
 	m := metric.New("cpu", tags, fields, now)
 
-	s, _ := NewSerializer(true, false)
+	s := &Serializer{HecRouting: true}
 	var buf []byte
 	buf, err := s.Serialize(m)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	expS := `{"time":0,"fields":{"_value":90,"cpu":"cpu0","metric_name":"cpu.usage_idle"}}`
-	assert.Equal(t, expS, string(buf))
+	expS := `{"time":0,"event":"metric","fields":{"_value":90,"cpu":"cpu0","metric_name":"cpu.usage_idle"}}`
+	require.Equal(t, expS, string(buf))
 }
 
 func TestSerializeMetricBool(t *testing.T) {
@@ -98,17 +93,17 @@ func TestSerializeMetricBool(t *testing.T) {
 		"container-name": "telegraf-test",
 	}
 	fields := map[string]interface{}{
-		"oomkiller": bool(true),
+		"oomkiller": true,
 	}
 	m := metric.New("docker", tags, fields, now)
 
-	s, _ := NewSerializer(false, false)
+	s := &Serializer{}
 	var buf []byte
 	buf, err := s.Serialize(m)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	expS := `{"_value":1,"container-name":"telegraf-test","metric_name":"docker.oomkiller","time":0}`
-	assert.Equal(t, expS, string(buf))
+	require.Equal(t, expS, string(buf))
 }
 
 func TestSerializeMetricBoolHec(t *testing.T) {
@@ -117,17 +112,17 @@ func TestSerializeMetricBoolHec(t *testing.T) {
 		"container-name": "telegraf-test",
 	}
 	fields := map[string]interface{}{
-		"oomkiller": bool(false),
+		"oomkiller": false,
 	}
 	m := metric.New("docker", tags, fields, now)
 
-	s, _ := NewSerializer(true, false)
+	s := &Serializer{HecRouting: true}
 	var buf []byte
 	buf, err := s.Serialize(m)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	expS := `{"time":0,"fields":{"_value":0,"container-name":"telegraf-test","metric_name":"docker.oomkiller"}}`
-	assert.Equal(t, expS, string(buf))
+	expS := `{"time":0,"event":"metric","fields":{"_value":0,"container-name":"telegraf-test","metric_name":"docker.oomkiller"}}`
+	require.Equal(t, expS, string(buf))
 }
 
 func TestSerializeMetricString(t *testing.T) {
@@ -141,14 +136,14 @@ func TestSerializeMetricString(t *testing.T) {
 	}
 	m := metric.New("cpu", tags, fields, now)
 
-	s, _ := NewSerializer(false, false)
+	s := &Serializer{}
 	var buf []byte
 	buf, err := s.Serialize(m)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	expS := `{"_value":5,"cpu":"cpu0","metric_name":"cpu.usage_idle","time":0}`
-	assert.Equal(t, expS, string(buf))
-	assert.NoError(t, err)
+	require.Equal(t, expS, string(buf))
+	require.NoError(t, err)
 }
 
 func TestSerializeBatch(t *testing.T) {
@@ -171,12 +166,12 @@ func TestSerializeBatch(t *testing.T) {
 	)
 
 	metrics := []telegraf.Metric{m, n}
-	s, _ := NewSerializer(false, false)
+	s := &Serializer{}
 	buf, err := s.SerializeBatch(metrics)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	expS := `{"_value":42,"metric_name":"cpu.value","time":0}{"_value":92,"metric_name":"cpu.value","time":0}`
-	assert.Equal(t, expS, string(buf))
+	require.Equal(t, expS, string(buf))
 }
 
 func TestSerializeMulti(t *testing.T) {
@@ -191,12 +186,12 @@ func TestSerializeMulti(t *testing.T) {
 	)
 
 	metrics := []telegraf.Metric{m}
-	s, _ := NewSerializer(false, true)
+	s := &Serializer{MultiMetric: true}
 	buf, err := s.SerializeBatch(metrics)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	expS := `{"metric_name:cpu.system":8,"metric_name:cpu.user":42,"time":0}`
-	assert.Equal(t, expS, string(buf))
+	require.Equal(t, expS, string(buf))
 }
 
 func TestSerializeBatchHec(t *testing.T) {
@@ -217,12 +212,13 @@ func TestSerializeBatchHec(t *testing.T) {
 		time.Unix(0, 0),
 	)
 	metrics := []telegraf.Metric{m, n}
-	s, _ := NewSerializer(true, false)
+	s := &Serializer{HecRouting: true}
 	buf, err := s.SerializeBatch(metrics)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	expS := `{"time":0,"fields":{"_value":42,"metric_name":"cpu.value"}}{"time":0,"fields":{"_value":92,"metric_name":"cpu.value"}}`
-	assert.Equal(t, expS, string(buf))
+	expS := `{"time":0,"event":"metric","fields":{"_value":42,"metric_name":"cpu.value"}}` +
+		`{"time":0,"event":"metric","fields":{"_value":92,"metric_name":"cpu.value"}}`
+	require.Equal(t, expS, string(buf))
 }
 
 func TestSerializeMultiHec(t *testing.T) {
@@ -237,10 +233,58 @@ func TestSerializeMultiHec(t *testing.T) {
 	)
 
 	metrics := []telegraf.Metric{m}
-	s, _ := NewSerializer(true, true)
+	s := &Serializer{
+		HecRouting:  true,
+		MultiMetric: true,
+	}
 	buf, err := s.SerializeBatch(metrics)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+
+	expS := `{"time":0,"event":"metric","fields":{"metric_name:cpu.system":8,"metric_name:cpu.usage":42}}`
+	require.Equal(t, expS, string(buf))
+}
+
+func TestSerializeOmitEvent(t *testing.T) {
+	m := metric.New(
+		"cpu",
+		map[string]string{},
+		map[string]interface{}{
+			"usage":  42.0,
+			"system": 8.0,
+		},
+		time.Unix(0, 0),
+	)
+
+	metrics := []telegraf.Metric{m}
+	s := &Serializer{
+		HecRouting:   true,
+		MultiMetric:  true,
+		OmitEventTag: true,
+	}
+	buf, err := s.SerializeBatch(metrics)
+	require.NoError(t, err)
 
 	expS := `{"time":0,"fields":{"metric_name:cpu.system":8,"metric_name:cpu.usage":42}}`
-	assert.Equal(t, expS, string(buf))
+	require.Equal(t, expS, string(buf))
+}
+
+func BenchmarkSerialize(b *testing.B) {
+	s := &Serializer{}
+	metrics := serializers.BenchmarkMetrics(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := s.Serialize(metrics[i%len(metrics)])
+		require.NoError(b, err)
+	}
+}
+
+func BenchmarkSerializeBatch(b *testing.B) {
+	s := &Serializer{}
+	m := serializers.BenchmarkMetrics(b)
+	metrics := m[:]
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := s.SerializeBatch(metrics)
+		require.NoError(b, err)
+	}
 }

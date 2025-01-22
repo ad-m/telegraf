@@ -4,6 +4,7 @@ The goal of this _shim_ is to make it trivial to extract an internal input,
 processor, or output plugin from the main Telegraf repo out to a stand-alone
 repo. This allows anyone to build and run it as a separate app using one of the
 execd plugins:
+
 - [inputs.execd](/plugins/inputs/execd)
 - [processors.execd](/plugins/processors/execd)
 - [outputs.execd](/plugins/outputs/execd)
@@ -41,7 +42,7 @@ execd plugins:
   an input gathering plugin, you may see data right away, or you may have to hit enter
   first, or wait for your poll duration to elapse, but the metrics will be written to
   STDOUT. Ctrl-C to end your test.
-  If you're testig a processor or output manually, you can still do this but you
+  If you're testing a processor or output manually, you can still do this but you
   will need to feed valid metrics in on STDIN to verify that it is doing what you
   want. This can be a very valuable debugging technique before hooking it up to
   Telegraf.
@@ -56,7 +57,7 @@ execd plugins:
 
   Refer to the execd plugin readmes for more information.
 
-## Congratulations!
+## Congratulations
 
 You've done it! Consider publishing your plugin to github and open a Pull Request
 back to the Telegraf repo letting us know about the availability of your

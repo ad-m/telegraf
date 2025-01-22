@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package twemproxy
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,27 +13,18 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 type Twemproxy struct {
-	Addr  string
-	Pools []string
+	Addr  string   `toml:"addr"`
+	Pools []string `toml:"pools"`
 }
 
-var sampleConfig = `
-  ## Twemproxy stats address and port (no scheme)
-  addr = "localhost:22222"
-  ## Monitor pool name
-  pools = ["redis_pool", "mc_pool"]
-`
-
-func (t *Twemproxy) SampleConfig() string {
+func (*Twemproxy) SampleConfig() string {
 	return sampleConfig
 }
 
-func (t *Twemproxy) Description() string {
-	return "Read Twemproxy stats data"
-}
-
-// Gather data from all Twemproxy instances
 func (t *Twemproxy) Gather(acc telegraf.Accumulator) error {
 	conn, err := net.DialTimeout("tcp", t.Addr, 1*time.Second)
 	if err != nil {
@@ -44,7 +37,7 @@ func (t *Twemproxy) Gather(acc telegraf.Accumulator) error {
 
 	var stats map[string]interface{}
 	if err = json.Unmarshal(body, &stats); err != nil {
-		return errors.New("Error decoding JSON response")
+		return errors.New("error decoding JSON response")
 	}
 
 	tags := make(map[string]string)
@@ -55,11 +48,7 @@ func (t *Twemproxy) Gather(acc telegraf.Accumulator) error {
 }
 
 // Process Twemproxy server stats
-func (t *Twemproxy) processStat(
-	acc telegraf.Accumulator,
-	tags map[string]string,
-	data map[string]interface{},
-) {
+func (t *Twemproxy) processStat(acc telegraf.Accumulator, tags map[string]string, data map[string]interface{}) {
 	if source, ok := data["source"]; ok {
 		if val, ok := source.(string); ok {
 			tags["source"] = val
@@ -82,18 +71,14 @@ func (t *Twemproxy) processStat(
 			if data, ok := poolStat.(map[string]interface{}); ok {
 				poolTags := copyTags(tags)
 				poolTags["pool"] = pool
-				t.processPool(acc, poolTags, data)
+				processPool(acc, poolTags, data)
 			}
 		}
 	}
 }
 
 // Process pool data in Twemproxy stats
-func (t *Twemproxy) processPool(
-	acc telegraf.Accumulator,
-	tags map[string]string,
-	data map[string]interface{},
-) {
+func processPool(acc telegraf.Accumulator, tags map[string]string, data map[string]interface{}) {
 	serverTags := make(map[string]map[string]string)
 
 	fields := make(map[string]interface{})
@@ -109,7 +94,7 @@ func (t *Twemproxy) processPool(
 					serverTags[key] = copyTags(tags)
 					serverTags[key]["server"] = key
 				}
-				t.processServer(acc, serverTags[key], data)
+				processServer(acc, serverTags[key], data)
 			}
 		}
 	}
@@ -117,18 +102,11 @@ func (t *Twemproxy) processPool(
 }
 
 // Process backend server(redis/memcached) stats
-func (t *Twemproxy) processServer(
-	acc telegraf.Accumulator,
-	tags map[string]string,
-	data map[string]interface{},
-) {
+func processServer(acc telegraf.Accumulator, tags map[string]string, data map[string]interface{}) {
 	fields := make(map[string]interface{})
 	for key, value := range data {
-		switch key {
-		default:
-			if val, ok := value.(float64); ok {
-				fields[key] = val
-			}
+		if val, ok := value.(float64); ok {
+			fields[key] = val
 		}
 	}
 	acc.AddFields("twemproxy_pool_server", fields, tags)

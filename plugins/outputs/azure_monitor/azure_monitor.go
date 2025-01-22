@@ -1,10 +1,14 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package azure_monitor
 
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	_ "embed"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -15,12 +19,16 @@ import (
 
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure/auth"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/plugins/outputs"
 	"github.com/influxdata/telegraf/selfstat"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 // AzureMonitor allows publishing of metrics to the Azure Monitor custom metrics
 // service
@@ -100,43 +108,7 @@ const (
 	maxRequestBodySize         = 4000000
 )
 
-var sampleConfig = `
-  ## Timeout for HTTP writes.
-  # timeout = "20s"
-
-  ## Set the namespace prefix, defaults to "Telegraf/<input-name>".
-  # namespace_prefix = "Telegraf/"
-
-  ## Azure Monitor doesn't have a string value type, so convert string
-  ## fields to dimensions (a.k.a. tags) if enabled. Azure Monitor allows
-  ## a maximum of 10 dimensions so Telegraf will only send the first 10
-  ## alphanumeric dimensions.
-  # strings_as_dimensions = false
-
-  ## Both region and resource_id must be set or be available via the
-  ## Instance Metadata service on Azure Virtual Machines.
-  #
-  ## Azure Region to publish metrics against.
-  ##   ex: region = "southcentralus"
-  # region = ""
-  #
-  ## The Azure Resource ID against which metric will be logged, e.g.
-  ##   ex: resource_id = "/subscriptions/<subscription_id>/resourceGroups/<resource_group>/providers/Microsoft.Compute/virtualMachines/<vm_name>"
-  # resource_id = ""
-
-  ## Optionally, if in Azure US Government, China or other sovereign
-  ## cloud environment, set appropriate REST endpoint for receiving
-  ## metrics. (Note: region may be unused in this context)
-  # endpoint_url = "https://monitoring.core.usgovcloudapi.net"
-`
-
-// Description provides a description of the plugin
-func (a *AzureMonitor) Description() string {
-	return "Send aggregate metrics to Azure Monitor"
-}
-
-// SampleConfig provides a sample configuration for the plugin
-func (a *AzureMonitor) SampleConfig() string {
+func (*AzureMonitor) SampleConfig() string {
 	return sampleConfig
 }
 
@@ -148,12 +120,7 @@ func (a *AzureMonitor) Connect() error {
 		a.Timeout = config.Duration(defaultRequestTimeout)
 	}
 
-	a.client = &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-		},
-		Timeout: time.Duration(a.Timeout),
-	}
+	a.initHTTPClient()
 
 	var err error
 	var region string
@@ -178,9 +145,9 @@ func (a *AzureMonitor) Connect() error {
 	}
 
 	if resourceID == "" {
-		return fmt.Errorf("no resource ID configured or available via VM instance metadata")
+		return errors.New("no resource ID configured or available via VM instance metadata")
 	} else if region == "" {
-		return fmt.Errorf("no region configured or available via VM instance metadata")
+		return errors.New("no region configured or available via VM instance metadata")
 	}
 
 	if endpointURL == "" {
@@ -207,11 +174,20 @@ func (a *AzureMonitor) Connect() error {
 	return nil
 }
 
+func (a *AzureMonitor) initHTTPClient() {
+	a.client = &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
+		Timeout: time.Duration(a.Timeout),
+	}
+}
+
 // vmMetadata retrieves metadata about the current Azure VM
-func vmInstanceMetadata(c *http.Client) (string, string, error) {
+func vmInstanceMetadata(c *http.Client) (region, resourceID string, err error) {
 	req, err := http.NewRequest("GET", vmInstanceMetadataURL, nil)
 	if err != nil {
-		return "", "", fmt.Errorf("error creating request: %v", err)
+		return "", "", fmt.Errorf("error creating request: %w", err)
 	}
 	req.Header.Set("Metadata", "true")
 
@@ -235,8 +211,8 @@ func vmInstanceMetadata(c *http.Client) (string, string, error) {
 		return "", "", err
 	}
 
-	region := metadata.Compute.Location
-	resourceID := metadata.ResourceID()
+	region = metadata.Compute.Location
+	resourceID = metadata.ResourceID()
 
 	return region, resourceID, nil
 }
@@ -301,11 +277,11 @@ func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
 		return nil
 	}
 
-	var body []byte
+	var body []byte //nolint:prealloc // There is no point in guessing the final capacity of this slice
 	for _, m := range azmetrics {
 		// Azure Monitor accepts new batches of points in new-line delimited
 		// JSON, following RFC 4288 (see https://github.com/ndjson/ndjson-spec).
-		jsonBytes, err := json.Marshal(&m)
+		jsonBytes, err := json.Marshal(m)
 		if err != nil {
 			return err
 		}
@@ -347,18 +323,22 @@ func (a *AzureMonitor) send(body []byte) error {
 	// refresh the token if needed.
 	req, err = autorest.CreatePreparer(a.auth.WithAuthorization()).Prepare(req)
 	if err != nil {
-		return fmt.Errorf("unable to fetch authentication credentials: %v", err)
+		return fmt.Errorf("unable to fetch authentication credentials: %w", err)
 	}
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			a.initHTTPClient()
+		}
+
 		return err
 	}
 	defer resp.Body.Close()
 
-	_, err = io.ReadAll(resp.Body)
+	respbody, err := io.ReadAll(resp.Body)
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("failed to write batch: [%v] %s", resp.StatusCode, resp.Status)
+		return fmt.Errorf("failed to write batch: [%v] %s: %s", resp.StatusCode, resp.Status, string(respbody))
 	}
 
 	return nil
@@ -384,8 +364,8 @@ func hashIDWithTagKeysOnly(m telegraf.Metric) uint64 {
 }
 
 func translate(m telegraf.Metric, prefix string) (*azureMonitorMetric, error) {
-	var dimensionNames []string
-	var dimensionValues []string
+	dimensionNames := make([]string, 0, len(m.TagList()))
+	dimensionValues := make([]string, 0, len(m.TagList()))
 	for _, tag := range m.TagList() {
 		// Azure custom metrics service supports up to 10 dimensions
 		if len(dimensionNames) >= 10 {
@@ -400,19 +380,19 @@ func translate(m telegraf.Metric, prefix string) (*azureMonitorMetric, error) {
 		dimensionValues = append(dimensionValues, tag.Value)
 	}
 
-	min, err := getFloatField(m, "min")
+	vmin, err := getFloatField(m, "min")
 	if err != nil {
 		return nil, err
 	}
-	max, err := getFloatField(m, "max")
+	vmax, err := getFloatField(m, "max")
 	if err != nil {
 		return nil, err
 	}
-	sum, err := getFloatField(m, "sum")
+	vsum, err := getFloatField(m, "sum")
 	if err != nil {
 		return nil, err
 	}
-	count, err := getIntField(m, "count")
+	vcount, err := getIntField(m, "count")
 	if err != nil {
 		return nil, err
 	}
@@ -437,10 +417,10 @@ func translate(m telegraf.Metric, prefix string) (*azureMonitorMetric, error) {
 				Series: []*azureMonitorSeries{
 					{
 						DimensionValues: dimensionValues,
-						Min:             min,
-						Max:             max,
-						Sum:             sum,
-						Count:           count,
+						Min:             vmin,
+						Max:             vmax,
+						Sum:             vsum,
+						Count:           vcount,
 					},
 				},
 			},
