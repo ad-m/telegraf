@@ -1,19 +1,27 @@
 # Logparser Input Plugin
 
+**Deprecated in Telegraf 1.15: Please use the [tail][] plugin along with the
+[`grok` data format][grok parser]**
+
 The `logparser` plugin streams and parses the given logfiles. Currently it
 has the capability of parsing "grok" patterns from logfiles, which also supports
 regex patterns.
 
-**Deprecated in Telegraf 1.15**: Please use the [tail][] plugin along with the [`grok` data format][grok parser].
-
 The `tail` plugin now provides all the functionality of the `logparser` plugin.
 Most options can be translated directly to the `tail` plugin:
+
 - For options in the `[inputs.logparser.grok]` section, the equivalent option
   will have add the `grok_` prefix when using them in the `tail` input.
 - The grok `measurement` option can be replaced using the standard plugin
   `name_override` option.
 
+This plugin also supports [metric filtering](CONFIGURATION.md#metric-filtering)
+and some [additional common options](CONFIGURATION.md#processor-plugins).
+
+## Example
+
 Migration Example:
+
 ```diff
 - [[inputs.logparser]]
 -   files = ["/var/log/apache/access.log"]
@@ -38,9 +46,30 @@ Migration Example:
 +   data_format = "grok"
 ```
 
-### Configuration
+## Service Input <!-- @/docs/includes/service_input.md -->
 
-```toml
+This plugin is a service input. Normal plugins gather metrics determined by the
+interval setting. Service plugins start a service to listens and waits for
+metrics or events to occur. Service plugins have two key differences from
+normal plugins:
+
+1. The global or plugin specific `interval` setting may not apply
+2. The CLI options of `--test`, `--test-wait`, and `--once` may not produce
+   output for this plugin
+
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
+
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Configuration
+
+```toml @sample.conf
+# Read metrics off Arista LANZ, via socket
 [[inputs.logparser]]
   ## Log files to parse.
   ## These accept standard unix glob matching rules, but with the addition of
@@ -88,17 +117,24 @@ Migration Example:
     ##   2. "Canada/Eastern"  -- Unix TZ values like those found in https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
     ##   3. UTC               -- or blank/unspecified, will return timestamp in UTC
     # timezone = "Canada/Eastern"
+
+    ## When set to "disable", timestamp will not incremented if there is a
+    ## duplicate.
+    # unique_timestamp = "auto"
 ```
 
-### Grok Parser
+## Grok Parser
 
 Reference the [grok parser][] documentation to setup the grok section of the
 configuration.
 
+## Additional Resources
 
-### Additional Resources
-
-- https://www.influxdata.com/telegraf-correlate-log-metrics-data-performance-bottlenecks/
+- <https://www.influxdata.com/telegraf-correlate-log-metrics-data-performance-bottlenecks/>
 
 [tail]: /plugins/inputs/tail/README.md
 [grok parser]: /plugins/parsers/grok/README.md
+
+## Metrics
+
+## Example Output

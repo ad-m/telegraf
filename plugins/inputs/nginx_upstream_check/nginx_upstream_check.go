@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package nginx_upstream_check
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,36 +17,8 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-const sampleConfig = `
-  ## An URL where Nginx Upstream check module is enabled
-  ## It should be set to return a JSON formatted response
-  url = "http://127.0.0.1/status?format=json"
-
-  ## HTTP method
-  # method = "GET"
-
-  ## Optional HTTP headers
-  # headers = {"X-Special-Header" = "Special-Value"}
-
-  ## Override HTTP "Host" header
-  # host_header = "check.example.com"
-
-  ## Timeout for HTTP requests
-  timeout = "5s"
-
-  ## Optional HTTP Basic Auth credentials
-  # username = "username"
-  # password = "pa$$word"
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-`
-
-const description = "Read nginx_upstream_check module status information (https://github.com/yaoweibin/nginx_upstream_check_module)"
+//go:embed sample.conf
+var sampleConfig string
 
 type NginxUpstreamCheck struct {
 	URL string `toml:"url"`
@@ -60,39 +34,15 @@ type NginxUpstreamCheck struct {
 	client *http.Client
 }
 
-func NewNginxUpstreamCheck() *NginxUpstreamCheck {
-	return &NginxUpstreamCheck{
-		URL:        "http://127.0.0.1/status?format=json",
-		Method:     "GET",
-		Headers:    make(map[string]string),
-		HostHeader: "",
-		Timeout:    config.Duration(time.Second * 5),
-	}
-}
-
-func init() {
-	inputs.Add("nginx_upstream_check", func() telegraf.Input {
-		return NewNginxUpstreamCheck()
-	})
-}
-
-func (check *NginxUpstreamCheck) SampleConfig() string {
-	return sampleConfig
-}
-
-func (check *NginxUpstreamCheck) Description() string {
-	return description
-}
-
-type NginxUpstreamCheckData struct {
+type nginxUpstreamCheckData struct {
 	Servers struct {
 		Total      uint64                     `json:"total"`
 		Generation uint64                     `json:"generation"`
-		Server     []NginxUpstreamCheckServer `json:"server"`
+		Server     []nginxUpstreamCheckServer `json:"server"`
 	} `json:"servers"`
 }
 
-type NginxUpstreamCheckServer struct {
+type nginxUpstreamCheckServer struct {
 	Index    uint64 `json:"index"`
 	Upstream string `json:"upstream"`
 	Name     string `json:"name"`
@@ -101,6 +51,33 @@ type NginxUpstreamCheckServer struct {
 	Fall     uint64 `json:"fall"`
 	Type     string `json:"type"`
 	Port     uint16 `json:"port"`
+}
+
+func (*NginxUpstreamCheck) SampleConfig() string {
+	return sampleConfig
+}
+
+func (check *NginxUpstreamCheck) Gather(accumulator telegraf.Accumulator) error {
+	if check.client == nil {
+		client, err := check.createHTTPClient()
+
+		if err != nil {
+			return err
+		}
+		check.client = client
+	}
+
+	statusURL, err := url.Parse(check.URL)
+	if err != nil {
+		return err
+	}
+
+	err = check.gatherStatusData(statusURL.String(), accumulator)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // createHTTPClient create a clients to access API
@@ -151,7 +128,7 @@ func (check *NginxUpstreamCheck) gatherJSONData(address string, value interface{
 
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		// ignore the err here; LimitReader returns io.EOF and we're not interested in read errors.
+		//nolint:errcheck // LimitReader returns io.EOF and we're not interested in read errors.
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 200))
 		return fmt.Errorf("%s returned HTTP status %s: %q", address, response.Status, body)
 	}
@@ -164,31 +141,8 @@ func (check *NginxUpstreamCheck) gatherJSONData(address string, value interface{
 	return nil
 }
 
-func (check *NginxUpstreamCheck) Gather(accumulator telegraf.Accumulator) error {
-	if check.client == nil {
-		client, err := check.createHTTPClient()
-
-		if err != nil {
-			return err
-		}
-		check.client = client
-	}
-
-	statusURL, err := url.Parse(check.URL)
-	if err != nil {
-		return err
-	}
-
-	err = check.gatherStatusData(statusURL.String(), accumulator)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func (check *NginxUpstreamCheck) gatherStatusData(address string, accumulator telegraf.Accumulator) error {
-	checkData := &NginxUpstreamCheckData{}
+	checkData := &nginxUpstreamCheckData{}
 
 	err := check.gatherJSONData(address, checkData)
 	if err != nil {
@@ -206,7 +160,7 @@ func (check *NginxUpstreamCheck) gatherStatusData(address string, accumulator te
 
 		fields := map[string]interface{}{
 			"status":      server.Status,
-			"status_code": check.getStatusCode(server.Status),
+			"status_code": getStatusCode(server.Status),
 			"rise":        server.Rise,
 			"fall":        server.Fall,
 		}
@@ -217,7 +171,7 @@ func (check *NginxUpstreamCheck) gatherStatusData(address string, accumulator te
 	return nil
 }
 
-func (check *NginxUpstreamCheck) getStatusCode(status string) uint8 {
+func getStatusCode(status string) uint8 {
 	switch status {
 	case "up":
 		return 1
@@ -226,4 +180,20 @@ func (check *NginxUpstreamCheck) getStatusCode(status string) uint8 {
 	default:
 		return 0
 	}
+}
+
+func newNginxUpstreamCheck() *NginxUpstreamCheck {
+	return &NginxUpstreamCheck{
+		URL:        "http://127.0.0.1/status?format=json",
+		Method:     "GET",
+		Headers:    make(map[string]string),
+		HostHeader: "",
+		Timeout:    config.Duration(time.Second * 5),
+	}
+}
+
+func init() {
+	inputs.Add("nginx_upstream_check", func() telegraf.Input {
+		return newNginxUpstreamCheck()
+	})
 }

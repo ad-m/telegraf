@@ -1,8 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package filestat
 
 import (
-	"crypto/md5"
-	"fmt"
+	"crypto/md5" //nolint:gosec // G501: Blocklisted import crypto/md5: weak cryptographic primitive - md5 hash is what is desired in this case
+	_ "embed"
+	"encoding/hex"
 	"io"
 	"os"
 
@@ -11,27 +13,14 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-const sampleConfig = `
-  ## Files to gather stats about.
-  ## These accept standard unix glob matching rules, but with the addition of
-  ## ** as a "super asterisk". ie:
-  ##   "/var/log/**.log"  -> recursively find all .log files in /var/log
-  ##   "/var/log/*/*.log" -> find all .log files with a parent dir in /var/log
-  ##   "/var/log/apache.log" -> just tail the apache log file
-  ##
-  ## See https://github.com/gobwas/glob for more examples
-  ##
-  files = ["/var/log/**.log"]
-
-  ## If true, read the entire file and calculate an md5 checksum.
-  md5 = false
-`
+//go:embed sample.conf
+var sampleConfig string
 
 type FileStat struct {
-	Md5   bool
-	Files []string
+	Md5   bool     `toml:"md5"`
+	Files []string `toml:"files"`
 
-	Log telegraf.Logger
+	Log telegraf.Logger `toml:"-"`
 
 	// maps full file paths to globmatch obj
 	globs map[string]*globpath.GlobPath
@@ -42,19 +31,9 @@ type FileStat struct {
 	filesWithErrors map[string]bool
 }
 
-func NewFileStat() *FileStat {
-	return &FileStat{
-		globs:           make(map[string]*globpath.GlobPath),
-		missingFiles:    make(map[string]bool),
-		filesWithErrors: make(map[string]bool),
-	}
+func (*FileStat) SampleConfig() string {
+	return sampleConfig
 }
-
-func (*FileStat) Description() string {
-	return "Read stats about given file(s)"
-}
-
-func (*FileStat) SampleConfig() string { return sampleConfig }
 
 func (f *FileStat) Gather(acc telegraf.Accumulator) error {
 	var err error
@@ -129,7 +108,7 @@ func (f *FileStat) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-// Read given file and calculate an md5 hash.
+// Read given file and calculate a md5 hash.
 func getMd5(file string) (string, error) {
 	of, err := os.Open(file)
 	if err != nil {
@@ -137,17 +116,26 @@ func getMd5(file string) (string, error) {
 	}
 	defer of.Close()
 
+	//nolint:gosec // G401: Use of weak cryptographic primitive - md5 hash is what is desired in this case
 	hash := md5.New()
 	_, err = io.Copy(hash, of)
 	if err != nil {
 		// fatal error
 		return "", err
 	}
-	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func newFileStat() *FileStat {
+	return &FileStat{
+		globs:           make(map[string]*globpath.GlobPath),
+		missingFiles:    make(map[string]bool),
+		filesWithErrors: make(map[string]bool),
+	}
 }
 
 func init() {
 	inputs.Add("filestat", func() telegraf.Input {
-		return NewFileStat()
+		return newFileStat()
 	})
 }

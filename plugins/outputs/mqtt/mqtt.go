@@ -1,137 +1,140 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package mqtt
 
 import (
+	// Blank import to support go:embed compile directive
+	_ "embed"
+	"errors"
 	"fmt"
-	"log"
-	"strings"
 	"sync"
 	"time"
 
-	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal"
-	"github.com/influxdata/telegraf/plugins/common/tls"
+	"github.com/influxdata/telegraf/plugins/common/mqtt"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	"github.com/influxdata/telegraf/plugins/serializers"
 )
 
-const (
-	defaultKeepAlive = 0
-)
+//go:embed sample.conf
+var sampleConfig string
 
-var sampleConfig = `
-  servers = ["localhost:1883"] # required.
-
-  ## MQTT outputs send metrics to this topic format
-  ##    "<topic_prefix>/<hostname>/<pluginname>/"
-  ##   ex: prefix/web01.example.com/mem
-  topic_prefix = "telegraf"
-
-  ## QoS policy for messages
-  ##   0 = at most once
-  ##   1 = at least once
-  ##   2 = exactly once
-  # qos = 2
-
-  ## username and password to connect MQTT server.
-  # username = "telegraf"
-  # password = "metricsmetricsmetricsmetrics"
-
-  ## client ID, if not set a random ID is generated
-  # client_id = ""
-
-  ## Timeout for write operations. default: 5s
-  # timeout = "5s"
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-
-  ## When true, metrics will be sent in one MQTT message per flush.  Otherwise,
-  ## metrics are written one metric per MQTT message.
-  # batch = false
-
-  ## When true, metric will have RETAIN flag set, making broker cache entries until someone
-  ## actually reads it
-  # retain = false
-
-  ## Defines the maximum length of time that the broker and client may not communicate. 
-  ## Defaults to 0 which turns the feature off. For version v2.0.12 of eclipse/mosquitto there is a 
-  ## [bug](https://github.com/eclipse/mosquitto/issues/2117) which requires keep_alive to be set.
-  ## As a reference eclipse/paho.mqtt.golang v1.3.0 defaults to 30.
-  # keep_alive = 0
-
-  ## Data format to output.
-  ## Each data format has its own unique set of configuration options, read
-  ## more about them here:
-  ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_OUTPUT.md
-  data_format = "influx"
-`
+type message struct {
+	topic   string
+	payload []byte
+}
 
 type MQTT struct {
-	Servers     []string `toml:"servers"`
-	Username    string
-	Password    string
-	Database    string
-	Timeout     config.Duration
-	TopicPrefix string
-	QoS         int    `toml:"qos"`
-	ClientID    string `toml:"client_id"`
-	tls.ClientConfig
-	BatchMessage bool  `toml:"batch"`
-	Retain       bool  `toml:"retain"`
-	KeepAlive    int64 `toml:"keep_alive"`
+	TopicPrefix     string          `toml:"topic_prefix" deprecated:"1.25.0;1.35.0;use 'topic' instead"`
+	Topic           string          `toml:"topic"`
+	BatchMessage    bool            `toml:"batch" deprecated:"1.25.2;1.35.0;use 'layout = \"batch\"' instead"`
+	Layout          string          `toml:"layout"`
+	HomieDeviceName string          `toml:"homie_device_name"`
+	HomieNodeID     string          `toml:"homie_node_id"`
+	Log             telegraf.Logger `toml:"-"`
+	mqtt.MqttConfig
 
-	client paho.Client
-	opts   *paho.ClientOptions
+	client     mqtt.Client
+	serializer telegraf.Serializer
+	generator  *TopicNameGenerator
 
-	serializer serializers.Serializer
+	homieDeviceNameGenerator *HomieGenerator
+	homieNodeIDGenerator     *HomieGenerator
+	homieSeen                map[string]map[string]bool
 
 	sync.Mutex
 }
 
-func (m *MQTT) Connect() error {
-	var err error
-	m.Lock()
-	defer m.Unlock()
-	if m.QoS > 2 || m.QoS < 0 {
-		return fmt.Errorf("MQTT Output, invalid QoS value: %d", m.QoS)
+func (*MQTT) SampleConfig() string {
+	return sampleConfig
+}
+
+func (m *MQTT) Init() error {
+	if len(m.Servers) == 0 {
+		return errors.New("no servers specified")
 	}
 
-	m.opts, err = m.createOpts()
+	if m.PersistentSession && m.ClientID == "" {
+		return errors.New("persistent_session requires client_id")
+	}
+	if m.QoS > 2 || m.QoS < 0 {
+		return fmt.Errorf("qos value must be 0, 1, or 2: %d", m.QoS)
+	}
+
+	var err error
+	m.generator, err = NewTopicNameGenerator(m.TopicPrefix, m.Topic)
 	if err != nil {
 		return err
 	}
 
-	m.client = paho.NewClient(m.opts)
-	if token := m.client.Connect(); token.Wait() && token.Error() != nil {
-		return token.Error()
+	switch m.Layout {
+	case "":
+		// For backward compatibility
+		if m.BatchMessage {
+			m.Layout = "batch"
+		} else {
+			m.Layout = "non-batch"
+		}
+	case "non-batch", "batch", "field":
+	case "homie-v4":
+		if m.HomieDeviceName == "" {
+			return errors.New("missing 'homie_device_name' option")
+		}
+
+		m.homieDeviceNameGenerator, err = NewHomieGenerator(m.HomieDeviceName)
+		if err != nil {
+			return fmt.Errorf("creating device name generator failed: %w", err)
+		}
+
+		if m.HomieNodeID == "" {
+			return errors.New("missing 'homie_node_id' option")
+		}
+
+		m.homieNodeIDGenerator, err = NewHomieGenerator(m.HomieNodeID)
+		if err != nil {
+			return fmt.Errorf("creating node ID name generator failed: %w", err)
+		}
+	default:
+		return fmt.Errorf("invalid layout %q", m.Layout)
 	}
 
 	return nil
 }
 
-func (m *MQTT) SetSerializer(serializer serializers.Serializer) {
+func (m *MQTT) Connect() error {
+	m.Lock()
+	defer m.Unlock()
+
+	m.homieSeen = make(map[string]map[string]bool)
+
+	client, err := mqtt.NewClient(&m.MqttConfig)
+	if err != nil {
+		return err
+	}
+	m.client = client
+
+	_, err = m.client.Connect()
+	return err
+}
+
+func (m *MQTT) SetSerializer(serializer telegraf.Serializer) {
 	m.serializer = serializer
 }
 
 func (m *MQTT) Close() error {
-	if m.client.IsConnected() {
-		m.client.Disconnect(20)
+	// Unregister devices if Homie layout was used. Usually we should do this
+	// using a "will" message, but this can only be done at connect time where,
+	// due to the dynamic nature of Telegraf messages, we do not know the topics
+	// to issue that "will" yet.
+	if len(m.homieSeen) > 0 {
+		for topic := range m.homieSeen {
+			//nolint:errcheck // We will ignore potential errors as we cannot do anything here
+			m.client.Publish(topic+"/$state", []byte("lost"))
+		}
+		// Give the messages some time to settle
+		time.Sleep(100 * time.Millisecond)
 	}
-	return nil
-}
-
-func (m *MQTT) SampleConfig() string {
-	return sampleConfig
-}
-
-func (m *MQTT) Description() string {
-	return "Configuration for MQTT server to send metrics to"
+	return m.client.Close()
 }
 
 func (m *MQTT) Write(metrics []telegraf.Metric) error {
@@ -140,116 +143,166 @@ func (m *MQTT) Write(metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
+
 	hostname, ok := metrics[0].Tags()["host"]
 	if !ok {
 		hostname = ""
 	}
 
-	metricsmap := make(map[string][]telegraf.Metric)
+	// Group the metrics to topics and serialize them
+	var topicMessages []message
+	switch m.Layout {
+	case "batch":
+		topicMessages = m.collectBatch(hostname, metrics)
+	case "non-batch":
+		topicMessages = m.collectNonBatch(hostname, metrics)
+	case "field":
+		topicMessages = m.collectField(hostname, metrics)
+	case "homie-v4":
+		topicMessages = m.collectHomieV4(hostname, metrics)
+	default:
+		return fmt.Errorf("unknown layout %q", m.Layout)
+	}
 
+	for _, msg := range topicMessages {
+		if err := m.client.Publish(msg.topic, msg.payload); err != nil {
+			// We do receive a timeout error if the remote broker is down,
+			// so let's retry the metrics in this case and drop them otherwise.
+			if errors.Is(err, internal.ErrTimeout) {
+				return fmt.Errorf("could not publish message to MQTT server: %w", err)
+			}
+			m.Log.Warnf("Could not publish message to MQTT server: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (m *MQTT) collectNonBatch(hostname string, metrics []telegraf.Metric) []message {
+	collection := make([]message, 0, len(metrics))
 	for _, metric := range metrics {
-		var t []string
-		if m.TopicPrefix != "" {
-			t = append(t, m.TopicPrefix)
-		}
-		if hostname != "" {
-			t = append(t, hostname)
+		topic, err := m.generator.Generate(hostname, metric)
+		if err != nil {
+			m.Log.Warnf("Generating topic name failed: %v", err)
+			m.Log.Debugf("metric was: %v", metric)
+			continue
 		}
 
-		t = append(t, metric.Name())
-		topic := strings.Join(t, "/")
+		buf, err := m.serializer.Serialize(metric)
+		if err != nil {
+			m.Log.Warnf("Could not serialize metric for topic %q: %v", topic, err)
+			m.Log.Debugf("metric was: %v", metric)
+			continue
+		}
+		collection = append(collection, message{topic, buf})
+	}
 
-		if m.BatchMessage {
-			metricsmap[topic] = append(metricsmap[topic], metric)
-		} else {
-			buf, err := m.serializer.Serialize(metric)
+	return collection
+}
+
+func (m *MQTT) collectBatch(hostname string, metrics []telegraf.Metric) []message {
+	metricsCollection := make(map[string][]telegraf.Metric)
+	for _, metric := range metrics {
+		topic, err := m.generator.Generate(hostname, metric)
+		if err != nil {
+			m.Log.Warnf("Generating topic name failed: %v", err)
+			m.Log.Debugf("metric was: %v", metric)
+			continue
+		}
+		metricsCollection[topic] = append(metricsCollection[topic], metric)
+	}
+
+	collection := make([]message, 0, len(metricsCollection))
+	for topic, ms := range metricsCollection {
+		buf, err := m.serializer.SerializeBatch(ms)
+		if err != nil {
+			m.Log.Warnf("Could not serialize metric batch for topic %q: %v", topic, err)
+			continue
+		}
+		collection = append(collection, message{topic, buf})
+	}
+	return collection
+}
+
+func (m *MQTT) collectField(hostname string, metrics []telegraf.Metric) []message {
+	var collection []message
+	for _, metric := range metrics {
+		topic, err := m.generator.Generate(hostname, metric)
+		if err != nil {
+			m.Log.Warnf("Generating topic name failed: %v", err)
+			m.Log.Debugf("metric was: %v", metric)
+			continue
+		}
+
+		for n, v := range metric.Fields() {
+			buf, err := internal.ToString(v)
 			if err != nil {
-				log.Printf("D! [outputs.mqtt] Could not serialize metric: %v", err)
+				m.Log.Warnf("Could not serialize metric for topic %q field %q: %v", topic, n, err)
+				m.Log.Debugf("metric was: %v", metric)
 				continue
 			}
-
-			err = m.publish(topic, buf)
-			if err != nil {
-				return fmt.Errorf("Could not write to MQTT server, %s", err)
-			}
+			collection = append(collection, message{topic + "/" + n, []byte(buf)})
 		}
 	}
 
-	for key := range metricsmap {
-		buf, err := m.serializer.SerializeBatch(metricsmap[key])
+	return collection
+}
 
+func (m *MQTT) collectHomieV4(hostname string, metrics []telegraf.Metric) []message {
+	var collection []message
+	for _, metric := range metrics {
+		topic, err := m.generator.Generate(hostname, metric)
 		if err != nil {
-			return err
+			m.Log.Warnf("Generating topic name failed: %v", err)
+			m.Log.Debugf("metric was: %v", metric)
+			continue
 		}
-		publisherr := m.publish(key, buf)
-		if publisherr != nil {
-			return fmt.Errorf("Could not write to MQTT server, %s", publisherr)
+
+		msgs, nodeID, err := m.collectHomieDeviceMessages(topic, metric)
+		if err != nil {
+			m.Log.Warn(err.Error())
+			m.Log.Debugf("metric was: %v", metric)
+			continue
+		}
+		path := topic + "/" + nodeID
+		collection = append(collection, msgs...)
+
+		for _, tag := range metric.TagList() {
+			propID := normalizeID(tag.Key)
+			collection = append(collection,
+				message{path + "/" + propID, []byte(tag.Value)},
+				message{path + "/" + propID + "/$name", []byte(tag.Key)},
+				message{path + "/" + propID + "/$datatype", []byte("string")},
+			)
+		}
+
+		for _, field := range metric.FieldList() {
+			v, dt, err := convertType(field.Value)
+			if err != nil {
+				m.Log.Warnf("Could not serialize metric for topic %q field %q: %v", topic, field.Key, err)
+				m.Log.Debugf("metric was: %v", metric)
+				continue
+			}
+			propID := normalizeID(field.Key)
+			collection = append(collection,
+				message{path + "/" + propID, []byte(v)},
+				message{path + "/" + propID + "/$name", []byte(field.Key)},
+				message{path + "/" + propID + "/$datatype", []byte(dt)},
+			)
 		}
 	}
 
-	return nil
-}
-
-func (m *MQTT) publish(topic string, body []byte) error {
-	token := m.client.Publish(topic, byte(m.QoS), m.Retain, body)
-	token.WaitTimeout(time.Duration(m.Timeout))
-	if token.Error() != nil {
-		return token.Error()
-	}
-	return nil
-}
-
-func (m *MQTT) createOpts() (*paho.ClientOptions, error) {
-	opts := paho.NewClientOptions()
-	opts.KeepAlive = m.KeepAlive
-
-	if m.Timeout < config.Duration(time.Second) {
-		m.Timeout = config.Duration(5 * time.Second)
-	}
-	opts.WriteTimeout = time.Duration(m.Timeout)
-
-	if m.ClientID != "" {
-		opts.SetClientID(m.ClientID)
-	} else {
-		opts.SetClientID("Telegraf-Output-" + internal.RandomString(5))
-	}
-
-	tlsCfg, err := m.ClientConfig.TLSConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	scheme := "tcp"
-	if tlsCfg != nil {
-		scheme = "ssl"
-		opts.SetTLSConfig(tlsCfg)
-	}
-
-	user := m.Username
-	if user != "" {
-		opts.SetUsername(user)
-	}
-	password := m.Password
-	if password != "" {
-		opts.SetPassword(password)
-	}
-
-	if len(m.Servers) == 0 {
-		return opts, fmt.Errorf("could not get host informations")
-	}
-	for _, host := range m.Servers {
-		server := fmt.Sprintf("%s://%s", scheme, host)
-
-		opts.AddBroker(server)
-	}
-	opts.SetAutoReconnect(true)
-	return opts, nil
+	return collection
 }
 
 func init() {
 	outputs.Add("mqtt", func() telegraf.Output {
 		return &MQTT{
-			KeepAlive: defaultKeepAlive,
+			MqttConfig: mqtt.MqttConfig{
+				KeepAlive:     30,
+				Timeout:       config.Duration(5 * time.Second),
+				AutoReconnect: true,
+			},
 		}
 	})
 }

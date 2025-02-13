@@ -1,158 +1,91 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package snmp_trap
 
 import (
+	_ "embed"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/gosnmp/gosnmp"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/internal/snmp"
 	"github.com/influxdata/telegraf/plugins/inputs"
-	"github.com/sleepinggenius2/gosmi"
-	"github.com/sleepinggenius2/gosmi/types"
-
-	"github.com/gosnmp/gosnmp"
 )
 
 var defaultTimeout = config.Duration(time.Second * 5)
 
-type mibEntry struct {
-	mibName string
-	oidText string
-}
+//go:embed sample.conf
+var sampleConfig string
 
 type SnmpTrap struct {
 	ServiceAddress string          `toml:"service_address"`
 	Timeout        config.Duration `toml:"timeout"`
 	Version        string          `toml:"version"`
 	Path           []string        `toml:"path"`
-
 	// Settings for version 3
 	// Values: "noAuthNoPriv", "authNoPriv", "authPriv"
 	SecLevel string `toml:"sec_level"`
-	SecName  string `toml:"sec_name"`
-	// Values: "MD5", "SHA", "". Default: ""
-	AuthProtocol string `toml:"auth_protocol"`
-	AuthPassword string `toml:"auth_password"`
-	// Values: "DES", "AES", "". Default: ""
-	PrivProtocol string `toml:"priv_protocol"`
-	PrivPassword string `toml:"priv_password"`
 
-	acc        telegraf.Accumulator
-	listener   *gosnmp.TrapListener
-	timeFunc   func() time.Time
-	lookupFunc func(string) (mibEntry, error)
-	errCh      chan error
+	SecName config.Secret `toml:"sec_name"`
+	// Values: "MD5", "SHA", "". Default: ""
+	AuthProtocol string        `toml:"auth_protocol"`
+	AuthPassword config.Secret `toml:"auth_password"`
+	// Values: "DES", "AES", "". Default: ""
+	PrivProtocol string        `toml:"priv_protocol"`
+	PrivPassword config.Secret `toml:"priv_password"`
+
+	Translator string          `toml:"-"`
+	Log        telegraf.Logger `toml:"-"`
+
+	acc      telegraf.Accumulator
+	listener *gosnmp.TrapListener
+	timeFunc func() time.Time
+	errCh    chan error
 
 	makeHandlerWrapper func(gosnmp.TrapHandlerFunc) gosnmp.TrapHandlerFunc
-
-	Log telegraf.Logger `toml:"-"`
+	transl             translator
 }
 
-var sampleConfig = `
-  ## Transport, local address, and port to listen on.  Transport must
-  ## be "udp://".  Omit local address to listen on all interfaces.
-  ##   example: "udp://127.0.0.1:1234"
-  ##
-  ## Special permissions may be required to listen on a port less than
-  ## 1024.  See README.md for details
-  ##
-  # service_address = "udp://:162"
-  ##
-  ## Path to mib files
-  # path = ["/usr/share/snmp/mibs"]
-  ##
-  ## Timeout running snmptranslate command
-  # timeout = "5s"
-  ## Snmp version, defaults to 2c
-  # version = "2c"
-  ## SNMPv3 authentication and encryption options.
-  ##
-  ## Security Name.
-  # sec_name = "myuser"
-  ## Authentication protocol; one of "MD5", "SHA" or "".
-  # auth_protocol = "MD5"
-  ## Authentication password.
-  # auth_password = "pass"
-  ## Security Level; one of "noAuthNoPriv", "authNoPriv", or "authPriv".
-  # sec_level = "authNoPriv"
-  ## Privacy protocol used for encrypted messages; one of "DES", "AES", "AES192", "AES192C", "AES256", "AES256C" or "".
-  # priv_protocol = ""
-  ## Privacy password used for encrypted messages.
-  # priv_password = ""
-`
+type wrapLog struct {
+	telegraf.Logger
+}
 
-func (s *SnmpTrap) SampleConfig() string {
+type translator interface {
+	lookup(oid string) (snmp.MibEntry, error)
+}
+
+func (*SnmpTrap) SampleConfig() string {
 	return sampleConfig
 }
 
-func (s *SnmpTrap) Description() string {
-	return "Receive SNMP traps"
-}
-
-func (s *SnmpTrap) Gather(_ telegraf.Accumulator) error {
-	return nil
-}
-
-func init() {
-	inputs.Add("snmp_trap", func() telegraf.Input {
-		return &SnmpTrap{
-			timeFunc:       time.Now,
-			lookupFunc:     lookup,
-			ServiceAddress: "udp://:162",
-			Timeout:        defaultTimeout,
-			Version:        "2c",
-		}
-	})
+func (s *SnmpTrap) SetTranslator(name string) {
+	s.Translator = name
 }
 
 func (s *SnmpTrap) Init() error {
-	// must init, append path for each directory, load module for every file
-	// or gosmi will fail without saying why
-	gosmi.Init()
-	err := s.getMibsPath()
+	var err error
+	switch s.Translator {
+	case "gosmi":
+		s.transl, err = newGosmiTranslator(s.Path, s.Log)
+		if err != nil {
+			return err
+		}
+	case "netsnmp":
+		s.transl = newNetsnmpTranslator(s.Timeout)
+	default:
+		return errors.New("invalid translator value")
+	}
+
 	if err != nil {
 		s.Log.Errorf("Could not get path %v", err)
-	}
-	return nil
-}
-
-func (s *SnmpTrap) getMibsPath() error {
-	var folders []string
-	for _, mibPath := range s.Path {
-		gosmi.AppendPath(mibPath)
-		folders = append(folders, mibPath)
-		err := filepath.Walk(mibPath, func(path string, info os.FileInfo, err error) error {
-			if info.Mode()&os.ModeSymlink != 0 {
-				s, _ := os.Readlink(path)
-				folders = append(folders, s)
-			}
-			return nil
-		})
-		if err != nil {
-			s.Log.Errorf("Filepath could not be walked %v", err)
-		}
-		for _, folder := range folders {
-			err := filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
-				if info.IsDir() {
-					gosmi.AppendPath(path)
-				} else if info.Mode()&os.ModeSymlink == 0 {
-					_, err := gosmi.LoadModule(info.Name())
-					if err != nil {
-						s.Log.Errorf("Module could not be loaded %v", err)
-					}
-				}
-				return nil
-			})
-			if err != nil {
-				s.Log.Errorf("Filepath could not be walked %v", err)
-			}
-		}
-		folders = []string{}
 	}
 	return nil
 }
@@ -161,7 +94,12 @@ func (s *SnmpTrap) Start(acc telegraf.Accumulator) error {
 	s.acc = acc
 	s.listener = gosnmp.NewTrapListener()
 	s.listener.OnNewTrap = makeTrapHandler(s)
-	s.listener.Params = gosnmp.Default
+
+	// gosnmp.Default is a pointer, using this more than once
+	// has side effects
+	defaults := *gosnmp.Default
+	s.listener.Params = &defaults
+	s.listener.Params.Logger = gosnmp.NewLogger(wrapLog{s.Log})
 
 	switch s.Version {
 	case "3":
@@ -185,7 +123,7 @@ func (s *SnmpTrap) Start(acc telegraf.Accumulator) error {
 		case "authpriv":
 			s.listener.Params.MsgFlags = gosnmp.AuthPriv
 		default:
-			return fmt.Errorf("unknown security level '%s'", s.SecLevel)
+			return fmt.Errorf("unknown security level %q", s.SecLevel)
 		}
 
 		var authenticationProtocol gosnmp.SnmpV3AuthProtocol
@@ -194,18 +132,18 @@ func (s *SnmpTrap) Start(acc telegraf.Accumulator) error {
 			authenticationProtocol = gosnmp.MD5
 		case "sha":
 			authenticationProtocol = gosnmp.SHA
-		//case "sha224":
-		//	authenticationProtocol = gosnmp.SHA224
-		//case "sha256":
-		//	authenticationProtocol = gosnmp.SHA256
-		//case "sha384":
-		//	authenticationProtocol = gosnmp.SHA384
-		//case "sha512":
-		//	authenticationProtocol = gosnmp.SHA512
+		case "sha224":
+			authenticationProtocol = gosnmp.SHA224
+		case "sha256":
+			authenticationProtocol = gosnmp.SHA256
+		case "sha384":
+			authenticationProtocol = gosnmp.SHA384
+		case "sha512":
+			authenticationProtocol = gosnmp.SHA512
 		case "":
 			authenticationProtocol = gosnmp.NoAuth
 		default:
-			return fmt.Errorf("unknown authentication protocol '%s'", s.AuthProtocol)
+			return fmt.Errorf("unknown authentication protocol %q", s.AuthProtocol)
 		}
 
 		var privacyProtocol gosnmp.SnmpV3PrivProtocol
@@ -225,14 +163,35 @@ func (s *SnmpTrap) Start(acc telegraf.Accumulator) error {
 		case "":
 			privacyProtocol = gosnmp.NoPriv
 		default:
-			return fmt.Errorf("unknown privacy protocol '%s'", s.PrivProtocol)
+			return fmt.Errorf("unknown privacy protocol %q", s.PrivProtocol)
 		}
 
+		secnameSecret, err := s.SecName.Get()
+		if err != nil {
+			return fmt.Errorf("getting secname failed: %w", err)
+		}
+		secname := secnameSecret.String()
+		secnameSecret.Destroy()
+
+		privPasswdSecret, err := s.PrivPassword.Get()
+		if err != nil {
+			return fmt.Errorf("getting secname failed: %w", err)
+		}
+		privPasswd := privPasswdSecret.String()
+		privPasswdSecret.Destroy()
+
+		authPasswdSecret, err := s.AuthPassword.Get()
+		if err != nil {
+			return fmt.Errorf("getting secname failed: %w", err)
+		}
+		authPasswd := authPasswdSecret.String()
+		authPasswdSecret.Destroy()
+
 		s.listener.Params.SecurityParameters = &gosnmp.UsmSecurityParameters{
-			UserName:                 s.SecName,
+			UserName:                 secname,
 			PrivacyProtocol:          privacyProtocol,
-			PrivacyPassphrase:        s.PrivPassword,
-			AuthenticationPassphrase: s.AuthPassword,
+			PrivacyPassphrase:        privPasswd,
+			AuthenticationPassphrase: authPasswd,
 			AuthenticationProtocol:   authenticationProtocol,
 		}
 	}
@@ -253,7 +212,7 @@ func (s *SnmpTrap) Start(acc telegraf.Accumulator) error {
 	// gosnmp.TrapListener currently supports udp only.  For forward
 	// compatibility, require udp in the service address
 	if protocol != "udp" {
-		return fmt.Errorf("unknown protocol '%s' in '%s'", protocol, s.ServiceAddress)
+		return fmt.Errorf("unknown protocol %q in %q", protocol, s.ServiceAddress)
 	}
 
 	// If (*TrapListener).Listen immediately returns an error we need
@@ -275,29 +234,32 @@ func (s *SnmpTrap) Start(acc telegraf.Accumulator) error {
 	return nil
 }
 
+func (*SnmpTrap) Gather(telegraf.Accumulator) error {
+	return nil
+}
+
 func (s *SnmpTrap) Stop() {
 	s.listener.Close()
-	defer gosmi.Exit()
 	err := <-s.errCh
 	if nil != err {
 		s.Log.Errorf("Error stopping trap listener %v", err)
 	}
 }
 
-func setTrapOid(tags map[string]string, oid string, e mibEntry) {
+func setTrapOid(tags map[string]string, oid string, e snmp.MibEntry) {
 	tags["oid"] = oid
-	tags["name"] = e.oidText
-	tags["mib"] = e.mibName
+	tags["name"] = e.OidText
+	tags["mib"] = e.MibName
 }
 
 func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 	return func(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) {
 		tm := s.timeFunc()
-		fields := map[string]interface{}{}
-		tags := map[string]string{}
-
-		tags["version"] = packet.Version.String()
-		tags["source"] = addr.IP.String()
+		fields := make(map[string]interface{}, len(packet.Variables)+1)
+		tags := map[string]string{
+			"version": packet.Version.String(),
+			"source":  addr.IP.String(),
+		}
 
 		if packet.Version == gosnmp.Version1 {
 			// Follow the procedure described in RFC 2576 3.1 to
@@ -311,7 +273,7 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 			}
 
 			if trapOid != "" {
-				e, err := s.lookupFunc(trapOid)
+				e, err := s.transl.lookup(trapOid)
 				if err != nil {
 					s.Log.Errorf("Error resolving V1 OID, oid=%s, source=%s: %v", trapOid, tags["source"], err)
 					return
@@ -347,15 +309,15 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 					return
 				}
 
-				var e mibEntry
+				var e snmp.MibEntry
 				var err error
-				e, err = s.lookupFunc(val)
+				e, err = s.transl.lookup(val)
 				if nil != err {
 					s.Log.Errorf("Error resolving value OID, oid=%s, source=%s: %v", val, tags["source"], err)
 					return
 				}
 
-				value = e.oidText
+				value = e.OidText
 
 				// 1.3.6.1.6.3.1.1.4.1.0 is SNMPv2-MIB::snmpTrapOID.0.
 				// If v.Name is this oid, set a tag of the trap name.
@@ -363,17 +325,24 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 					setTrapOid(tags, val, e)
 					continue
 				}
+			case gosnmp.OctetString:
+				// OctetStrings may contain hex data that needs its own conversion
+				if !utf8.Valid(v.Value.([]byte)[:]) {
+					value = hex.EncodeToString(v.Value.([]byte))
+				} else {
+					value = v.Value
+				}
 			default:
 				value = v.Value
 			}
 
-			e, err := s.lookupFunc(v.Name)
+			e, err := s.transl.lookup(v.Name)
 			if nil != err {
 				s.Log.Errorf("Error resolving OID oid=%s, source=%s: %v", v.Name, tags["source"], err)
 				return
 			}
 
-			name := e.oidText
+			name := e.OidText
 
 			fields[name] = value
 		}
@@ -396,22 +365,22 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 	}
 }
 
-func lookup(oid string) (e mibEntry, err error) {
-	var node gosmi.SmiNode
-	node, err = gosmi.GetNodeByOID(types.OidMustFromString(oid))
+func (l wrapLog) Printf(format string, args ...interface{}) {
+	l.Debugf(format, args...)
+}
 
-	// ensure modules are loaded or node will be empty (might not error)
-	if err != nil {
-		return e, err
-	}
+func (l wrapLog) Print(args ...interface{}) {
+	l.Debug(args...)
+}
 
-	e.oidText = node.RenderQualified()
-
-	i := strings.Index(e.oidText, "::")
-	if i == -1 {
-		return e, fmt.Errorf("not found")
-	}
-	e.mibName = e.oidText[:i]
-	e.oidText = e.oidText[i+2:]
-	return e, nil
+func init() {
+	inputs.Add("snmp_trap", func() telegraf.Input {
+		return &SnmpTrap{
+			timeFunc:       time.Now,
+			ServiceAddress: "udp://:162",
+			Timeout:        defaultTimeout,
+			Path:           []string{"/usr/share/snmp/mibs"},
+			Version:        "2c",
+		}
+	})
 }

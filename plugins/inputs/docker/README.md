@@ -1,14 +1,30 @@
 # Docker Input Plugin
 
-The docker plugin uses the Docker Engine API to gather metrics on running
+This plugin uses the [Docker Engine API][api] to gather metrics on running
 docker containers.
 
-The docker plugin uses the [Official Docker Client](https://github.com/moby/moby/tree/master/client)
-to gather stats from the [Engine API](https://docs.docker.com/engine/api/v1.24/).
+> [!NOTE]
+> Please make sure Telegraf has sufficient permissions to access the configured
+> endpoint!
 
-### Configuration:
+⭐ Telegraf v0.1.9
+🏷️ containers
+💻 all
 
-```toml
+[api]: https://docs.docker.com/engine/api
+
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
+
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Configuration
+
+```toml @sample.conf
 # Read metrics about docker containers
 [[inputs.docker]]
   ## Docker Endpoint
@@ -40,29 +56,21 @@ to gather stats from the [Engine API](https://docs.docker.com/engine/api/v1.24/)
   # container_state_include = []
   # container_state_exclude = []
 
+  ## Objects to include for disk usage query
+  ## Allowed values are "container", "image", "volume" 
+  ## When empty disk usage is excluded
+  storage_objects = []
+
   ## Timeout for docker list, info, and stats commands
   timeout = "5s"
 
-  ## Whether to report for each container per-device blkio (8:0, 8:1...),
-  ## network (eth0, eth1, ...) and cpu (cpu0, cpu1, ...) stats or not.
-  ## Usage of this setting is discouraged since it will be deprecated in favor of 'perdevice_include'.
-  ## Default value is 'true' for backwards compatibility, please set it to 'false' so that 'perdevice_include' setting 
-  ## is honored.
-  perdevice = true
-  
   ## Specifies for which classes a per-device metric should be issued
   ## Possible values are 'cpu' (cpu0, cpu1, ...), 'blkio' (8:0, 8:1, ...) and 'network' (eth0, eth1, ...)
   ## Please note that this setting has no effect if 'perdevice' is set to 'true'
   # perdevice_include = ["cpu"]
-  
-  ## Whether to report for each container total blkio and network stats or not.
-  ## Usage of this setting is discouraged since it will be deprecated in favor of 'total_include'.
-  ## Default value is 'false' for backwards compatibility, please set it to 'true' so that 'total_include' setting 
-  ## is honored.
-  total = false
-  
+
   ## Specifies for which classes a total metric should be issued. Total is an aggregated of the 'perdevice' values.
-  ## Possible values are 'cpu', 'blkio' and 'network'  
+  ## Possible values are 'cpu', 'blkio' and 'network'
   ## Total 'cpu' is reported directly by Docker daemon, and 'network' and 'blkio' totals are aggregated by this plugin.
   ## Please note that this setting has no effect if 'total' is set to 'false'
   # total_include = ["cpu", "blkio", "network"]
@@ -83,61 +91,74 @@ to gather stats from the [Engine API](https://docs.docker.com/engine/api/v1.24/)
   # insecure_skip_verify = false
 ```
 
-#### Environment Configuration
+### Environment Configuration
 
-When using the `"ENV"` endpoint, the connection is configured using the
-[cli Docker environment variables](https://godoc.org/github.com/moby/moby/client#NewEnvClient).
+When using the `"ENV"` endpoint, the connection is configured using the [cli
+Docker environment variables][3].
 
-#### Security
+[3]: https://godoc.org/github.com/moby/moby/client#NewEnvClient
 
-Giving telegraf access to the Docker daemon expands the [attack surface](https://docs.docker.com/engine/security/security/#docker-daemon-attack-surface) that could result in an attacker gaining root access to a machine. This is especially relevant if the telegraf configuration can be changed by untrusted users.
+### Security
 
-#### Docker Daemon Permissions
+Giving telegraf access to the Docker daemon expands the [attack surface][4] that
+could result in an attacker gaining root access to a machine. This is especially
+relevant if the telegraf configuration can be changed by untrusted users.
+
+[4]: https://docs.docker.com/engine/security/security/#docker-daemon-attack-surface
+
+### Docker Daemon Permissions
 
 Typically, telegraf must be given permission to access the docker daemon unix
 socket when using the default endpoint. This can be done by adding the
 `telegraf` unix user (created when installing a Telegraf package) to the
 `docker` unix group with the following command:
 
-```
+```shell
 sudo usermod -aG docker telegraf
 ```
 
 If telegraf is run within a container, the unix socket will need to be exposed
 within the telegraf container. This can be done in the docker CLI by add the
 option `-v /var/run/docker.sock:/var/run/docker.sock` or adding the following
-lines to the telegraf container definition in a docker compose file:
+lines to the telegraf container definition in a docker compose file.
+Additionally docker `telegraf` user must be assigned to `docker` group id
+from host:
 
-```
+```yaml
+user: telegraf:<host_docker_gid>
 volumes:
   - /var/run/docker.sock:/var/run/docker.sock
 ```
 
-#### source tag
+### source tag
 
-Selecting the containers measurements can be tricky if you have many containers with the same name.
-To alleviate this issue you can set the below value to `true`
+Selecting the containers measurements can be tricky if you have many containers
+with the same name.  To alleviate this issue you can set the below value to
+`true`
 
 ```toml
 source_tag = true
 ```
 
-This will cause all measurements to have the `source` tag be set to the first 12 characters of the container id. The first 12 characters is the common hostname for containers that have no explicit hostname set, as defined by docker.
+This will cause all measurements to have the `source` tag be set to the first 12
+characters of the container id. The first 12 characters is the common hostname
+for containers that have no explicit hostname set, as defined by docker.
 
-#### Kubernetes Labels
+### Kubernetes Labels
 
 Kubernetes may add many labels to your containers, if they are not needed you
 may prefer to exclude them:
-```
+
+```json
   docker_label_exclude = ["annotation.kubernetes*"]
 ```
 
+### Docker-compose Labels
 
-#### Docker-compose Labels
+Docker-compose will add labels to your containers. You can limit restrict labels
+to selected ones, e.g.
 
-Docker-compose will add labels to your containers. You can limit restrict labels to selected ones, e.g. 
-
-```
+```json
   docker_label_include = [
     "com.docker.compose.config-hash",
     "com.docker.compose.container-number",
@@ -147,15 +168,14 @@ Docker-compose will add labels to your containers. You can limit restrict labels
   ]
 ```
 
-
-### Metrics:
+## Metrics
 
 - docker
   - tags:
     - unit
     - engine_host
     - server_version
-  + fields:
+  - fields:
     - n_used_file_descriptors
     - n_cpus
     - n_containers
@@ -171,12 +191,12 @@ Docker-compose will add labels to your containers. You can limit restrict labels
 The `docker_data` and `docker_metadata` measurements are available only for
 some storage drivers such as devicemapper.
 
-+ docker_data (deprecated see: `docker_devicemapper`)
+- docker_data (deprecated see: `docker_devicemapper`)
   - tags:
     - unit
     - engine_host
     - server_version
-  + fields:
+  - fields:
     - available
     - total
     - used
@@ -186,19 +206,20 @@ some storage drivers such as devicemapper.
     - unit
     - engine_host
     - server_version
-  + fields:
+  - fields:
     - available
     - total
     - used
 
-The above measurements for the devicemapper storage driver can now be found in the new `docker_devicemapper` measurement
+The above measurements for the devicemapper storage driver can now be found in
+the new `docker_devicemapper` measurement
 
 - docker_devicemapper
   - tags:
     - engine_host
     - server_version
     - pool_name
-  + fields:
+  - fields:
     - pool_blocksize_bytes
     - data_space_used_bytes
     - data_space_total_bytes
@@ -208,7 +229,7 @@ The above measurements for the devicemapper storage driver can now be found in t
     - metadata_space_available_bytes
     - thin_pool_minimum_free_space_bytes
 
-+ docker_container_mem
+- docker_container_mem
   - tags:
     - engine_host
     - server_version
@@ -216,7 +237,7 @@ The above measurements for the devicemapper storage driver can now be found in t
     - container_name
     - container_status
     - container_version
-  + fields:
+  - fields:
     - total_pgmajfault
     - cache
     - mapped_file
@@ -261,7 +282,7 @@ The above measurements for the devicemapper storage driver can now be found in t
     - container_status
     - container_version
     - cpu
-  + fields:
+  - fields:
     - throttling_periods
     - throttling_throttled_periods
     - throttling_throttled_time
@@ -272,7 +293,7 @@ The above measurements for the devicemapper storage driver can now be found in t
     - usage_percent
     - container_id
 
-+ docker_container_net
+- docker_container_net
   - tags:
     - engine_host
     - server_version
@@ -281,7 +302,7 @@ The above measurements for the devicemapper storage driver can now be found in t
     - container_status
     - container_version
     - network
-  + fields:
+  - fields:
     - rx_dropped
     - rx_bytes
     - rx_errors
@@ -327,8 +348,8 @@ status if configured.
     - container_status
     - container_version
   - fields:
-  	- health_status (string)
-  	- failing_streak (integer)
+    - health_status (string)
+    - failing_streak (integer)
 
 - docker_container_status
   - tags:
@@ -356,9 +377,26 @@ status if configured.
     - tasks_desired
     - tasks_running
 
-### Example Output:
+- docker_disk_usage
+  - tags:
+    - engine_host
+    - server_version
+    - container_name
+    - container_image
+    - container_version
+    - image_id
+    - image_name
+    - image_version
+    - volume_name
+  - fields:
+    - size_rw
+    - size_root_fs
+    - size
+    - shared_size
 
-```
+## Example Output
+
+```text
 docker,engine_host=debian-stretch-docker,server_version=17.09.0-ce n_containers=6i,n_containers_paused=0i,n_containers_running=1i,n_containers_stopped=5i,n_cpus=2i,n_goroutines=41i,n_images=2i,n_listener_events=0i,n_used_file_descriptors=27i 1524002041000000000
 docker,engine_host=debian-stretch-docker,server_version=17.09.0-ce,unit=bytes memory_total=2101661696i 1524002041000000000
 docker_container_mem,container_image=telegraf,container_name=zen_ritchie,container_status=running,container_version=unknown,engine_host=debian-stretch-docker,server_version=17.09.0-ce active_anon=8327168i,active_file=2314240i,cache=27402240i,container_id="adc4ba9593871bf2ab95f3ffde70d1b638b897bb225d21c2c9c84226a10a8cf4",hierarchical_memory_limit=9223372036854771712i,inactive_anon=0i,inactive_file=25088000i,limit=2101661696i,mapped_file=20582400i,max_usage=36646912i,pgfault=4193i,pgmajfault=214i,pgpgin=9243i,pgpgout=520i,rss=8327168i,rss_huge=0i,total_active_anon=8327168i,total_active_file=2314240i,total_cache=27402240i,total_inactive_anon=0i,total_inactive_file=25088000i,total_mapped_file=20582400i,total_pgfault=4193i,total_pgmajfault=214i,total_pgpgin=9243i,total_pgpgout=520i,total_rss=8327168i,total_rss_huge=0i,total_unevictable=0i,total_writeback=0i,unevictable=0i,usage=36528128i,usage_percent=0.4342225020025297,writeback=0i 1524002042000000000
@@ -369,4 +407,8 @@ docker_container_net,container_image=telegraf,container_name=zen_ritchie,contain
 docker_container_blkio,container_image=telegraf,container_name=zen_ritchie,container_status=running,container_version=unknown,device=254:0,engine_host=debian-stretch-docker,server_version=17.09.0-ce container_id="adc4ba9593871bf2ab95f3ffde70d1b638b897bb225d21c2c9c84226a10a8cf4",io_service_bytes_recursive_async=27398144i,io_service_bytes_recursive_read=27398144i,io_service_bytes_recursive_sync=0i,io_service_bytes_recursive_total=27398144i,io_service_bytes_recursive_write=0i,io_serviced_recursive_async=529i,io_serviced_recursive_read=529i,io_serviced_recursive_sync=0i,io_serviced_recursive_total=529i,io_serviced_recursive_write=0i 1524002042000000000
 docker_container_health,container_image=telegraf,container_name=zen_ritchie,container_status=running,container_version=unknown,engine_host=debian-stretch-docker,server_version=17.09.0-ce failing_streak=0i,health_status="healthy" 1524007529000000000
 docker_swarm,service_id=xaup2o9krw36j2dy1mjx1arjw,service_mode=replicated,service_name=test tasks_desired=3,tasks_running=3 1508968160000000000
+docker_disk_usage,engine_host=docker-desktop,server_version=24.0.5 layers_size=17654519107i 1695742041000000000
+docker_disk_usage,container_image=influxdb,container_name=frosty_wright,container_version=1.8,engine_host=docker-desktop,server_version=24.0.5 size_root_fs=286593526i,size_rw=538i 1695742041000000000
+docker_disk_usage,engine_host=docker-desktop,image_id=7f4a1cc74046,image_name=telegraf,image_version=latest,server_version=24.0.5 shared_size=0i,size=425484494i 1695742041000000000
+docker_disk_usage,engine_host=docker-desktop,server_version=24.0.5,volume_name=docker_influxdb-data size=91989940i 1695742041000000000
 ```

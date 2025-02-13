@@ -1,12 +1,23 @@
 # S2 Geo Processor Plugin
 
-Use the `s2geo` processor to add tag with S2 cell ID token of specified [cell level][cell levels].
-The tag is used in `experimental/geo` Flux package functions.
-The `lat` and `lon` fields values should contain WGS-84 coordinates in decimal degrees.
+Use the `s2geo` processor to add tag with S2 cell ID token of specified [cell
+level][cell levels].  The tag is used in `experimental/geo` Flux package
+functions.  The `lat` and `lon` fields values should contain WGS-84 coordinates
+in decimal degrees.
 
-### Configuration
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
 
-```toml
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Configuration
+
+```toml @sample.conf
+# Add the S2 Cell ID as a tag based on latitude and longitude fields
 [[processors.s2geo]]
   ## The name of the lat and lon fields containing WGS-84 latitude and
   ## longitude in decimal degrees.
@@ -20,7 +31,7 @@ The `lat` and `lon` fields values should contain WGS-84 coordinates in decimal d
   # cell_level = 9
 ```
 
-### Example
+## Example
 
 ```diff
 - mta,area=llir,id=GO505_20_2704,status=1 lat=40.878738,lon=-72.517572 1560540094

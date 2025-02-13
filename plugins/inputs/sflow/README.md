@@ -6,7 +6,7 @@ accordance with the specification from [sflow.org](https://sflow.org/).
 Currently only Flow Samples of Ethernet / IPv4 & IPv4 TCP & UDP headers are
 turned into metrics.  Counters and other header samples are ignored.
 
-#### Series Cardinality Warning
+## Series Cardinality Warning
 
 This plugin may produce a high number of series which, when not controlled
 for, will cause high load on your database. Use the following techniques to
@@ -18,9 +18,30 @@ avoid cardinality issues:
 - Monitor your databases [series cardinality][].
 - Consult the [InfluxDB documentation][influx-docs] for the most up-to-date techniques.
 
-### Configuration
+## Service Input <!-- @/docs/includes/service_input.md -->
 
-```toml
+This plugin is a service input. Normal plugins gather metrics determined by the
+interval setting. Service plugins start a service to listens and waits for
+metrics or events to occur. Service plugins have two key differences from
+normal plugins:
+
+1. The global or plugin specific `interval` setting may not apply
+2. The CLI options of `--test`, `--test-wait`, and `--once` may not produce
+   output for this plugin
+
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
+
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Configuration
+
+```toml @sample.conf
+# SFlow V5 Protocol Listener
 [[inputs.sflow]]
   ## Address to listen for sFlow packets.
   ##   example: service_address = "udp://:6343"
@@ -33,7 +54,7 @@ avoid cardinality issues:
   # read_buffer_size = ""
 ```
 
-### Metrics
+## Metrics
 
 - sflow
   - tags:
@@ -81,33 +102,35 @@ avoid cardinality issues:
     - ip_flags (integer, ip_ver field of IPv4 structures)
     - tcp_flags (integer, TCP flags of TCP IP header (IPv4 or IPv6))
 
-### Troubleshooting
+## Troubleshooting
 
 The [sflowtool][] utility can be used to print sFlow packets, and compared
 against the metrics produced by Telegraf.
-```
+
+```sh
 sflowtool -p 6343
 ```
 
 If opening an issue, in addition to the output of sflowtool it will also be
 helpful to collect a packet capture.  Adjust the interface, host and port as
 needed:
-```
-$ sudo tcpdump -s 0 -i eth0 -w telegraf-sflow.pcap host 127.0.0.1 and port 6343
+
+```sh
+sudo tcpdump -s 0 -i eth0 -w telegraf-sflow.pcap host 127.0.0.1 and port 6343
 ```
 
 [sflowtool]: https://github.com/sflow/sflowtool
 
-### Example Output
-```
+## Example Output
+
+```text
 sflow,agent_address=0.0.0.0,dst_ip=10.0.0.2,dst_mac=ff:ff:ff:ff:ff:ff,dst_port=40042,ether_type=IPv4,header_protocol=ETHERNET-ISO88023,input_ifindex=6,ip_dscp=27,ip_ecn=0,output_ifindex=1073741823,source_id_index=3,source_id_type=0,src_ip=10.0.0.1,src_mac=ff:ff:ff:ff:ff:ff,src_port=443 bytes=1570i,drops=0i,frame_length=157i,header_length=128i,ip_flags=2i,ip_fragment_offset=0i,ip_total_length=139i,ip_ttl=42i,sampling_rate=10i,tcp_header_length=0i,tcp_urgent_pointer=0i,tcp_window_size=14i 1584473704793580447
 ```
 
-### Reference Documentation
+## Reference Documentation
 
-This sflow implementation was built from the reference document 
-[sflow.org/sflow_version_5.txt](sflow_version_5)
-
+This sflow implementation was built from the reference document
+[sflow.org/sflow_version_5.txt][sflow_version_5]
 
 [metric filtering]: https://github.com/influxdata/telegraf/blob/master/docs/CONFIGURATION.md#metric-filtering
 [retention policy]: https://docs.influxdata.com/influxdb/latest/guides/downsampling_and_retention/

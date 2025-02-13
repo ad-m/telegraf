@@ -2,7 +2,7 @@ package cookie
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,26 +12,32 @@ import (
 
 	clockutil "github.com/benbjohnson/clock"
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
 )
 
 const (
-	reqUser   = "testUser"
-	reqPasswd = "testPassword"
-	reqBody   = "a body"
+	reqUser      = "testUser"
+	reqPasswd    = "testPassword"
+	reqBody      = "a body"
+	reqHeaderKey = "hello"
+	reqHeaderVal = "world"
 
 	authEndpointNoCreds                   = "/auth"
 	authEndpointWithBasicAuth             = "/authWithCreds"
 	authEndpointWithBasicAuthOnlyUsername = "/authWithCredsUser"
 	authEndpointWithBody                  = "/authWithBody"
+	authEndpointWithHeader                = "/authWithHeader"
 )
 
 var fakeCookie = &http.Cookie{
 	Name:  "test-cookie",
 	Value: "this is an auth cookie",
 }
+
+var reqHeaderValSecret = config.NewSecret([]byte(reqHeaderVal))
 
 type fakeServer struct {
 	*httptest.Server
@@ -49,9 +55,19 @@ func newFakeServer(t *testing.T) fakeServer {
 			switch r.URL.Path {
 			case authEndpointNoCreds:
 				authed()
+			case authEndpointWithHeader:
+				if !cmp.Equal(r.Header.Get(reqHeaderKey), reqHeaderVal) {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				authed()
 			case authEndpointWithBody:
 				body, err := io.ReadAll(r.Body)
-				require.NoError(t, err)
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Error(err)
+					return
+				}
 				if !cmp.Equal([]byte(reqBody), body) {
 					w.WriteHeader(http.StatusUnauthorized)
 					return
@@ -77,7 +93,11 @@ func newFakeServer(t *testing.T) fakeServer {
 					w.WriteHeader(http.StatusForbidden)
 					return
 				}
-				_, _ = w.Write([]byte("good test response"))
+				if _, err := w.Write([]byte("good test response")); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Error(err)
+					return
+				}
 			}
 		})),
 		int32: &c,
@@ -112,6 +132,7 @@ func TestAuthConfig_Start(t *testing.T) {
 		Username string
 		Password string
 		Body     string
+		Headers  map[string]*config.Secret
 	}
 	type args struct {
 		renewal  time.Duration
@@ -132,6 +153,20 @@ func TestAuthConfig_Start(t *testing.T) {
 			args: args{
 				renewal:  renewal,
 				endpoint: authEndpointNoCreds,
+			},
+			firstAuthCount:    1,
+			lastAuthCount:     3,
+			firstHTTPResponse: http.StatusOK,
+			lastHTTPResponse:  http.StatusOK,
+		},
+		{
+			name: "success no creds, no body, default method, header set",
+			args: args{
+				renewal:  renewal,
+				endpoint: authEndpointWithHeader,
+			},
+			fields: fields{
+				Headers: map[string]*config.Secret{reqHeaderKey: &reqHeaderValSecret},
 			},
 			firstAuthCount:    1,
 			lastAuthCount:     3,
@@ -165,7 +200,7 @@ func TestAuthConfig_Start(t *testing.T) {
 				renewal:  renewal,
 				endpoint: authEndpointWithBasicAuth,
 			},
-			wantErr:           fmt.Errorf("cookie auth renewal received status code: 401 (Unauthorized)"),
+			wantErr:           errors.New("cookie auth renewal received status code: 401 (Unauthorized) []"),
 			firstAuthCount:    0,
 			lastAuthCount:     0,
 			firstHTTPResponse: http.StatusForbidden,
@@ -196,7 +231,7 @@ func TestAuthConfig_Start(t *testing.T) {
 				renewal:  renewal,
 				endpoint: authEndpointWithBody,
 			},
-			wantErr:           fmt.Errorf("cookie auth renewal received status code: 401 (Unauthorized)"),
+			wantErr:           errors.New("cookie auth renewal received status code: 401 (Unauthorized) []"),
 			firstAuthCount:    0,
 			lastAuthCount:     0,
 			firstHTTPResponse: http.StatusForbidden,
@@ -204,7 +239,6 @@ func TestAuthConfig_Start(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			srv := newFakeServer(t)
 			c := &CookieAuthConfig{
@@ -213,6 +247,7 @@ func TestAuthConfig_Start(t *testing.T) {
 				Username: tt.fields.Username,
 				Password: tt.fields.Password,
 				Body:     tt.fields.Body,
+				Headers:  tt.fields.Headers,
 				Renewal:  config.Duration(tt.args.renewal),
 			}
 			if err := c.initializeClient(srv.Client()); tt.wantErr != nil {
@@ -231,7 +266,10 @@ func TestAuthConfig_Start(t *testing.T) {
 			srv.checkAuthCount(t, tt.firstAuthCount)
 			srv.checkResp(t, tt.firstHTTPResponse)
 			mock.Add(renewalCheck)
+
 			// Ensure that the auth renewal goroutine has completed
+			require.Eventually(t, func() bool { return atomic.LoadInt32(srv.int32) >= tt.lastAuthCount }, time.Second, 10*time.Millisecond)
+
 			cancel()
 			c.wg.Wait()
 			srv.checkAuthCount(t, tt.lastAuthCount)

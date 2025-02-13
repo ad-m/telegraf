@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package bind
 
 import (
+	_ "embed"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,31 +14,20 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 type Bind struct {
-	Urls                 []string
-	GatherMemoryContexts bool
-	GatherViews          bool
+	Urls                 []string        `toml:"urls"`
+	GatherMemoryContexts bool            `toml:"gather_memory_contexts"`
+	GatherViews          bool            `toml:"gather_views"`
 	Timeout              config.Duration `toml:"timeout"`
+	CountersAsInt        bool            `toml:"report_counters_as_int"`
 
 	client http.Client
 }
 
-var sampleConfig = `
-  ## An array of BIND XML statistics URI to gather stats.
-  ## Default is "http://localhost:8053/xml/v3".
-  # urls = ["http://localhost:8053/xml/v3"]
-  # gather_memory_contexts = false
-  # gather_views = false
-
-  ## Timeout for http requests made by bind nameserver
-  # timeout = "4s"
-`
-
-func (b *Bind) Description() string {
-	return "Read BIND nameserver XML statistics"
-}
-
-func (b *Bind) SampleConfig() string {
+func (*Bind) SampleConfig() string {
 	return sampleConfig
 }
 
@@ -58,7 +49,7 @@ func (b *Bind) Gather(acc telegraf.Accumulator) error {
 	for _, u := range b.Urls {
 		addr, err := url.Parse(u)
 		if err != nil {
-			acc.AddError(fmt.Errorf("unable to parse address '%s': %s", u, err))
+			acc.AddError(fmt.Errorf("unable to parse address %q: %w", u, err))
 			continue
 		}
 
@@ -94,5 +85,5 @@ func (b *Bind) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 }
 
 func init() {
-	inputs.Add("bind", func() telegraf.Input { return &Bind{} })
+	inputs.Add("bind", func() telegraf.Input { return &Bind{CountersAsInt: true} })
 }

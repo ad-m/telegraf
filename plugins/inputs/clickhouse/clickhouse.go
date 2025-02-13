@@ -1,7 +1,9 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package clickhouse
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,94 +21,11 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 var defaultTimeout = 5 * time.Second
 
-var sampleConfig = `
-  ## Username for authorization on ClickHouse server
-  ## example: username = "default"
-  username = "default"
-
-  ## Password for authorization on ClickHouse server
-  ## example: password = "super_secret"
-
-  ## HTTP(s) timeout while getting metrics values
-  ## The timeout includes connection time, any redirects, and reading the response body.
-  ##   example: timeout = 1s
-  # timeout = 5s
-
-  ## List of servers for metrics scraping
-  ## metrics scrape via HTTP(s) clickhouse interface
-  ## https://clickhouse.tech/docs/en/interfaces/http/
-  ##    example: servers = ["http://127.0.0.1:8123","https://custom-server.mdb.yandexcloud.net"]
-  servers         = ["http://127.0.0.1:8123"]
-
-  ## If "auto_discovery"" is "true" plugin tries to connect to all servers available in the cluster
-  ## with using same "user:password" described in "user" and "password" parameters
-  ## and get this server hostname list from "system.clusters" table
-  ## see
-  ## - https://clickhouse.tech/docs/en/operations/system_tables/#system-clusters
-  ## - https://clickhouse.tech/docs/en/operations/server_settings/settings/#server_settings_remote_servers
-  ## - https://clickhouse.tech/docs/en/operations/table_engines/distributed/
-  ## - https://clickhouse.tech/docs/en/operations/table_engines/replication/#creating-replicated-tables
-  ##    example: auto_discovery = false
-  # auto_discovery = true
-
-  ## Filter cluster names in "system.clusters" when "auto_discovery" is "true"
-  ## when this filter present then "WHERE cluster IN (...)" filter will apply
-  ## please use only full cluster names here, regexp and glob filters is not allowed
-  ## for "/etc/clickhouse-server/config.d/remote.xml"
-  ## <yandex>
-  ##  <remote_servers>
-  ##    <my-own-cluster>
-  ##        <shard>
-  ##          <replica><host>clickhouse-ru-1.local</host><port>9000</port></replica>
-  ##          <replica><host>clickhouse-ru-2.local</host><port>9000</port></replica>
-  ##        </shard>
-  ##        <shard>
-  ##          <replica><host>clickhouse-eu-1.local</host><port>9000</port></replica>
-  ##          <replica><host>clickhouse-eu-2.local</host><port>9000</port></replica>
-  ##        </shard>
-  ##    </my-onw-cluster>
-  ##  </remote_servers>
-  ##
-  ## </yandex>
-  ##
-  ## example: cluster_include = ["my-own-cluster"]
-  # cluster_include = []
-
-  ## Filter cluster names in "system.clusters" when "auto_discovery" is "true"
-  ## when this filter present then "WHERE cluster NOT IN (...)" filter will apply
-  ##    example: cluster_exclude = ["my-internal-not-discovered-cluster"]
-  # cluster_exclude = []
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-`
-
-type connect struct {
-	Cluster  string `json:"cluster"`
-	ShardNum int    `json:"shard_num"`
-	Hostname string `json:"host_name"`
-	url      *url.URL
-}
-
-func init() {
-	inputs.Add("clickhouse", func() telegraf.Input {
-		return &ClickHouse{
-			AutoDiscovery: true,
-			ClientConfig: tls.ClientConfig{
-				InsecureSkipVerify: false,
-			},
-			Timeout: config.Duration(defaultTimeout),
-		}
-	})
-}
-
-// ClickHouse Telegraf Input Plugin
 type ClickHouse struct {
 	Username       string          `toml:"username"`
 	Password       string          `toml:"password"`
@@ -115,18 +34,34 @@ type ClickHouse struct {
 	ClusterInclude []string        `toml:"cluster_include"`
 	ClusterExclude []string        `toml:"cluster_exclude"`
 	Timeout        config.Duration `toml:"timeout"`
-	HTTPClient     http.Client
+	Variant        string          `toml:"variant"`
+
+	HTTPClient http.Client
 	tls.ClientConfig
 }
 
-// SampleConfig returns the sample config
+type connect struct {
+	Cluster  string `json:"cluster"`
+	ShardNum int    `json:"shard_num"`
+	Hostname string `json:"host_name"`
+	url      *url.URL
+}
+
 func (*ClickHouse) SampleConfig() string {
 	return sampleConfig
 }
 
-// Description return plugin description
-func (*ClickHouse) Description() string {
-	return "Read metrics from one or many ClickHouse servers"
+func (ch *ClickHouse) Init() error {
+	switch ch.Variant {
+	case "":
+		ch.Variant = "self-hosted"
+	case "self-hosted", "managed":
+		// valid options
+	default:
+		return fmt.Errorf("unknown variant %q", ch.Variant)
+	}
+
+	return nil
 }
 
 // Start ClickHouse input service
@@ -194,10 +129,9 @@ func (ch *ClickHouse) Gather(acc telegraf.Accumulator) (err error) {
 		}
 	}
 
-	for _, conn := range connects {
+	for i := range connects {
 		metricsFuncs := []func(acc telegraf.Accumulator, conn *connect) error{
 			ch.tables,
-			ch.zookeeper,
 			ch.replicationQueue,
 			ch.detachedParts,
 			ch.dictionaries,
@@ -207,14 +141,20 @@ func (ch *ClickHouse) Gather(acc telegraf.Accumulator) (err error) {
 			ch.textLog,
 		}
 
+		// Managed instances on Clickhouse Cloud does not give a user
+		// permissions to the zookeeper table
+		if ch.Variant != "managed" {
+			metricsFuncs = append(metricsFuncs, ch.zookeeper)
+		}
+
 		for _, metricFunc := range metricsFuncs {
-			if err := metricFunc(acc, &conn); err != nil {
+			if err := metricFunc(acc, &connects[i]); err != nil {
 				acc.AddError(err)
 			}
 		}
 
 		for metric := range commonMetrics {
-			if err := ch.commonMetrics(acc, &conn, metric); err != nil {
+			if err := ch.commonMetrics(acc, &connects[i], metric); err != nil {
 				acc.AddError(err)
 			}
 		}
@@ -270,7 +210,7 @@ func (ch *ClickHouse) commonMetrics(acc telegraf.Accumulator, conn *connect, met
 		Value  float64 `json:"value"`
 	}
 
-	tags := ch.makeDefaultTags(conn)
+	tags := makeDefaultTags(conn)
 	fields := make(map[string]interface{})
 
 	if commonMetricsIsFloat[metric] {
@@ -301,7 +241,7 @@ func (ch *ClickHouse) zookeeper(acc telegraf.Accumulator, conn *connect) error {
 	if err := ch.execQuery(conn.url, systemZookeeperExistsSQL, &zkExists); err != nil {
 		return err
 	}
-	tags := ch.makeDefaultTags(conn)
+	tags := makeDefaultTags(conn)
 
 	if len(zkExists) > 0 && zkExists[0].ZkExists > 0 {
 		var zkRootNodes []struct {
@@ -330,7 +270,7 @@ func (ch *ClickHouse) replicationQueue(acc telegraf.Accumulator, conn *connect) 
 		return err
 	}
 
-	tags := ch.makeDefaultTags(conn)
+	tags := makeDefaultTags(conn)
 
 	if len(replicationQueueExists) > 0 && replicationQueueExists[0].ReplicationQueueExists > 0 {
 		var replicationTooManyTries []struct {
@@ -361,7 +301,7 @@ func (ch *ClickHouse) detachedParts(acc telegraf.Accumulator, conn *connect) err
 	}
 
 	if len(detachedParts) > 0 {
-		tags := ch.makeDefaultTags(conn)
+		tags := makeDefaultTags(conn)
 		acc.AddFields("clickhouse_detached_parts",
 			map[string]interface{}{
 				"detached_parts": uint64(detachedParts[0].DetachedParts),
@@ -383,7 +323,7 @@ func (ch *ClickHouse) dictionaries(acc telegraf.Accumulator, conn *connect) erro
 	}
 
 	for _, dict := range brokenDictionaries {
-		tags := ch.makeDefaultTags(conn)
+		tags := makeDefaultTags(conn)
 
 		isLoaded := uint64(1)
 		if dict.Status != "LOADED" {
@@ -416,7 +356,7 @@ func (ch *ClickHouse) mutations(acc telegraf.Accumulator, conn *connect) error {
 	}
 
 	if len(mutationsStatus) > 0 {
-		tags := ch.makeDefaultTags(conn)
+		tags := makeDefaultTags(conn)
 
 		acc.AddFields("clickhouse_mutations",
 			map[string]interface{}{
@@ -444,7 +384,7 @@ func (ch *ClickHouse) disks(acc telegraf.Accumulator, conn *connect) error {
 	}
 
 	for _, disk := range disksStatus {
-		tags := ch.makeDefaultTags(conn)
+		tags := makeDefaultTags(conn)
 		tags["name"] = disk.Name
 		tags["path"] = disk.Path
 
@@ -473,7 +413,7 @@ func (ch *ClickHouse) processes(acc telegraf.Accumulator, conn *connect) error {
 	}
 
 	for _, process := range processesStats {
-		tags := ch.makeDefaultTags(conn)
+		tags := makeDefaultTags(conn)
 		tags["query_type"] = process.QueryType
 
 		acc.AddFields("clickhouse_processes",
@@ -508,7 +448,7 @@ func (ch *ClickHouse) textLog(acc telegraf.Accumulator, conn *connect) error {
 		}
 
 		for _, textLogItem := range textLogLast10MinMessages {
-			tags := ch.makeDefaultTags(conn)
+			tags := makeDefaultTags(conn)
 			tags["level"] = textLogItem.Level
 			acc.AddFields("clickhouse_text_log",
 				map[string]interface{}{
@@ -533,7 +473,7 @@ func (ch *ClickHouse) tables(acc telegraf.Accumulator, conn *connect) error {
 	if err := ch.execQuery(conn.url, systemPartsSQL, &parts); err != nil {
 		return err
 	}
-	tags := ch.makeDefaultTags(conn)
+	tags := makeDefaultTags(conn)
 
 	for _, part := range parts {
 		tags["table"] = part.Table
@@ -550,7 +490,7 @@ func (ch *ClickHouse) tables(acc telegraf.Accumulator, conn *connect) error {
 	return nil
 }
 
-func (ch *ClickHouse) makeDefaultTags(conn *connect) map[string]string {
+func makeDefaultTags(conn *connect) map[string]string {
 	tags := map[string]string{
 		"source": conn.Hostname,
 	}
@@ -576,7 +516,10 @@ func (ch *ClickHouse) execQuery(address *url.URL, query string, i interface{}) e
 	q := address.Query()
 	q.Set("query", query+" FORMAT JSON")
 	address.RawQuery = q.Encode()
-	req, _ := http.NewRequest("GET", address.String(), nil)
+	req, err := http.NewRequest("GET", address.String(), nil)
+	if err != nil {
+		return err
+	}
 	if ch.Username != "" {
 		req.Header.Add("X-ClickHouse-User", ch.Username)
 	}
@@ -589,6 +532,7 @@ func (ch *ClickHouse) execQuery(address *url.URL, query string, i interface{}) e
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
+		//nolint:errcheck // reading body for error reporting
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		return &clickhouseError{
 			StatusCode: resp.StatusCode,
@@ -647,18 +591,25 @@ const (
 	systemZookeeperRootNodesSQL = "SELECT count() AS zk_root_nodes FROM system.zookeeper WHERE path='/'"
 
 	systemReplicationExistsSQL   = "SELECT count() AS replication_queue_exists FROM system.tables WHERE database='system' AND name='replication_queue'"
-	systemReplicationNumTriesSQL = "SELECT countIf(num_tries>1) AS replication_num_tries_replicas, countIf(num_tries>100) AS replication_too_many_tries_replicas FROM system.replication_queue SETTINGS empty_result_for_aggregation_by_empty_set=0"
+	systemReplicationNumTriesSQL = "SELECT countIf(num_tries>1) AS replication_num_tries_replicas, countIf(num_tries>100) " +
+		"AS replication_too_many_tries_replicas FROM system.replication_queue SETTINGS empty_result_for_aggregation_by_empty_set=0"
 
 	systemDetachedPartsSQL = "SELECT count() AS detached_parts FROM system.detached_parts SETTINGS empty_result_for_aggregation_by_empty_set=0"
 
 	systemDictionariesSQL = "SELECT origin, status, bytes_allocated FROM system.dictionaries"
 
-	systemMutationSQL  = "SELECT countIf(latest_fail_time>toDateTime('0000-00-00 00:00:00') AND is_done=0) AS failed, countIf(latest_fail_time=toDateTime('0000-00-00 00:00:00') AND is_done=0) AS running, countIf(is_done=1) AS completed FROM system.mutations SETTINGS empty_result_for_aggregation_by_empty_set=0"
-	systemDisksSQL     = "SELECT name, path, toUInt64(100*free_space / total_space) AS free_space_percent, toUInt64( 100 * keep_free_space / total_space) AS keep_free_space_percent FROM system.disks"
-	systemProcessesSQL = "SELECT multiIf(positionCaseInsensitive(query,'select')=1,'select',positionCaseInsensitive(query,'insert')=1,'insert','other') AS query_type, quantile\n(0.5)(elapsed) AS p50, quantile(0.9)(elapsed) AS p90, max(elapsed) AS longest_running FROM system.processes GROUP BY query_type SETTINGS empty_result_for_aggregation_by_empty_set=0"
+	systemMutationSQL = "SELECT countIf(latest_fail_time>toDateTime('0000-00-00 00:00:00') AND is_done=0) " +
+		"AS failed, countIf(latest_fail_time=toDateTime('0000-00-00 00:00:00') AND is_done=0) " +
+		"AS running, countIf(is_done=1) AS completed FROM system.mutations SETTINGS empty_result_for_aggregation_by_empty_set=0"
+	systemDisksSQL = "SELECT name, path, toUInt64(100*free_space / total_space) " +
+		"AS free_space_percent, toUInt64( 100 * keep_free_space / total_space) AS keep_free_space_percent FROM system.disks"
+	systemProcessesSQL = "SELECT multiIf(positionCaseInsensitive(query,'select')=1,'select',positionCaseInsensitive(query,'insert')=1,'insert','other') " +
+		"AS query_type, quantile\n(0.5)(elapsed) AS p50, quantile(0.9)(elapsed) AS p90, max(elapsed) AS longest_running " +
+		"FROM system.processes GROUP BY query_type SETTINGS empty_result_for_aggregation_by_empty_set=0"
 
 	systemTextLogExistsSQL = "SELECT count() AS text_log_exists FROM system.tables WHERE database='system' AND name='text_log'"
-	systemTextLogSQL       = "SELECT count() AS messages_last_10_min, level FROM system.text_log WHERE level <= 'Notice' AND event_time >= now() - INTERVAL 600 SECOND GROUP BY level SETTINGS empty_result_for_aggregation_by_empty_set=0"
+	systemTextLogSQL       = "SELECT count() AS messages_last_10_min, level FROM system.text_log " +
+		"WHERE level <= 'Notice' AND event_time >= now() - INTERVAL 600 SECOND GROUP BY level SETTINGS empty_result_for_aggregation_by_empty_set=0"
 )
 
 var commonMetrics = map[string]string{
@@ -674,3 +625,15 @@ var commonMetricsIsFloat = map[string]bool{
 }
 
 var _ telegraf.ServiceInput = &ClickHouse{}
+
+func init() {
+	inputs.Add("clickhouse", func() telegraf.Input {
+		return &ClickHouse{
+			AutoDiscovery: true,
+			ClientConfig: tls.ClientConfig{
+				InsecureSkipVerify: false,
+			},
+			Timeout: config.Duration(defaultTimeout),
+		}
+	})
+}

@@ -4,13 +4,18 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
-	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/testutil"
 )
 
 const (
@@ -18,19 +23,28 @@ const (
 	testURL   = "https://logzio.com"
 )
 
-func TestConnetWithoutToken(t *testing.T) {
+func TestConnectWithoutToken(t *testing.T) {
 	l := &Logzio{
 		URL: testURL,
 		Log: testutil.Logger{},
 	}
 	err := l.Connect()
-	require.Error(t, err)
+	require.ErrorContains(t, err, "token is required")
+}
+
+func TestConnectWithDefaultToken(t *testing.T) {
+	l := &Logzio{
+		URL:   testURL,
+		Token: config.NewSecret([]byte("your logz.io token")),
+		Log:   testutil.Logger{},
+	}
+	err := l.Connect()
+	require.ErrorContains(t, err, "please replace 'token'")
 }
 
 func TestParseMetric(t *testing.T) {
-	l := &Logzio{}
 	for _, tm := range testutil.MockMetrics() {
-		lm := l.parseMetric(tm)
+		lm := parseMetric(tm)
 		require.Equal(t, tm.Fields(), lm.Metric[tm.Name()])
 		require.Equal(t, logzioType, lm.Type)
 		require.Equal(t, tm.Tags(), lm.Dimensions)
@@ -39,22 +53,18 @@ func TestParseMetric(t *testing.T) {
 }
 
 func TestBadStatusCode(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer ts.Close()
 
 	l := &Logzio{
-		Token: testToken,
+		Token: config.NewSecret([]byte(testToken)),
 		URL:   ts.URL,
 		Log:   testutil.Logger{},
 	}
-
-	err := l.Connect()
-	require.NoError(t, err)
-
-	err = l.Write(testutil.MockMetrics())
-	require.Error(t, err)
+	require.NoError(t, l.Connect())
+	require.Error(t, l.Write(testutil.MockMetrics()))
 }
 
 func TestWrite(t *testing.T) {
@@ -62,33 +72,64 @@ func TestWrite(t *testing.T) {
 	var body bytes.Buffer
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gz, err := gzip.NewReader(r.Body)
-		require.NoError(t, err)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Error(err)
+			return
+		}
 
-		_, err = io.Copy(&body, gz)
-		require.NoError(t, err)
+		var maxDecompressionSize int64 = 500 * 1024 * 1024
+		n, err := io.CopyN(&body, gz, maxDecompressionSize)
+		if errors.Is(err, io.EOF) {
+			err = nil
+		}
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Error(err)
+			return
+		}
+		if n > maxDecompressionSize {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Errorf("Size of decoded data exceeds (%v) allowed size (%v)", n, maxDecompressionSize)
+			return
+		}
 
 		var lm Metric
-		err = json.Unmarshal(body.Bytes(), &lm)
-		require.NoError(t, err)
-
-		require.Equal(t, tm.Fields(), lm.Metric[tm.Name()])
-		require.Equal(t, logzioType, lm.Type)
-		require.Equal(t, tm.Tags(), lm.Dimensions)
-		require.Equal(t, tm.Time(), lm.Time)
+		if err = json.Unmarshal(body.Bytes(), &lm); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Error(err)
+			return
+		}
+		if !reflect.DeepEqual(lm.Metric[tm.Name()], tm.Fields()) {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Errorf("Not equal, expected: %q, actual: %q", tm.Fields(), lm.Metric[tm.Name()])
+			return
+		}
+		if lm.Type != logzioType {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Errorf("Not equal, expected: %q, actual: %q", logzioType, lm.Type)
+			return
+		}
+		if !reflect.DeepEqual(lm.Dimensions, tm.Tags()) {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Errorf("Not equal, expected: %q, actual: %q", tm.Tags(), lm.Dimensions)
+			return
+		}
+		if lm.Time != tm.Time() {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Errorf("Not equal, expected: %q, actual: %q", tm.Time(), lm.Time)
+			return
+		}
 
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer ts.Close()
 
 	l := &Logzio{
-		Token: testToken,
+		Token: config.NewSecret([]byte(testToken)),
 		URL:   ts.URL,
 		Log:   testutil.Logger{},
 	}
-
-	err := l.Connect()
-	require.NoError(t, err)
-
-	err = l.Write([]telegraf.Metric{tm})
-	require.NoError(t, err)
+	require.NoError(t, l.Connect())
+	require.NoError(t, l.Write([]telegraf.Metric{tm}))
 }

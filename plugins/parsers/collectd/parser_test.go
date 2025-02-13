@@ -3,13 +3,15 @@ package collectd
 import (
 	"context"
 	"testing"
+	"time"
 
 	"collectd.org/api"
 	"collectd.org/network"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/metric"
+	"github.com/influxdata/telegraf/testutil"
 )
 
 type AuthMap struct {
@@ -109,9 +111,11 @@ var multiMetric = testCase{
 }
 
 func TestNewCollectdParser(t *testing.T) {
-	parser, err := NewCollectdParser("", "", []string{}, "join")
-	require.NoError(t, err)
-	require.Equal(t, parser.popts.SecurityLevel, network.None)
+	parser := Parser{
+		ParseMultiValue: "join",
+	}
+	require.NoError(t, parser.Init())
+	require.Equal(t, network.None, parser.popts.SecurityLevel)
 	require.NotNil(t, parser.popts.PasswordLookup)
 	require.Nil(t, parser.popts.TypesDB)
 }
@@ -125,8 +129,8 @@ func TestParse(t *testing.T) {
 		bytes, err := buf.Bytes()
 		require.NoError(t, err)
 
-		parser := &CollectdParser{}
-		require.NoError(t, err)
+		parser := &Parser{}
+		require.NoError(t, parser.Init())
 		metrics, err := parser.Parse(bytes)
 		require.NoError(t, err)
 
@@ -140,11 +144,26 @@ func TestParseMultiValueSplit(t *testing.T) {
 	bytes, err := buf.Bytes()
 	require.NoError(t, err)
 
-	parser := &CollectdParser{ParseMultiValue: "split"}
+	parser := &Parser{ParseMultiValue: "split"}
+	require.NoError(t, parser.Init())
 	metrics, err := parser.Parse(bytes)
 	require.NoError(t, err)
 
-	assert.Equal(t, 2, len(metrics))
+	require.Len(t, metrics, 2)
+}
+
+func TestParseMultiValueJoin(t *testing.T) {
+	buf, err := writeValueList(multiMetric.vl)
+	require.NoError(t, err)
+	bytes, err := buf.Bytes()
+	require.NoError(t, err)
+
+	parser := &Parser{ParseMultiValue: "join"}
+	require.NoError(t, parser.Init())
+	metrics, err := parser.Parse(bytes)
+	require.NoError(t, err)
+
+	require.Len(t, metrics, 1)
 }
 
 func TestParse_DefaultTags(t *testing.T) {
@@ -153,7 +172,8 @@ func TestParse_DefaultTags(t *testing.T) {
 	bytes, err := buf.Bytes()
 	require.NoError(t, err)
 
-	parser := &CollectdParser{}
+	parser := &Parser{}
+	require.NoError(t, parser.Init())
 	parser.SetDefaultTags(map[string]string{
 		"foo": "bar",
 	})
@@ -165,16 +185,11 @@ func TestParse_DefaultTags(t *testing.T) {
 }
 
 func TestParse_SignSecurityLevel(t *testing.T) {
-	parser := &CollectdParser{}
-	popts := &network.ParseOpts{
-		SecurityLevel: network.Sign,
-		PasswordLookup: &AuthMap{
-			map[string]string{
-				"user0": "bar",
-			},
-		},
+	parser := &Parser{
+		SecurityLevel: "sign",
+		AuthFile:      "testdata/authfile",
 	}
-	parser.SetParseOpts(popts)
+	require.NoError(t, parser.Init())
 
 	// Signed data
 	buf, err := writeValueList(singleMetric.vl)
@@ -206,7 +221,7 @@ func TestParse_SignSecurityLevel(t *testing.T) {
 
 	metrics, err = parser.Parse(bytes)
 	require.NoError(t, err)
-	require.Equal(t, []telegraf.Metric{}, metrics)
+	require.Empty(t, metrics)
 
 	// Wrong password error
 	buf, err = writeValueList(singleMetric.vl)
@@ -215,21 +230,16 @@ func TestParse_SignSecurityLevel(t *testing.T) {
 	bytes, err = buf.Bytes()
 	require.NoError(t, err)
 
-	metrics, err = parser.Parse(bytes)
+	_, err = parser.Parse(bytes)
 	require.Error(t, err)
 }
 
 func TestParse_EncryptSecurityLevel(t *testing.T) {
-	parser := &CollectdParser{}
-	popts := &network.ParseOpts{
-		SecurityLevel: network.Encrypt,
-		PasswordLookup: &AuthMap{
-			map[string]string{
-				"user0": "bar",
-			},
-		},
+	parser := &Parser{
+		SecurityLevel: "encrypt",
+		AuthFile:      "testdata/authfile",
 	}
-	parser.SetParseOpts(popts)
+	require.NoError(t, parser.Init())
 
 	// Signed data skipped
 	buf, err := writeValueList(singleMetric.vl)
@@ -240,7 +250,7 @@ func TestParse_EncryptSecurityLevel(t *testing.T) {
 
 	metrics, err := parser.Parse(bytes)
 	require.NoError(t, err)
-	require.Equal(t, []telegraf.Metric{}, metrics)
+	require.Empty(t, metrics)
 
 	// Encrypted data
 	buf, err = writeValueList(singleMetric.vl)
@@ -261,7 +271,7 @@ func TestParse_EncryptSecurityLevel(t *testing.T) {
 
 	metrics, err = parser.Parse(bytes)
 	require.NoError(t, err)
-	require.Equal(t, []telegraf.Metric{}, metrics)
+	require.Empty(t, metrics)
 
 	// Wrong password error
 	buf, err = writeValueList(singleMetric.vl)
@@ -270,7 +280,7 @@ func TestParse_EncryptSecurityLevel(t *testing.T) {
 	bytes, err = buf.Bytes()
 	require.NoError(t, err)
 
-	metrics, err = parser.Parse(bytes)
+	_, err = parser.Parse(bytes)
 	require.Error(t, err)
 }
 
@@ -279,21 +289,22 @@ func TestParseLine(t *testing.T) {
 	require.NoError(t, err)
 	bytes, err := buf.Bytes()
 	require.NoError(t, err)
-
-	parser, err := NewCollectdParser("", "", []string{}, "split")
+	parser := Parser{
+		ParseMultiValue: "split",
+	}
+	require.NoError(t, parser.Init())
+	m, err := parser.ParseLine(string(bytes))
 	require.NoError(t, err)
-	metric, err := parser.ParseLine(string(bytes))
-	require.NoError(t, err)
 
-	assertEqualMetrics(t, singleMetric.expected, []telegraf.Metric{metric})
+	assertEqualMetrics(t, singleMetric.expected, []telegraf.Metric{m})
 }
 
 func writeValueList(valueLists []api.ValueList) (*network.Buffer, error) {
 	buffer := network.NewBuffer(0)
 
 	ctx := context.Background()
-	for _, vl := range valueLists {
-		err := buffer.Write(ctx, &vl)
+	for i := range valueLists {
+		err := buffer.Write(ctx, &valueLists[i])
 		if err != nil {
 			return nil, err
 		}
@@ -308,5 +319,93 @@ func assertEqualMetrics(t *testing.T, expected []metricData, received []telegraf
 		require.Equal(t, expected[i].name, m.Name())
 		require.Equal(t, expected[i].tags, m.Tags())
 		require.Equal(t, expected[i].fields, m.Fields())
+	}
+}
+
+var benchmarkData = []api.ValueList{
+	{
+		Identifier: api.Identifier{
+			Host:           "xyzzy",
+			Plugin:         "cpu",
+			PluginInstance: "1",
+			Type:           "cpu",
+			TypeInstance:   "user",
+		},
+		Values: []api.Value{
+			api.Counter(4),
+		},
+		DSNames: []string(nil),
+	},
+	{
+		Identifier: api.Identifier{
+			Host:           "xyzzy",
+			Plugin:         "cpu",
+			PluginInstance: "2",
+			Type:           "cpu",
+			TypeInstance:   "user",
+		},
+		Values: []api.Value{
+			api.Counter(5),
+		},
+		DSNames: []string(nil),
+	},
+}
+
+func TestBenchmarkData(t *testing.T) {
+	expected := []telegraf.Metric{
+		metric.New(
+			"cpu_value",
+			map[string]string{
+				"host":          "xyzzy",
+				"instance":      "1",
+				"type":          "cpu",
+				"type_instance": "user",
+			},
+			map[string]interface{}{
+				"value": 4.0,
+			},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"cpu_value",
+			map[string]string{
+				"host":          "xyzzy",
+				"instance":      "2",
+				"type":          "cpu",
+				"type_instance": "user",
+			},
+			map[string]interface{}{
+				"value": 5.0,
+			},
+			time.Unix(0, 0),
+		),
+	}
+
+	buf, err := writeValueList(benchmarkData)
+	require.NoError(t, err)
+	bytes, err := buf.Bytes()
+	require.NoError(t, err)
+
+	parser := &Parser{}
+	require.NoError(t, parser.Init())
+	actual, err := parser.Parse(bytes)
+	require.NoError(t, err)
+
+	testutil.RequireMetricsEqual(t, expected, actual, testutil.IgnoreTime(), testutil.SortMetrics())
+}
+
+func BenchmarkParsing(b *testing.B) {
+	buf, err := writeValueList(benchmarkData)
+	require.NoError(b, err)
+	bytes, err := buf.Bytes()
+	require.NoError(b, err)
+
+	parser := &Parser{}
+	require.NoError(b, parser.Init())
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		//nolint:errcheck // Benchmarking so skip the error check to avoid the unnecessary operations
+		parser.Parse(bytes)
 	}
 }

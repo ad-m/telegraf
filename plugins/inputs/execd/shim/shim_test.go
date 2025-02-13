@@ -3,7 +3,6 @@ package shim
 import (
 	"bufio"
 	"io"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -54,9 +53,9 @@ func TestShimStdinSignalingWorks(t *testing.T) {
 	<-exited
 }
 
-func runInputPlugin(t *testing.T, interval time.Duration, stdin io.Reader, stdout, stderr io.Writer) (metricProcessed chan bool, exited chan bool) {
-	metricProcessed = make(chan bool)
-	exited = make(chan bool)
+func runInputPlugin(t *testing.T, interval time.Duration, stdin io.Reader, stdout, stderr io.Writer) (chan bool, chan bool) {
+	metricProcessed := make(chan bool)
+	exited := make(chan bool)
 	inp := &testInput{
 		metricProcessed: metricProcessed,
 	}
@@ -74,8 +73,9 @@ func runInputPlugin(t *testing.T, interval time.Duration, stdin io.Reader, stdou
 
 	require.NoError(t, shim.AddInput(inp))
 	go func() {
-		err := shim.Run(interval)
-		require.NoError(t, err)
+		if err := shim.Run(interval); err != nil {
+			t.Error(err)
+		}
 		exited <- true
 	}()
 	return metricProcessed, exited
@@ -85,11 +85,7 @@ type testInput struct {
 	metricProcessed chan bool
 }
 
-func (i *testInput) SampleConfig() string {
-	return ""
-}
-
-func (i *testInput) Description() string {
+func (*testInput) SampleConfig() string {
 	return ""
 }
 
@@ -105,26 +101,26 @@ func (i *testInput) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func (i *testInput) Start(_ telegraf.Accumulator) error {
+func (*testInput) Start(telegraf.Accumulator) error {
 	return nil
 }
 
-func (i *testInput) Stop() {
+func (*testInput) Stop() {
 }
 
 func TestLoadConfig(t *testing.T) {
-	require.NoError(t, os.Setenv("SECRET_TOKEN", "xxxxxxxxxx"))
-	require.NoError(t, os.Setenv("SECRET_VALUE", `test"\test`))
+	t.Setenv("SECRET_TOKEN", "xxxxxxxxxx")
+	t.Setenv("SECRET_VALUE", `test"\test`)
 
 	inputs.Add("test", func() telegraf.Input {
 		return &serviceInput{}
 	})
 
 	c := "./testdata/plugin.conf"
-	inputs, err := LoadConfig(&c)
+	loadedInputs, err := LoadConfig(&c)
 	require.NoError(t, err)
 
-	inp := inputs[0].(*serviceInput)
+	inp := loadedInputs[0].(*serviceInput)
 
 	require.Equal(t, "awesome name", inp.ServiceName)
 	require.Equal(t, "xxxxxxxxxx", inp.SecretToken)
@@ -137,15 +133,11 @@ type serviceInput struct {
 	SecretValue string `toml:"secret_value"`
 }
 
-func (i *serviceInput) SampleConfig() string {
+func (*serviceInput) SampleConfig() string {
 	return ""
 }
 
-func (i *serviceInput) Description() string {
-	return ""
-}
-
-func (i *serviceInput) Gather(acc telegraf.Accumulator) error {
+func (*serviceInput) Gather(acc telegraf.Accumulator) error {
 	acc.AddFields("measurement",
 		map[string]interface{}{
 			"field": 1,
@@ -157,11 +149,11 @@ func (i *serviceInput) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func (i *serviceInput) Start(_ telegraf.Accumulator) error {
+func (*serviceInput) Start(telegraf.Accumulator) error {
 	return nil
 }
 
-func (i *serviceInput) Stop() {
+func (*serviceInput) Stop() {
 }
 
 // we can get stuck if stdout gets clogged up and nobody's reading from it.

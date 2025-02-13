@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package enum
 
 import (
+	_ "embed"
 	"fmt"
 	"strconv"
 
@@ -9,29 +11,8 @@ import (
 	"github.com/influxdata/telegraf/plugins/processors"
 )
 
-var sampleConfig = `
-  [[processors.enum.mapping]]
-    ## Name of the field to map. Globs accepted.
-    field = "status"
-
-    ## Name of the tag to map. Globs accepted.
-    # tag = "status"
-
-    ## Destination tag or field to be used for the mapped value.  By default the
-    ## source tag or field is used, overwriting the original value.
-    dest = "status_code"
-
-    ## Default value to be used for all values not contained in the mapping
-    ## table.  When unset, the unmodified value for the field will be used if no
-    ## match is found.
-    # default = 0
-
-    ## Table of mappings
-    [processors.enum.mapping.value_mappings]
-      green = 1
-      amber = 2
-      red = 3
-`
+//go:embed sample.conf
+var sampleConfig string
 
 type EnumMapper struct {
 	Mappings []Mapping `toml:"mapping"`
@@ -48,6 +29,10 @@ type Mapping struct {
 	ValueMappings map[string]interface{}
 }
 
+func (*EnumMapper) SampleConfig() string {
+	return sampleConfig
+}
+
 func (mapper *EnumMapper) Init() error {
 	mapper.FieldFilters = make(map[string]filter.Filter)
 	mapper.TagFilters = make(map[string]filter.Filter)
@@ -62,21 +47,13 @@ func (mapper *EnumMapper) Init() error {
 		if mapping.Tag != "" {
 			tagFilter, err := filter.NewIncludeExcludeFilter([]string{mapping.Tag}, nil)
 			if err != nil {
-				return fmt.Errorf("failed to create new tag filter: %s", err)
+				return fmt.Errorf("failed to create new tag filter: %w", err)
 			}
 			mapper.TagFilters[mapping.Tag] = tagFilter
 		}
 	}
 
 	return nil
-}
-
-func (mapper *EnumMapper) SampleConfig() string {
-	return sampleConfig
-}
-
-func (mapper *EnumMapper) Description() string {
-	return "Map enum values according to given table."
 }
 
 func (mapper *EnumMapper) Apply(in ...telegraf.Metric) []telegraf.Metric {
@@ -176,7 +153,7 @@ func writeField(metric telegraf.Metric, name string, value interface{}) {
 	metric.AddField(name, value)
 }
 
-func writeTag(metric telegraf.Metric, name string, value string) {
+func writeTag(metric telegraf.Metric, name, value string) {
 	metric.RemoveTag(name)
 	metric.AddTag(name, value)
 }

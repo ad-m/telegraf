@@ -1,7 +1,9 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package nginx
 
 import (
 	"bufio"
+	_ "embed"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,36 +19,20 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 type Nginx struct {
-	Urls            []string
-	ResponseTimeout config.Duration
+	Urls            []string        `toml:"urls"`
+	ResponseTimeout config.Duration `toml:"response_timeout"`
 	tls.ClientConfig
 
 	// HTTP client
 	client *http.Client
 }
 
-var sampleConfig = `
-  # An array of Nginx stub_status URI to gather stats.
-  urls = ["http://localhost/server_status"]
-
-  ## Optional TLS Config
-  tls_ca = "/etc/telegraf/ca.pem"
-  tls_cert = "/etc/telegraf/cert.cer"
-  tls_key = "/etc/telegraf/key.key"
-  ## Use TLS but skip chain & host verification
-  insecure_skip_verify = false
-
-  # HTTP response timeout (default: 5s)
-  response_timeout = "5s"
-`
-
-func (n *Nginx) SampleConfig() string {
+func (*Nginx) SampleConfig() string {
 	return sampleConfig
-}
-
-func (n *Nginx) Description() string {
-	return "Read Nginx's basic status information (ngx_http_stub_status_module)"
 }
 
 func (n *Nginx) Gather(acc telegraf.Accumulator) error {
@@ -65,7 +51,7 @@ func (n *Nginx) Gather(acc telegraf.Accumulator) error {
 	for _, u := range n.Urls {
 		addr, err := url.Parse(u)
 		if err != nil {
-			acc.AddError(fmt.Errorf("Unable to parse address '%s': %s", u, err))
+			acc.AddError(fmt.Errorf("unable to parse address %q: %w", u, err))
 			continue
 		}
 
@@ -103,7 +89,7 @@ func (n *Nginx) createHTTPClient() (*http.Client, error) {
 func (n *Nginx) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 	resp, err := n.client.Get(addr.String())
 	if err != nil {
-		return fmt.Errorf("error making HTTP request to %s: %s", addr.String(), err)
+		return fmt.Errorf("error making HTTP request to %q: %w", addr.String(), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

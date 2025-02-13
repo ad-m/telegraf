@@ -1,8 +1,12 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package dns_query
 
 import (
+	_ "embed"
+	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -10,112 +14,59 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-type ResultType uint64
+//go:embed sample.conf
+var sampleConfig string
+
+var ignoredErrors = []string{
+	"NXDOMAIN",
+}
+
+type resultType uint64
 
 const (
-	Success ResultType = iota
-	Timeout
-	Error
+	successResult resultType = iota
+	timeoutResult
+	errorResult
 )
 
 type DNSQuery struct {
-	// Domains or subdomains to query
-	Domains []string
+	Domains       []string        `toml:"domains"`
+	Network       string          `toml:"network"`
+	Servers       []string        `toml:"servers"`
+	RecordType    string          `toml:"record_type"`
+	Port          int             `toml:"port"`
+	Timeout       config.Duration `toml:"timeout"`
+	IncludeFields []string        `toml:"include_fields"`
 
-	// Network protocol name
-	Network string
-
-	// Server to query
-	Servers []string
-
-	// Record type
-	RecordType string `toml:"record_type"`
-
-	// DNS server port number
-	Port int
-
-	// Dns query timeout in seconds. 0 means no timeout
-	Timeout int
+	fieldEnabled map[string]bool
 }
 
-var sampleConfig = `
-  ## servers to query
-  servers = ["8.8.8.8"]
-
-  ## Network is the network protocol name.
-  # network = "udp"
-
-  ## Domains or subdomains to query.
-  # domains = ["."]
-
-  ## Query record type.
-  ## Possible values: A, AAAA, CNAME, MX, NS, PTR, TXT, SOA, SPF, SRV.
-  # record_type = "A"
-
-  ## Dns server port.
-  # port = 53
-
-  ## Query timeout in seconds.
-  # timeout = 2
-`
-
-func (d *DNSQuery) SampleConfig() string {
+func (*DNSQuery) SampleConfig() string {
 	return sampleConfig
 }
 
-func (d *DNSQuery) Description() string {
-	return "Query given DNS server and gives statistics"
-}
-func (d *DNSQuery) Gather(acc telegraf.Accumulator) error {
-	var wg sync.WaitGroup
-	d.setDefaultValues()
-
-	for _, domain := range d.Domains {
-		for _, server := range d.Servers {
-			wg.Add(1)
-			go func(domain, server string) {
-				fields := make(map[string]interface{}, 2)
-				tags := map[string]string{
-					"server":      server,
-					"domain":      domain,
-					"record_type": d.RecordType,
-				}
-
-				dnsQueryTime, rcode, err := d.getDNSQueryTime(domain, server)
-				if rcode >= 0 {
-					tags["rcode"] = dns.RcodeToString[rcode]
-					fields["rcode_value"] = rcode
-				}
-				if err == nil {
-					setResult(Success, fields, tags)
-					fields["query_time_ms"] = dnsQueryTime
-				} else if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
-					setResult(Timeout, fields, tags)
-				} else if err != nil {
-					setResult(Error, fields, tags)
-					acc.AddError(err)
-				}
-
-				acc.AddFields("dns_query", fields, tags)
-
-				wg.Done()
-			}(domain, server)
+func (d *DNSQuery) Init() error {
+	// Convert the included fields into a lookup-table
+	d.fieldEnabled = make(map[string]bool, len(d.IncludeFields))
+	for _, f := range d.IncludeFields {
+		switch f {
+		case "first_ip", "all_ips":
+		default:
+			return fmt.Errorf("invalid field %q included", f)
 		}
+		d.fieldEnabled[f] = true
 	}
 
-	wg.Wait()
-	return nil
-}
-
-func (d *DNSQuery) setDefaultValues() {
+	// Set defaults
 	if d.Network == "" {
 		d.Network = "udp"
 	}
 
-	if len(d.RecordType) == 0 {
+	if d.RecordType == "" {
 		d.RecordType = "NS"
 	}
 
@@ -124,39 +75,130 @@ func (d *DNSQuery) setDefaultValues() {
 		d.RecordType = "NS"
 	}
 
-	if d.Port == 0 {
+	if d.Port < 1 {
 		d.Port = 53
 	}
 
-	if d.Timeout == 0 {
-		d.Timeout = 2
-	}
+	return nil
 }
 
-func (d *DNSQuery) getDNSQueryTime(domain string, server string) (float64, int, error) {
-	dnsQueryTime := float64(0)
+func (d *DNSQuery) Gather(acc telegraf.Accumulator) error {
+	var wg sync.WaitGroup
 
-	c := new(dns.Client)
-	c.ReadTimeout = time.Duration(d.Timeout) * time.Second
-	c.Net = d.Network
+	for _, domain := range d.Domains {
+		for _, server := range d.Servers {
+			wg.Add(1)
+			go func(domain, server string) {
+				defer wg.Done()
 
-	m := new(dns.Msg)
+				fields, tags, err := d.query(domain, server)
+				if err != nil && !slices.Contains(ignoredErrors, tags["rcode"]) {
+					var opErr *net.OpError
+					if !errors.As(err, &opErr) || !opErr.Timeout() {
+						acc.AddError(err)
+					}
+				}
+				acc.AddFields("dns_query", fields, tags)
+			}(domain, server)
+		}
+	}
+	wg.Wait()
+
+	return nil
+}
+
+func (d *DNSQuery) query(domain, server string) (map[string]interface{}, map[string]string, error) {
+	tags := map[string]string{
+		"server":      server,
+		"domain":      domain,
+		"record_type": d.RecordType,
+		"result":      "error",
+	}
+
+	fields := map[string]interface{}{
+		"query_time_ms": float64(0),
+		"result_code":   uint64(errorResult),
+	}
+
+	c := dns.Client{
+		ReadTimeout: time.Duration(d.Timeout),
+		Net:         d.Network,
+	}
+
 	recordType, err := d.parseRecordType()
 	if err != nil {
-		return dnsQueryTime, -1, err
+		return fields, tags, err
 	}
-	m.SetQuestion(dns.Fqdn(domain), recordType)
-	m.RecursionDesired = true
 
-	r, rtt, err := c.Exchange(m, net.JoinHostPort(server, strconv.Itoa(d.Port)))
+	var msg dns.Msg
+	msg.SetQuestion(dns.Fqdn(domain), recordType)
+	msg.RecursionDesired = true
+
+	addr := net.JoinHostPort(server, strconv.Itoa(d.Port))
+	r, rtt, err := c.Exchange(&msg, addr)
 	if err != nil {
-		return dnsQueryTime, -1, err
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Timeout() {
+			tags["result"] = "timeout"
+			fields["result_code"] = uint64(timeoutResult)
+			return fields, tags, err
+		}
+		return fields, tags, err
 	}
+
+	// Fill valid fields
+	tags["rcode"] = dns.RcodeToString[r.Rcode]
+	fields["rcode_value"] = r.Rcode
+	fields["query_time_ms"] = float64(rtt.Nanoseconds()) / 1e6
+
+	// Handle the failure case
 	if r.Rcode != dns.RcodeSuccess {
-		return dnsQueryTime, r.Rcode, fmt.Errorf("Invalid answer (%s) from %s after %s query for %s", dns.RcodeToString[r.Rcode], server, d.RecordType, domain)
+		return fields, tags, fmt.Errorf("invalid answer (%s) from %s after %s query for %s", dns.RcodeToString[r.Rcode], server, d.RecordType, domain)
 	}
-	dnsQueryTime = float64(rtt.Nanoseconds()) / 1e6
-	return dnsQueryTime, r.Rcode, nil
+
+	// Success
+	tags["result"] = "success"
+	fields["result_code"] = uint64(successResult)
+
+	// Fill out custom fields for specific record types
+	for _, record := range r.Answer {
+		switch x := record.(type) {
+		case *dns.A:
+			fields["name"] = x.Hdr.Name
+		case *dns.AAAA:
+			fields["name"] = x.Hdr.Name
+		case *dns.CNAME:
+			fields["name"] = x.Hdr.Name
+		case *dns.MX:
+			fields["name"] = x.Hdr.Name
+			fields["preference"] = x.Preference
+		case *dns.SOA:
+			fields["expire"] = x.Expire
+			fields["minttl"] = x.Minttl
+			fields["name"] = x.Hdr.Name
+			fields["refresh"] = x.Refresh
+			fields["retry"] = x.Retry
+			fields["serial"] = x.Serial
+		}
+	}
+
+	if d.fieldEnabled["first_ip"] {
+		for _, record := range r.Answer {
+			if ip, found := extractIP(record); found {
+				fields["ip"] = ip
+				break
+			}
+		}
+	}
+	if d.fieldEnabled["all_ips"] {
+		for i, record := range r.Answer {
+			if ip, found := extractIP(record); found {
+				fields["ip_"+strconv.Itoa(i)] = ip
+			}
+		}
+	}
+
+	return fields, tags, nil
 }
 
 func (d *DNSQuery) parseRecordType() (uint16, error) {
@@ -187,29 +229,26 @@ func (d *DNSQuery) parseRecordType() (uint16, error) {
 	case "TXT":
 		recordType = dns.TypeTXT
 	default:
-		err = fmt.Errorf("Record type %s not recognized", d.RecordType)
+		err = fmt.Errorf("record type %s not recognized", d.RecordType)
 	}
 
 	return recordType, err
 }
 
-func setResult(result ResultType, fields map[string]interface{}, tags map[string]string) {
-	var tag string
-	switch result {
-	case Success:
-		tag = "success"
-	case Timeout:
-		tag = "timeout"
-	case Error:
-		tag = "error"
+func extractIP(record dns.RR) (string, bool) {
+	if r, ok := record.(*dns.A); ok {
+		return r.A.String(), true
 	}
-
-	tags["result"] = tag
-	fields["result_code"] = uint64(result)
+	if r, ok := record.(*dns.AAAA); ok {
+		return r.AAAA.String(), true
+	}
+	return "", false
 }
 
 func init() {
 	inputs.Add("dns_query", func() telegraf.Input {
-		return &DNSQuery{}
+		return &DNSQuery{
+			Timeout: config.Duration(2 * time.Second),
+		}
 	})
 }

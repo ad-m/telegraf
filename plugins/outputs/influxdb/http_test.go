@@ -1,4 +1,3 @@
-//nolint
 package influxdb_test
 
 import (
@@ -12,17 +11,20 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"path"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/plugins/outputs/influxdb"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
 )
 
 func getHTTPURL() *url.URL {
@@ -34,28 +36,28 @@ func getHTTPURL() *url.URL {
 }
 
 func TestHTTP_EmptyConfig(t *testing.T) {
-	config := influxdb.HTTPConfig{}
-	_, err := influxdb.NewHTTPClient(config)
+	cfg := influxdb.HTTPConfig{}
+	_, err := influxdb.NewHTTPClient(cfg)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), influxdb.ErrMissingURL.Error())
 }
 
 func TestHTTP_MinimalConfig(t *testing.T) {
-	config := influxdb.HTTPConfig{
+	cfg := influxdb.HTTPConfig{
 		URL: getHTTPURL(),
 	}
-	_, err := influxdb.NewHTTPClient(config)
+	_, err := influxdb.NewHTTPClient(cfg)
 	require.NoError(t, err)
 }
 
 func TestHTTP_UnsupportedScheme(t *testing.T) {
-	config := influxdb.HTTPConfig{
+	cfg := influxdb.HTTPConfig{
 		URL: &url.URL{
 			Scheme: "foo",
 			Host:   "localhost",
 		},
 	}
-	_, err := influxdb.NewHTTPClient(config)
+	_, err := influxdb.NewHTTPClient(cfg)
 	require.Error(t, err)
 }
 
@@ -63,7 +65,7 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
 
-	u, err := url.Parse(fmt.Sprintf("http://%s", ts.Listener.Addr().String()))
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
 	require.NoError(t, err)
 
 	successResponse := []byte(`{"results": [{"statement_id": 0}]}`)
@@ -84,15 +86,16 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 				require.Equal(t, `CREATE DATABASE "xyzzy"`, r.FormValue("q"))
 				w.WriteHeader(http.StatusOK)
-				w.Write(successResponse)
+				_, err = w.Write(successResponse)
+				require.NoError(t, err)
 			},
 		},
 		{
 			name: "send basic auth",
 			config: influxdb.HTTPConfig{
 				URL:      u,
-				Username: "guy",
-				Password: "smiley",
+				Username: config.NewSecret([]byte("guy")),
+				Password: config.NewSecret([]byte("smiley")),
 				Database: "telegraf",
 			},
 			database: "telegraf",
@@ -102,7 +105,8 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 				require.Equal(t, "guy", username)
 				require.Equal(t, "smiley", password)
 				w.WriteHeader(http.StatusOK)
-				w.Write(successResponse)
+				_, err = w.Write(successResponse)
+				require.NoError(t, err)
 			},
 		},
 		{
@@ -117,10 +121,11 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 			},
 			database: `a " b`,
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.Header.Get("A"), "B")
-				require.Equal(t, r.Header.Get("C"), "D")
+				require.Equal(t, "B", r.Header.Get("A"))
+				require.Equal(t, "D", r.Header.Get("C"))
 				w.WriteHeader(http.StatusOK)
-				w.Write(successResponse)
+				_, err = w.Write(successResponse)
+				require.NoError(t, err)
 			},
 		},
 		{
@@ -134,10 +139,11 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 				Database: "telegraf",
 			},
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.Header.Get("A"), "B")
-				require.Equal(t, r.Header.Get("C"), "D")
+				require.Equal(t, "B", r.Header.Get("A"))
+				require.Equal(t, "D", r.Header.Get("C"))
 				w.WriteHeader(http.StatusOK)
-				w.Write(successResponse)
+				_, err = w.Write(successResponse)
+				require.NoError(t, err)
 			},
 		},
 		{
@@ -148,7 +154,8 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 				require.Equal(t, `CREATE DATABASE "telegraf"`, r.FormValue("q"))
 				w.WriteHeader(http.StatusOK)
-				w.Write(successResponse)
+				_, err = w.Write(successResponse)
+				require.NoError(t, err)
 			},
 		},
 		{
@@ -160,7 +167,8 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 				require.Equal(t, `CREATE DATABASE "a \" b"`, r.FormValue("q"))
 				w.WriteHeader(http.StatusOK)
-				w.Write(successResponse)
+				_, err = w.Write(successResponse)
+				require.NoError(t, err)
 			},
 		},
 		{
@@ -169,10 +177,11 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 				URL:      u,
 				Database: `a \\ b`,
 			},
-			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
 				// Yes, 200 OK is the correct response...
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"results": [{"error": "invalid name", "statement_id": 0}]}`))
+				_, err = w.Write([]byte(`{"results": [{"error": "invalid name", "statement_id": 0}]}`))
+				require.NoError(t, err)
 			},
 			errFunc: func(t *testing.T, err error) {
 				expected := &influxdb.APIError{
@@ -190,7 +199,7 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 				URL:      u,
 				Database: "telegraf",
 			},
-			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			queryHandlerFunc: func(_ *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusNotFound)
 			},
 			errFunc: func(t *testing.T, err error) {
@@ -208,7 +217,7 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 				URL:      u,
 				Database: "telegraf",
 			},
-			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			queryHandlerFunc: func(_ *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 			},
 		},
@@ -218,9 +227,10 @@ func TestHTTP_CreateDatabase(t *testing.T) {
 				URL:      u,
 				Database: `database`,
 			},
-			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(`invalid response`))
+				_, err = w.Write([]byte(`invalid response`))
+				require.NoError(t, err)
 			},
 			errFunc: func(t *testing.T, err error) {
 				expected := &influxdb.APIError{
@@ -265,7 +275,7 @@ func TestHTTP_Write(t *testing.T) {
 	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
 
-	u, err := url.Parse(fmt.Sprintf("http://%s", ts.Listener.Addr().String()))
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -283,7 +293,7 @@ func TestHTTP_Write(t *testing.T) {
 				Log:      testutil.Logger{},
 			},
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.FormValue("db"), "telegraf")
+				require.Equal(t, "telegraf", r.FormValue("db"))
 				body, err := io.ReadAll(r.Body)
 				require.NoError(t, err)
 				require.Contains(t, string(body), "cpu value=42")
@@ -295,8 +305,8 @@ func TestHTTP_Write(t *testing.T) {
 			config: influxdb.HTTPConfig{
 				URL:      u,
 				Database: "telegraf",
-				Username: "guy",
-				Password: "smiley",
+				Username: config.NewSecret([]byte("guy")),
+				Password: config.NewSecret([]byte("smiley")),
 				Log:      testutil.Logger{},
 			},
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
@@ -316,7 +326,7 @@ func TestHTTP_Write(t *testing.T) {
 				Log:       testutil.Logger{},
 			},
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.Header.Get("User-Agent"), "telegraf")
+				require.Equal(t, "telegraf", r.Header.Get("User-Agent"))
 				w.WriteHeader(http.StatusNoContent)
 			},
 		},
@@ -354,8 +364,8 @@ func TestHTTP_Write(t *testing.T) {
 				Log: testutil.Logger{},
 			},
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.Header.Get("A"), "B")
-				require.Equal(t, r.Header.Get("C"), "D")
+				require.Equal(t, "B", r.Header.Get("A"))
+				require.Equal(t, "D", r.Header.Get("C"))
 				w.WriteHeader(http.StatusNoContent)
 			},
 		},
@@ -392,9 +402,10 @@ func TestHTTP_Write(t *testing.T) {
 				Database: "telegraf",
 				Log:      testutil.Logger{},
 			},
-			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(`{"error": "write failed: hinted handoff queue not empty"}`))
+				_, err = w.Write([]byte(`{"error": "write failed: hinted handoff queue not empty"}`))
+				require.NoError(t, err)
 			},
 			errFunc: func(t *testing.T, err error) {
 				require.NoError(t, err)
@@ -407,9 +418,10 @@ func TestHTTP_Write(t *testing.T) {
 				Database: "telegraf",
 				Log:      testutil.Logger{},
 			},
-			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(`{"error": "partial write: field type conflict:"}`))
+				_, err = w.Write([]byte(`{"error": "partial write: field type conflict:"}`))
+				require.NoError(t, err)
 			},
 			logFunc: func(t *testing.T, str string) {
 				require.Contains(t, str, "partial write")
@@ -422,9 +434,10 @@ func TestHTTP_Write(t *testing.T) {
 				Database: "telegraf",
 				Log:      testutil.Logger{},
 			},
-			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(`{"error": "unable to parse 'cpu value': invalid field format"}`))
+				_, err = w.Write([]byte(`{"error": "unable to parse 'cpu value': invalid field format"}`))
+				require.NoError(t, err)
 			},
 			logFunc: func(t *testing.T, str string) {
 				require.Contains(t, str, "unable to parse")
@@ -437,7 +450,7 @@ func TestHTTP_Write(t *testing.T) {
 				Database: "telegraf",
 				Log:      testutil.Logger{},
 			},
-			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			queryHandlerFunc: func(_ *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusBadGateway)
 			},
 			errFunc: func(t *testing.T, err error) {
@@ -455,9 +468,10 @@ func TestHTTP_Write(t *testing.T) {
 				Database: "telegraf",
 				Log:      testutil.Logger{},
 			},
-			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusServiceUnavailable)
-				w.Write([]byte(`{"error": "unknown error"}`))
+				_, err = w.Write([]byte(`{"error": "unknown error"}`))
+				require.NoError(t, err)
 			},
 			errFunc: func(t *testing.T, err error) {
 				expected := &influxdb.APIError{
@@ -550,15 +564,15 @@ func TestHTTP_WritePathPrefix(t *testing.T) {
 	)
 	metrics := []telegraf.Metric{m}
 
-	config := influxdb.HTTPConfig{
+	cfg := influxdb.HTTPConfig{
 		URL:      u,
 		Database: "telegraf",
 		Log:      testutil.Logger{},
 	}
 
-	client, err := influxdb.NewHTTPClient(config)
+	client, err := influxdb.NewHTTPClient(cfg)
 	require.NoError(t, err)
-	err = client.CreateDatabase(ctx, config.Database)
+	err = client.CreateDatabase(ctx, cfg.Database)
 	require.NoError(t, err)
 	err = client.Write(ctx, metrics)
 	require.NoError(t, err)
@@ -569,14 +583,30 @@ func TestHTTP_WriteContentEncodingGzip(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/write":
-				require.Equal(t, r.Header.Get("Content-Encoding"), "gzip")
+				if contentHeader := r.Header.Get("Content-Encoding"); contentHeader != "gzip" {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Errorf("Not equal, expected: %q, actual: %q", "gzip", contentHeader)
+					return
+				}
 
 				gr, err := gzip.NewReader(r.Body)
-				require.NoError(t, err)
-				body, err := io.ReadAll(gr)
-				require.NoError(t, err)
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Error(err)
+					return
+				}
 
-				require.Contains(t, string(body), "cpu value=42")
+				body, err := io.ReadAll(gr)
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Error(err)
+					return
+				}
+				if !strings.Contains(string(body), "cpu value=42") {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Errorf("'body' should contain %q", "cpu value=42")
+					return
+				}
 				w.WriteHeader(http.StatusNoContent)
 				return
 			default:
@@ -604,25 +634,21 @@ func TestHTTP_WriteContentEncodingGzip(t *testing.T) {
 	require.NoError(t, err)
 	metrics := []telegraf.Metric{m}
 
-	config := influxdb.HTTPConfig{
+	cfg := influxdb.HTTPConfig{
 		URL:             u,
 		Database:        "telegraf",
 		ContentEncoding: "gzip",
 		Log:             testutil.Logger{},
 	}
 
-	client, err := influxdb.NewHTTPClient(config)
+	client, err := influxdb.NewHTTPClient(cfg)
 	require.NoError(t, err)
 	err = client.Write(ctx, metrics)
 	require.NoError(t, err)
 }
 
 func TestHTTP_UnixSocket(t *testing.T) {
-	tmpdir, err := os.MkdirTemp("", "telegraf-test")
-	if err != nil {
-		require.NoError(t, err)
-	}
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	sock := path.Join(tmpdir, "test.sock")
 	listener, err := net.Listen("unix", sock)
@@ -653,11 +679,13 @@ func TestHTTP_UnixSocket(t *testing.T) {
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 				require.Equal(t, `CREATE DATABASE "xyzzy"`, r.FormValue("q"))
 				w.WriteHeader(http.StatusOK)
-				w.Write(successResponse)
+				_, err = w.Write(successResponse)
+				require.NoError(t, err)
 			},
-			writeHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			writeHandlerFunc: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusNoContent)
-				w.Write(successResponse)
+				_, err = w.Write(successResponse)
+				require.NoError(t, err)
 			},
 		},
 	}
@@ -697,12 +725,28 @@ func TestHTTP_WriteDatabaseTagWorksOnRetry(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/write":
-				r.ParseForm()
-				require.Equal(t, r.Form["db"], []string{"foo"})
+				if err := r.ParseForm(); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Error(err)
+					return
+				}
+				if !reflect.DeepEqual(r.Form["db"], []string{"foo"}) {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Errorf("Not equal, expected: %q, actual: %q", []string{"foo"}, r.Form["db"])
+					return
+				}
 
 				body, err := io.ReadAll(r.Body)
-				require.NoError(t, err)
-				require.Contains(t, string(body), "cpu value=42")
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Error(err)
+					return
+				}
+				if !strings.Contains(string(body), "cpu value=42") {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Errorf("'body' should contain %q", "cpu value=42")
+					return
+				}
 
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -719,7 +763,7 @@ func TestHTTP_WriteDatabaseTagWorksOnRetry(t *testing.T) {
 		Host:   ts.Listener.Addr().String(),
 	}
 
-	config := influxdb.HTTPConfig{
+	cfg := influxdb.HTTPConfig{
 		URL:                addr,
 		Database:           "telegraf",
 		DatabaseTag:        "database",
@@ -727,7 +771,7 @@ func TestHTTP_WriteDatabaseTagWorksOnRetry(t *testing.T) {
 		Log:                testutil.Logger{},
 	}
 
-	client, err := influxdb.NewHTTPClient(config)
+	client, err := influxdb.NewHTTPClient(cfg)
 	require.NoError(t, err)
 
 	metrics := []telegraf.Metric{
@@ -754,7 +798,7 @@ func TestDBRPTags(t *testing.T) {
 	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
 
-	u, err := url.Parse(fmt.Sprintf("http://%s", ts.Listener.Addr().String()))
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -783,8 +827,8 @@ func TestDBRPTags(t *testing.T) {
 				),
 			},
 			handlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.FormValue("db"), "telegraf")
-				require.Equal(t, r.FormValue("rp"), "")
+				require.Equal(t, "telegraf", r.FormValue("db"))
+				require.Equal(t, "", r.FormValue("rp"))
 				w.WriteHeader(http.StatusNoContent)
 			},
 		},
@@ -806,8 +850,8 @@ func TestDBRPTags(t *testing.T) {
 				),
 			},
 			handlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.FormValue("db"), "telegraf")
-				require.Equal(t, r.FormValue("rp"), "foo")
+				require.Equal(t, "telegraf", r.FormValue("db"))
+				require.Equal(t, "foo", r.FormValue("rp"))
 				w.WriteHeader(http.StatusNoContent)
 			},
 		},
@@ -833,8 +877,8 @@ func TestDBRPTags(t *testing.T) {
 				),
 			},
 			handlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.FormValue("db"), "telegraf")
-				require.Equal(t, r.FormValue("rp"), "foo")
+				require.Equal(t, "telegraf", r.FormValue("db"))
+				require.Equal(t, "foo", r.FormValue("rp"))
 				body, err := io.ReadAll(r.Body)
 				require.NoError(t, err)
 				require.Contains(t, string(body), "cpu,rp=foo value=42")
@@ -862,8 +906,8 @@ func TestDBRPTags(t *testing.T) {
 				),
 			},
 			handlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.FormValue("db"), "telegraf")
-				require.Equal(t, r.FormValue("rp"), "foo")
+				require.Equal(t, "telegraf", r.FormValue("db"))
+				require.Equal(t, "foo", r.FormValue("rp"))
 				w.WriteHeader(http.StatusNoContent)
 			},
 		},
@@ -887,8 +931,8 @@ func TestDBRPTags(t *testing.T) {
 				),
 			},
 			handlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.FormValue("db"), "telegraf")
-				require.Equal(t, r.FormValue("rp"), "")
+				require.Equal(t, "telegraf", r.FormValue("db"))
+				require.Equal(t, "", r.FormValue("rp"))
 				w.WriteHeader(http.StatusNoContent)
 			},
 		},
@@ -915,8 +959,8 @@ func TestDBRPTags(t *testing.T) {
 				),
 			},
 			handlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.FormValue("db"), "telegraf")
-				require.Equal(t, r.FormValue("rp"), "foo")
+				require.Equal(t, "telegraf", r.FormValue("db"))
+				require.Equal(t, "foo", r.FormValue("rp"))
 				body, err := io.ReadAll(r.Body)
 				require.NoError(t, err)
 				require.Contains(t, string(body), "cpu value=42")
@@ -946,8 +990,8 @@ func TestDBRPTags(t *testing.T) {
 				),
 			},
 			handlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.FormValue("db"), "telegraf")
-				require.Equal(t, r.FormValue("rp"), "foo")
+				require.Equal(t, "telegraf", r.FormValue("db"))
+				require.Equal(t, "foo", r.FormValue("rp"))
 				body, err := io.ReadAll(r.Body)
 				require.NoError(t, err)
 				require.Contains(t, string(body), "cpu,rp=foo value=42")
@@ -1000,7 +1044,7 @@ func TestDBRPTagsCreateDatabaseNotCalledOnRetryAfterForbidden(t *testing.T) {
 	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
 
-	u, err := url.Parse(fmt.Sprintf("http://%s", ts.Listener.Addr().String()))
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
 	require.NoError(t, err)
 
 	handlers := &MockHandlerChain{
@@ -1013,7 +1057,11 @@ func TestDBRPTagsCreateDatabaseNotCalledOnRetryAfterForbidden(t *testing.T) {
 						return
 					}
 					w.WriteHeader(http.StatusForbidden)
-					w.Write([]byte(`{"results": [{"error": "error authorizing query"}]}`))
+					if _, err = w.Write([]byte(`{"results": [{"error": "error authorizing query"}]}`)); err != nil {
+						w.WriteHeader(http.StatusInternalServerError)
+						t.Error(err)
+						return
+					}
 				default:
 					w.WriteHeader(http.StatusInternalServerError)
 				}
@@ -1050,7 +1098,7 @@ func TestDBRPTagsCreateDatabaseNotCalledOnRetryAfterForbidden(t *testing.T) {
 	}
 
 	output := influxdb.InfluxDB{
-		URL:         u.String(),
+		URLs:        []string{u.String()},
 		Database:    "telegraf",
 		DatabaseTag: "database",
 		Log:         testutil.Logger{},
@@ -1072,7 +1120,7 @@ func TestDBRPTagsCreateDatabaseCalledOnDatabaseNotFound(t *testing.T) {
 	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
 
-	u, err := url.Parse(fmt.Sprintf("http://%s", ts.Listener.Addr().String()))
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
 	require.NoError(t, err)
 
 	handlers := &MockHandlerChain{
@@ -1085,7 +1133,11 @@ func TestDBRPTagsCreateDatabaseCalledOnDatabaseNotFound(t *testing.T) {
 						return
 					}
 					w.WriteHeader(http.StatusForbidden)
-					w.Write([]byte(`{"results": [{"error": "error authorizing query"}]}`))
+					if _, err = w.Write([]byte(`{"results": [{"error": "error authorizing query"}]}`)); err != nil {
+						w.WriteHeader(http.StatusInternalServerError)
+						t.Error(err)
+						return
+					}
 				default:
 					w.WriteHeader(http.StatusInternalServerError)
 				}
@@ -1094,7 +1146,11 @@ func TestDBRPTagsCreateDatabaseCalledOnDatabaseNotFound(t *testing.T) {
 				switch r.URL.Path {
 				case "/write":
 					w.WriteHeader(http.StatusNotFound)
-					w.Write([]byte(`{"error": "database not found: \"telegraf\""}`))
+					if _, err = w.Write([]byte(`{"error": "database not found: \"telegraf\""}`)); err != nil {
+						w.WriteHeader(http.StatusInternalServerError)
+						t.Error(err)
+						return
+					}
 				default:
 					w.WriteHeader(http.StatusInternalServerError)
 				}
@@ -1135,7 +1191,7 @@ func TestDBRPTagsCreateDatabaseCalledOnDatabaseNotFound(t *testing.T) {
 	}
 
 	output := influxdb.InfluxDB{
-		URL:         u.String(),
+		URLs:        []string{u.String()},
 		Database:    "telegraf",
 		DatabaseTag: "database",
 		Log:         testutil.Logger{},
@@ -1162,13 +1218,17 @@ func TestDBNotFoundShouldDropMetricWhenSkipDatabaseCreateIsTrue(t *testing.T) {
 	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
 
-	u, err := url.Parse(fmt.Sprintf("http://%s", ts.Listener.Addr().String()))
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
 	require.NoError(t, err)
 	f := func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/write":
 			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error": "database not found: \"telegraf\""}`))
+			if _, err = w.Write([]byte(`{"error": "database not found: \"telegraf\""}`)); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+				return
+			}
 		default:
 			w.WriteHeader(http.StatusInternalServerError)
 		}
@@ -1189,7 +1249,7 @@ func TestDBNotFoundShouldDropMetricWhenSkipDatabaseCreateIsTrue(t *testing.T) {
 
 	logger := &testutil.CaptureLogger{}
 	output := influxdb.InfluxDB{
-		URL:                  u.String(),
+		URLs:                 []string{u.String()},
 		Database:             "telegraf",
 		DatabaseTag:          "database",
 		SkipDatabaseCreation: true,
@@ -1202,10 +1262,10 @@ func TestDBNotFoundShouldDropMetricWhenSkipDatabaseCreateIsTrue(t *testing.T) {
 	err = output.Connect()
 	require.NoError(t, err)
 	err = output.Write(metrics)
-	require.Contains(t, logger.LastError, "database not found")
+	require.Contains(t, logger.LastError(), "database not found")
 	require.NoError(t, err)
 
 	err = output.Write(metrics)
-	require.Contains(t, logger.LastError, "database not found")
+	require.Contains(t, logger.LastError(), "database not found")
 	require.NoError(t, err)
 }

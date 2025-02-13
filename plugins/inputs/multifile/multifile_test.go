@@ -11,12 +11,13 @@ import (
 )
 
 func TestFileTypes(t *testing.T) {
-	wd, _ := os.Getwd()
+	wd, err := os.Getwd()
+	require.NoError(t, err)
 
 	m := MultiFile{
 		BaseDir:   path.Join(wd, `testdata`),
 		FailEarly: true,
-		Files: []File{
+		Files: []file{
 			{Name: `bool.txt`, Dest: `examplebool`, Conversion: `bool`},
 			{Name: `float.txt`, Dest: `examplefloat`, Conversion: `float`},
 			{Name: `int.txt`, Dest: `examplefloatX`, Conversion: `float(3)`},
@@ -29,9 +30,8 @@ func TestFileTypes(t *testing.T) {
 
 	var acc testutil.Accumulator
 
-	err := m.Gather(&acc)
-
-	require.NoError(t, err)
+	require.NoError(t, m.Init())
+	require.NoError(t, m.Gather(&acc))
 	require.Equal(t, map[string]string{"exampletag": "test"}, acc.Metrics[0].Tags)
 	require.Equal(t, map[string]interface{}{
 		"examplebool":   true,
@@ -43,13 +43,14 @@ func TestFileTypes(t *testing.T) {
 	}, acc.Metrics[0].Fields)
 }
 
-func FailEarly(failEarly bool, t *testing.T) error {
-	wd, _ := os.Getwd()
+func failEarly(failEarly bool, t *testing.T) error {
+	wd, err := os.Getwd()
+	require.NoError(t, err)
 
 	m := MultiFile{
 		BaseDir:   path.Join(wd, `testdata`),
 		FailEarly: failEarly,
-		Files: []File{
+		Files: []file{
 			{Name: `int.txt`, Dest: `exampleint`, Conversion: `int`},
 			{Name: `int.txt`, Dest: `exampleerror`, Conversion: `bool`},
 		},
@@ -57,7 +58,8 @@ func FailEarly(failEarly bool, t *testing.T) error {
 
 	var acc testutil.Accumulator
 
-	err := m.Gather(&acc)
+	require.NoError(t, m.Init())
+	err = m.Gather(&acc)
 
 	if err == nil {
 		require.Equal(t, map[string]interface{}{
@@ -69,8 +71,8 @@ func FailEarly(failEarly bool, t *testing.T) error {
 }
 
 func TestFailEarly(t *testing.T) {
-	err := FailEarly(false, t)
+	err := failEarly(false, t)
 	require.NoError(t, err)
-	err = FailEarly(true, t)
+	err = failEarly(true, t)
 	require.Error(t, err)
 }
