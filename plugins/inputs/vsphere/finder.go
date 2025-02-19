@@ -17,32 +17,32 @@ var addFields map[string][]string
 
 var containers map[string]interface{}
 
-// Finder allows callers to find resources in vCenter given a query string.
-type Finder struct {
-	client *Client
+// finder allows callers to find resources in vCenter given a query string.
+type finder struct {
+	client *client
 }
 
-// ResourceFilter is a convenience class holding a finder and a set of paths. It is useful when you need a
+// resourceFilter is a convenience class holding a finder and a set of paths. It is useful when you need a
 // self contained object capable of returning a certain set of resources.
-type ResourceFilter struct {
-	finder       *Finder
+type resourceFilter struct {
+	finder       *finder
 	resType      string
 	paths        []string
 	excludePaths []string
 }
 
-// FindAll returns the union of resources found given the supplied resource type and paths.
-func (f *Finder) FindAll(ctx context.Context, resType string, paths, excludePaths []string, dst interface{}) error {
+// findAll returns the union of resources found given the supplied resource type and paths.
+func (f *finder) findAll(ctx context.Context, resType string, paths, excludePaths []string, dst interface{}) error {
 	objs := make(map[string]types.ObjectContent)
 	for _, p := range paths {
-		if err := f.find(ctx, resType, p, objs); err != nil {
+		if err := f.findResources(ctx, resType, p, objs); err != nil {
 			return err
 		}
 	}
 	if len(excludePaths) > 0 {
 		excludes := make(map[string]types.ObjectContent)
 		for _, p := range excludePaths {
-			if err := f.find(ctx, resType, p, excludes); err != nil {
+			if err := f.findResources(ctx, resType, p, excludes); err != nil {
 				return err
 			}
 		}
@@ -53,23 +53,23 @@ func (f *Finder) FindAll(ctx context.Context, resType string, paths, excludePath
 	return objectContentToTypedArray(objs, dst)
 }
 
-// Find returns the resources matching the specified path.
-func (f *Finder) Find(ctx context.Context, resType, path string, dst interface{}) error {
+// find returns the resources matching the specified path.
+func (f *finder) find(ctx context.Context, resType, path string, dst interface{}) error {
 	objs := make(map[string]types.ObjectContent)
-	err := f.find(ctx, resType, path, objs)
+	err := f.findResources(ctx, resType, path, objs)
 	if err != nil {
 		return err
 	}
 	return objectContentToTypedArray(objs, dst)
 }
 
-func (f *Finder) find(ctx context.Context, resType, path string, objs map[string]types.ObjectContent) error {
+func (f *finder) findResources(ctx context.Context, resType, path string, objs map[string]types.ObjectContent) error {
 	p := strings.Split(path, "/")
-	flt := make([]property.Filter, len(p)-1)
+	flt := make([]property.Match, len(p)-1)
 	for i := 1; i < len(p); i++ {
-		flt[i-1] = property.Filter{"name": p[i]}
+		flt[i-1] = property.Match{"name": p[i]}
 	}
-	err := f.descend(ctx, f.client.Client.ServiceContent.RootFolder, resType, flt, 0, objs)
+	err := f.descend(ctx, f.client.client.ServiceContent.RootFolder, resType, flt, 0, objs)
 	if err != nil {
 		return err
 	}
@@ -77,8 +77,8 @@ func (f *Finder) find(ctx context.Context, resType, path string, objs map[string
 	return nil
 }
 
-func (f *Finder) descend(ctx context.Context, root types.ManagedObjectReference, resType string,
-	tokens []property.Filter, pos int, objs map[string]types.ObjectContent) error {
+func (f *finder) descend(ctx context.Context, root types.ManagedObjectReference, resType string,
+	tokens []property.Match, pos int, objs map[string]types.ObjectContent) error {
 	isLeaf := pos == len(tokens)-1
 
 	// No more tokens to match?
@@ -94,20 +94,18 @@ func (f *Finder) descend(ctx context.Context, root types.ManagedObjectReference,
 		return nil
 	}
 
-	m := view.NewManager(f.client.Client.Client)
+	m := view.NewManager(f.client.client.Client)
 	v, err := m.CreateContainerView(ctx, root, ct, false)
 	if err != nil {
 		return err
 	}
-	// Ignore the returned error as we cannot do anything about it anyway
-	//nolint:errcheck,revive
-	defer v.Destroy(ctx)
+	defer v.Destroy(ctx) //nolint:errcheck // Ignore the returned error as we cannot do anything about it anyway
 	var content []types.ObjectContent
 
 	fields := []string{"name"}
 	recurse := tokens[pos]["name"] == "**"
 
-	types := ct
+	objectTypes := ct
 	if isLeaf {
 		if af, ok := addFields[resType]; ok {
 			fields = append(fields, af...)
@@ -119,9 +117,7 @@ func (f *Finder) descend(ctx context.Context, root types.ManagedObjectReference,
 			if err != nil {
 				return err
 			}
-			// Ignore the returned error as we cannot do anything about it anyway
-			//nolint:errcheck,revive
-			defer v2.Destroy(ctx)
+			defer v2.Destroy(ctx) //nolint:errcheck // Ignore the returned error as we cannot do anything about it anyway
 			err = v2.Retrieve(ctx, []string{resType}, fields, &content)
 			if err != nil {
 				return err
@@ -131,9 +127,9 @@ func (f *Finder) descend(ctx context.Context, root types.ManagedObjectReference,
 			}
 			return nil
 		}
-		types = []string{resType} // Only load wanted object type at leaf level
+		objectTypes = []string{resType} // Only load wanted object type at leaf level
 	}
-	err = v.Retrieve(ctx, types, fields, &content)
+	err = v.Retrieve(ctx, objectTypes, fields, &content)
 	if err != nil {
 		return err
 	}
@@ -159,22 +155,20 @@ func (f *Finder) descend(ctx context.Context, root types.ManagedObjectReference,
 		var inc int
 		if recurse {
 			inc = 0 // By default, we stay on this token
-			if !isLeaf {
-				// Lookahead to next token.
-				if matchName(tokens[pos+1], c.PropSet) {
-					// Are we looking ahead at a leaf node that has the wanted type?
-					// Rerun the entire level as a leaf. This is needed since all properties aren't loaded
-					// when we're processing non-leaf nodes.
-					if pos == len(tokens)-2 {
-						if c.Obj.Type == resType {
-							rerunAsLeaf = true
-							continue
-						}
-					} else if _, ok := containers[c.Obj.Type]; ok {
-						// Tokens match and we're looking ahead at a container type that's not a leaf
-						// Consume this token and the next.
-						inc = 2
+			// Lookahead to next token.
+			if matchName(tokens[pos+1], c.PropSet) {
+				// Are we looking ahead at a leaf node that has the wanted type?
+				// Rerun the entire level as a leaf. This is needed since all properties aren't loaded
+				// when we're processing non-leaf nodes.
+				if pos == len(tokens)-2 {
+					if c.Obj.Type == resType {
+						rerunAsLeaf = true
+						continue
 					}
+				} else if _, ok := containers[c.Obj.Type]; ok {
+					// Tokens match and we're looking ahead at a container type that's not a leaf
+					// Consume this token and the next.
+					inc = 2
 				}
 			}
 		} else {
@@ -228,16 +222,15 @@ func objectContentToTypedArray(objs map[string]types.ObjectContent, dst interfac
 	return nil
 }
 
-// FindAll finds all resources matching the paths that were specified upon creation of
-// the ResourceFilter.
-func (r *ResourceFilter) FindAll(ctx context.Context, dst interface{}) error {
-	return r.finder.FindAll(ctx, r.resType, r.paths, r.excludePaths, dst)
+// findAll finds all resources matching the paths that were specified upon creation of the resourceFilter.
+func (r *resourceFilter) findAll(ctx context.Context, dst interface{}) error {
+	return r.finder.findAll(ctx, r.resType, r.paths, r.excludePaths, dst)
 }
 
-func matchName(f property.Filter, props []types.DynamicProperty) bool {
+func matchName(f property.Match, props []types.DynamicProperty) bool {
 	for _, prop := range props {
 		if prop.Name == "name" {
-			return f.MatchProperty(prop)
+			return f.Property(prop)
 		}
 	}
 	return false
@@ -246,6 +239,7 @@ func matchName(f property.Filter, props []types.DynamicProperty) bool {
 func init() {
 	childTypes = map[string][]string{
 		"HostSystem":             {"VirtualMachine"},
+		"ResourcePool":           {"VirtualMachine"},
 		"ComputeResource":        {"HostSystem", "ResourcePool", "VirtualApp"},
 		"ClusterComputeResource": {"HostSystem", "ResourcePool", "VirtualApp"},
 		"Datacenter":             {"Folder"},
@@ -260,12 +254,15 @@ func init() {
 	}
 
 	addFields = map[string][]string{
-		"HostSystem": {"parent", "summary.customValue", "customValue"},
+		"HostSystem":   {"parent", "summary.customValue", "customValue"},
+		"ResourcePool": {"parent", "customValue"},
 		"VirtualMachine": {"runtime.host", "config.guestId", "config.uuid", "runtime.powerState",
-			"summary.customValue", "guest.net", "guest.hostName", "customValue"},
+			"summary.customValue", "summary.config.memorySizeMB", "guest.guestId", "guest.net", "guest.hostName",
+			"resourcePool", "customValue"},
 		"Datastore":              {"parent", "info", "customValue"},
 		"ClusterComputeResource": {"parent", "customValue"},
 		"Datacenter":             {"parent", "customValue"},
+		"HostNumericSensorInfo":  {"parent", "temperature", "baseUnits"},
 	}
 
 	containers = map[string]interface{}{

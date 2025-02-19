@@ -1,11 +1,13 @@
+//go:generate ../../../tools/readme_config_includer/generator
 //go:build !windows
-// +build !windows
 
 package intel_rdt
 
 import (
 	"bufio"
 	"context"
+	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,13 +26,8 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-const (
-	timestampFormat           = "2006-01-02 15:04:05"
-	defaultSamplingInterval   = 10
-	pqosInitOutputLinesNumber = 4
-	numberOfMetrics           = 6
-	secondsDenominator        = 10
-)
+//go:embed sample.conf
+var sampleConfig string
 
 var pqosMetricOrder = map[int]string{
 	0: "IPC",        // Instructions Per Cycle
@@ -41,17 +38,25 @@ var pqosMetricOrder = map[int]string{
 	5: "MBT",        // Total Memory Bandwidth
 }
 
-type IntelRDT struct {
-	PqosPath         string   `toml:"pqos_path"`
-	Cores            []string `toml:"cores"`
-	Processes        []string `toml:"processes"`
-	SamplingInterval int32    `toml:"sampling_interval"`
-	ShortenedMetrics bool     `toml:"shortened_metrics"`
-	UseSudo          bool     `toml:"use_sudo"`
+const (
+	timestampFormat           = "2006-01-02 15:04:05"
+	defaultSamplingInterval   = 10
+	pqosInitOutputLinesNumber = 4
+	numberOfMetrics           = 6
+	secondsDenominator        = 10
+)
 
-	Log              telegraf.Logger  `toml:"-"`
-	Publisher        Publisher        `toml:"-"`
-	Processor        ProcessesHandler `toml:"-"`
+type IntelRDT struct {
+	PqosPath         string          `toml:"pqos_path"`
+	Cores            []string        `toml:"cores"`
+	Processes        []string        `toml:"processes"`
+	SamplingInterval int32           `toml:"sampling_interval"`
+	ShortenedMetrics bool            `toml:"shortened_metrics"`
+	UseSudo          bool            `toml:"use_sudo"`
+	Log              telegraf.Logger `toml:"-"`
+
+	publisher        publisher
+	processor        processesHandler
 	stopPQOSChan     chan bool
 	quitChan         chan struct{}
 	errorChan        chan error
@@ -72,66 +77,39 @@ type splitCSVLine struct {
 	coreOrPIDsValues []string
 }
 
-// All gathering is done in the Start function
-func (r *IntelRDT) Gather(_ telegraf.Accumulator) error {
-	return nil
-}
-
-func (r *IntelRDT) Description() string {
-	return "Intel Resource Director Technology plugin"
-}
-
-func (r *IntelRDT) SampleConfig() string {
-	return `
-	## Optionally set sampling interval to Nx100ms. 
-	## This value is propagated to pqos tool. Interval format is defined by pqos itself.
-	## If not provided or provided 0, will be set to 10 = 10x100ms = 1s.
-	# sampling_interval = "10"
-	
-	## Optionally specify the path to pqos executable. 
-	## If not provided, auto discovery will be performed.
-	# pqos_path = "/usr/local/bin/pqos"
-
-	## Optionally specify if IPC and LLC_Misses metrics shouldn't be propagated.
-	## If not provided, default value is false.
-	# shortened_metrics = false
-	
-	## Specify the list of groups of CPU core(s) to be provided as pqos input. 
-	## Mandatory if processes aren't set and forbidden if processes are specified.
-	## e.g. ["0-3", "4,5,6"] or ["1-3,4"]
-	# cores = ["0-3"]
-	
-	## Specify the list of processes for which Metrics will be collected.
-	## Mandatory if cores aren't set and forbidden if cores are specified.
-	## e.g. ["qemu", "pmd"]
-	# processes = ["process"]
-
-	## Specify if the pqos process should be called with sudo.
-	## Mandatory if the telegraf process does not run as root.
-	# use_sudo = false
-`
+func (*IntelRDT) SampleConfig() string {
+	return sampleConfig
 }
 
 func (r *IntelRDT) Start(acc telegraf.Accumulator) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 
-	r.Processor = NewProcessor()
-	r.Publisher = NewPublisher(acc, r.Log, r.ShortenedMetrics)
+	r.processor = newProcessor()
+	r.publisher = newPublisher(acc, r.Log, r.ShortenedMetrics)
 
-	err := r.Initialize()
+	err := r.initialize()
 	if err != nil {
 		return err
 	}
 
-	r.Publisher.publish(ctx)
+	r.publisher.publish(ctx)
 	go r.errorHandler(ctx)
 	go r.scheduler(ctx)
 
 	return nil
 }
 
-func (r *IntelRDT) Initialize() error {
+func (*IntelRDT) Gather(telegraf.Accumulator) error {
+	return nil
+}
+
+func (r *IntelRDT) Stop() {
+	r.cancel()
+	r.wg.Wait()
+}
+
+func (r *IntelRDT) initialize() error {
 	r.stopPQOSChan = make(chan bool)
 	r.quitChan = make(chan struct{})
 	r.errorChan = make(chan error)
@@ -141,15 +119,15 @@ func (r *IntelRDT) Initialize() error {
 		return err
 	}
 	if len(r.Cores) != 0 && len(r.Processes) != 0 {
-		return fmt.Errorf("monitoring start error, process and core tracking can not be done simultaneously")
+		return errors.New("monitoring start error, process and core tracking can not be done simultaneously")
 	}
 	if len(r.Cores) == 0 && len(r.Processes) == 0 {
-		return fmt.Errorf("monitoring start error, at least one of cores or processes must be provided in config")
+		return errors.New("monitoring start error, at least one of cores or processes must be provided in config")
 	}
 	if r.SamplingInterval == 0 {
 		r.SamplingInterval = defaultSamplingInterval
 	}
-	if err = validateInterval(r.SamplingInterval); err != nil {
+	if err := validateInterval(r.SamplingInterval); err != nil {
 		return err
 	}
 	r.parsedCores, err = parseCoresConfig(r.Cores)
@@ -205,11 +183,6 @@ func (r *IntelRDT) scheduler(ctx context.Context) {
 	}
 }
 
-func (r *IntelRDT) Stop() {
-	r.cancel()
-	r.wg.Wait()
-}
-
 func (r *IntelRDT) checkPIDsAssociation(ctx context.Context) error {
 	newProcessesPIDsMap, err := r.associateProcessesWithPIDs(r.Processes)
 	if err != nil {
@@ -228,16 +201,16 @@ func (r *IntelRDT) checkPIDsAssociation(ctx context.Context) error {
 }
 
 func (r *IntelRDT) associateProcessesWithPIDs(providedProcesses []string) (map[string]string, error) {
-	mapProcessPIDs := map[string]string{}
-
-	availableProcesses, err := r.Processor.getAllProcesses()
+	availableProcesses, err := r.processor.getAllProcesses()
 	if err != nil {
-		return nil, fmt.Errorf("cannot gather information of all available processes")
+		return nil, errors.New("cannot gather information of all available processes")
 	}
+
+	mapProcessPIDs := make(map[string]string, len(availableProcesses))
 	for _, availableProcess := range availableProcesses {
 		if choice.Contains(availableProcess.Name, providedProcesses) {
 			pid := availableProcess.PID
-			mapProcessPIDs[availableProcess.Name] = mapProcessPIDs[availableProcess.Name] + fmt.Sprintf("%d", pid) + ","
+			mapProcessPIDs[availableProcess.Name] = mapProcessPIDs[availableProcess.Name] + strconv.Itoa(pid) + ","
 		}
 	}
 	for key := range mapProcessPIDs {
@@ -268,7 +241,7 @@ func (r *IntelRDT) readData(ctx context.Context, args []string, processesPIDsAss
 
 	if r.UseSudo {
 		// run pqos with `/bin/sh -c "sudo /path/to/pqos ..."`
-		args = []string{"-c", fmt.Sprintf("sudo %s %s", r.PqosPath, strings.Replace(strings.Join(args, " "), ";", "\\;", -1))}
+		args = []string{"-c", fmt.Sprintf("sudo %s %s", r.PqosPath, strings.ReplaceAll(strings.Join(args, " "), ";", "\\;"))}
 		cmd = exec.Command("/bin/sh", args...)
 	}
 
@@ -335,8 +308,8 @@ func (r *IntelRDT) processOutput(cmdReader io.ReadCloser, processesPIDsAssociati
 
 			pids, err := findPIDsInMeasurement(out)
 			if err != nil {
-				r.errorChan <- err
-				break
+				r.Log.Warnf("Skipping measurement: %v", err)
+				continue
 			}
 			for processName, PIDsProcess := range processesPIDsAssociation {
 				if pids == PIDsProcess {
@@ -344,9 +317,9 @@ func (r *IntelRDT) processOutput(cmdReader io.ReadCloser, processesPIDsAssociati
 					newMetric.measurement = out
 				}
 			}
-			r.Publisher.BufferChanProcess <- newMetric
+			r.publisher.bufferChanProcess <- newMetric
 		} else {
-			r.Publisher.BufferChanCores <- out
+			r.publisher.bufferChanCores <- out
 		}
 	}
 }
@@ -355,14 +328,14 @@ func shutDownPqos(pqos *exec.Cmd) error {
 	timeout := time.Second * 2
 
 	if pqos.Process != nil {
-		// try to send interrupt signal, ignore err for now
-		_ = pqos.Process.Signal(os.Interrupt)
+		//nolint:errcheck // try to send interrupt signal, ignore err for now
+		pqos.Process.Signal(os.Interrupt)
 
 		// wait and constantly check if pqos is still running
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		for {
-			if err := pqos.Process.Signal(syscall.Signal(0)); err == os.ErrProcessDone {
+			if err := pqos.Process.Signal(syscall.Signal(0)); errors.Is(err, os.ErrProcessDone) {
 				return nil
 			} else if ctx.Err() != nil {
 				break
@@ -374,7 +347,7 @@ func shutDownPqos(pqos *exec.Cmd) error {
 		// fixed in https://github.com/intel/intel-cmt-cat/issues/197
 		err := pqos.Process.Kill()
 		if err != nil {
-			return fmt.Errorf("failed to shut down pqos: %v", err)
+			return fmt.Errorf("failed to shut down pqos: %w", err)
 		}
 	}
 	return nil
@@ -414,23 +387,22 @@ func createArgsForGroups(coresOrPIDs []string) string {
 
 func validatePqosPath(pqosPath string) error {
 	if len(pqosPath) == 0 {
-		return fmt.Errorf("monitoring start error, can not find pqos executable")
+		return errors.New("monitoring start error, can not find pqos executable")
 	}
 	pathInfo, err := os.Stat(pqosPath)
 	if os.IsNotExist(err) {
-		return fmt.Errorf("monitoring start error, provided pqos path not exist")
+		return errors.New("monitoring start error, provided pqos path not exist")
 	}
 	if mode := pathInfo.Mode(); !mode.IsRegular() {
-		return fmt.Errorf("monitoring start error, provided pqos path does not point to a regular file")
+		return errors.New("monitoring start error, provided pqos path does not point to a regular file")
 	}
 	return nil
 }
 
 func parseCoresConfig(cores []string) ([]string, error) {
-	var parsedCores []string
 	var allCores []int
-	configError := fmt.Errorf("wrong cores input config data format")
 
+	parsedCores := make([]string, 0, len(cores))
 	for _, singleCoreGroup := range cores {
 		var actualGroupOfCores []int
 		separatedCores := strings.Split(singleCoreGroup, ",")
@@ -438,16 +410,17 @@ func parseCoresConfig(cores []string) ([]string, error) {
 		for _, coreStr := range separatedCores {
 			actualCores, err := validateAndParseCores(coreStr)
 			if err != nil {
-				return nil, fmt.Errorf("%v: %v", configError, err)
+				return nil, fmt.Errorf("wrong cores input config data format: %w", err)
 			}
 			if checkForDuplicates(allCores, actualCores) {
-				return nil, fmt.Errorf("%v: %v", configError, "core value cannot be duplicated")
+				return nil, errors.New("wrong cores input config data format: core value cannot be duplicated")
 			}
 			actualGroupOfCores = append(actualGroupOfCores, actualCores...)
 			allCores = append(allCores, actualGroupOfCores...)
 		}
 		parsedCores = append(parsedCores, arrayToString(actualGroupOfCores))
 	}
+
 	return parsedCores, nil
 }
 
@@ -457,7 +430,7 @@ func validateAndParseCores(coreStr string) ([]int, error) {
 		rangeValues := strings.Split(coreStr, "-")
 
 		if len(rangeValues) != 2 {
-			return nil, fmt.Errorf("more than two values in range")
+			return nil, errors.New("more than two values in range")
 		}
 
 		startValue, err := strconv.Atoi(rangeValues[0])
@@ -470,7 +443,7 @@ func validateAndParseCores(coreStr string) ([]int, error) {
 		}
 
 		if startValue > stopValue {
-			return nil, fmt.Errorf("first value cannot be higher than second")
+			return nil, errors.New("first value cannot be higher than second")
 		}
 
 		rangeOfCores := makeRange(startValue, stopValue)
@@ -490,7 +463,7 @@ func findPIDsInMeasurement(measurements string) (string, error) {
 	var insideQuoteRegex = regexp.MustCompile(`"(.*?)"`)
 	pidsMatch := insideQuoteRegex.FindStringSubmatch(measurements)
 	if len(pidsMatch) < 2 {
-		return "", fmt.Errorf("cannot find PIDs in measurement line")
+		return "", errors.New("cannot find PIDs in measurement line")
 	}
 	pids := pidsMatch[1]
 	return pids, nil
@@ -515,7 +488,7 @@ func splitCSVLineIntoValues(line string) (splitCSVLine, error) {
 
 func validateInterval(interval int32) error {
 	if interval < 0 {
-		return fmt.Errorf("interval cannot be lower than 0")
+		return errors.New("interval cannot be lower than 0")
 	}
 	return nil
 }
@@ -523,7 +496,7 @@ func validateInterval(interval int32) error {
 func splitMeasurementLine(line string) ([]string, error) {
 	values := strings.Split(line, ",")
 	if len(values) < 8 {
-		return nil, fmt.Errorf(fmt.Sprintf("not valid line format from pqos: %s", values))
+		return nil, fmt.Errorf("not valid line format from pqos: %s", values)
 	}
 	return values, nil
 }
@@ -552,7 +525,7 @@ func arrayToString(array []int) string {
 	return strings.TrimSuffix(result, ",")
 }
 
-func checkForDuplicates(values []int, valuesToCheck []int) bool {
+func checkForDuplicates(values, valuesToCheck []int) bool {
 	for _, value := range values {
 		for _, valueToCheck := range valuesToCheck {
 			if value == valueToCheck {
@@ -563,10 +536,10 @@ func checkForDuplicates(values []int, valuesToCheck []int) bool {
 	return false
 }
 
-func makeRange(min, max int) []int {
-	a := make([]int, max-min+1)
+func makeRange(low, high int) []int {
+	a := make([]int, high-low+1)
 	for i := range a {
-		a[i] = min + i
+		a[i] = low + i
 	}
 	return a
 }
@@ -574,8 +547,8 @@ func makeRange(min, max int) []int {
 func init() {
 	inputs.Add("intel_rdt", func() telegraf.Input {
 		rdt := IntelRDT{}
-		pathPqos, _ := exec.LookPath("pqos")
-		if len(pathPqos) > 0 {
+		pathPqos, err := exec.LookPath("pqos")
+		if len(pathPqos) > 0 && err != nil {
 			rdt.PqosPath = pathPqos
 		}
 		return &rdt

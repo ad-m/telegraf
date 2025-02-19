@@ -1,86 +1,54 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package consul
 
 import (
+	_ "embed"
 	"net/http"
 	"strings"
 
 	"github.com/hashicorp/consul/api"
+
 	"github.com/influxdata/telegraf"
+	telegraf_config "github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-type Consul struct {
-	Address    string
-	Scheme     string
-	Token      string
-	Username   string
-	Password   string
-	Datacentre string // deprecated in 1.10; use Datacenter
-	Datacenter string
-	tls.ClientConfig
-	TagDelimiter  string
-	MetricVersion int
-	Log           telegraf.Logger
+//go:embed sample.conf
+var sampleConfig string
 
-	// client used to connect to Consul agnet
+type Consul struct {
+	Address       string `toml:"address"`
+	Scheme        string `toml:"scheme"`
+	Token         string `toml:"token"`
+	Username      string `toml:"username"`
+	Password      string `toml:"password"`
+	Datacentre    string `toml:"datacentre" deprecated:"1.10.0;1.35.0;use 'datacenter' instead"`
+	Datacenter    string `toml:"datacenter"`
+	TagDelimiter  string `toml:"tag_delimiter"`
+	MetricVersion int    `toml:"metric_version"`
+	Log           telegraf.Logger
+	tls.ClientConfig
+
+	// client used to connect to Consul agent
 	client *api.Client
 }
 
-var sampleConfig = `
-  ## Consul server address
-  # address = "localhost:8500"
-
-  ## URI scheme for the Consul server, one of "http", "https"
-  # scheme = "http"
-
-  ## Metric version controls the mapping from Consul metrics into
-  ## Telegraf metrics.
-  ##
-  ##   example: metric_version = 1; deprecated in 1.15
-  ##            metric_version = 2; recommended version
-  # metric_version = 1
-
-  ## ACL token used in every request
-  # token = ""
-
-  ## HTTP Basic Authentication username and password.
-  # username = ""
-  # password = ""
-
-  ## Data center to query the health checks from
-  # datacenter = ""
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = true
-
-  ## Consul checks' tag splitting
-  # When tags are formatted like "key:value" with ":" as a delimiter then
-  # they will be splitted and reported as proper key:value in Telegraf
-  # tag_delimiter = ":"
-`
-
-func (c *Consul) Init() error {
-	if c.MetricVersion != 2 {
-		c.Log.Warnf("Use of deprecated configuration: 'metric_version = 1'; please update to 'metric_version = 2'")
-	}
-
-	return nil
-}
-
-func (c *Consul) Description() string {
-	return "Gather health check statuses from services registered in Consul"
-}
-
-func (c *Consul) SampleConfig() string {
+func (*Consul) SampleConfig() string {
 	return sampleConfig
 }
 
-func (c *Consul) createAPIClient() (*api.Client, error) {
+func (c *Consul) Init() error {
+	if c.MetricVersion != 2 {
+		telegraf_config.PrintOptionValueDeprecationNotice("inputs.consul", "metric_version", 1,
+			telegraf.DeprecationInfo{
+				Since:     "1.16.0",
+				RemovalIn: "1.40.0",
+				Notice:    `please update to 'metric_version = 2'`,
+			},
+		)
+	}
+
 	config := api.DefaultConfig()
 
 	if c.Address != "" {
@@ -112,17 +80,30 @@ func (c *Consul) createAPIClient() (*api.Client, error) {
 
 	tlsCfg, err := c.ClientConfig.TLSConfig()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	config.Transport = &http.Transport{
 		TLSClientConfig: tlsCfg,
 	}
 
-	return api.NewClient(config)
+	c.client, err = api.NewClient(config)
+	return err
 }
 
-func (c *Consul) GatherHealthCheck(acc telegraf.Accumulator, checks []*api.HealthCheck) {
+func (c *Consul) Gather(acc telegraf.Accumulator) error {
+	checks, _, err := c.client.Health().State("any", nil)
+
+	if err != nil {
+		return err
+	}
+
+	c.gatherHealthCheck(acc, checks)
+
+	return nil
+}
+
+func (c *Consul) gatherHealthCheck(acc telegraf.Accumulator, checks []*api.HealthCheck) {
 	for _, check := range checks {
 		record := make(map[string]interface{})
 		tags := make(map[string]string)
@@ -161,28 +142,6 @@ func (c *Consul) GatherHealthCheck(acc telegraf.Accumulator, checks []*api.Healt
 
 		acc.AddFields("consul_health_checks", record, tags)
 	}
-}
-
-func (c *Consul) Gather(acc telegraf.Accumulator) error {
-	if c.client == nil {
-		newClient, err := c.createAPIClient()
-
-		if err != nil {
-			return err
-		}
-
-		c.client = newClient
-	}
-
-	checks, _, err := c.client.Health().State("any", nil)
-
-	if err != nil {
-		return err
-	}
-
-	c.GatherHealthCheck(acc, checks)
-
-	return nil
 }
 
 func init() {

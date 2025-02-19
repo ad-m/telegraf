@@ -1,181 +1,77 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package exec
 
 import (
 	"bytes"
+	_ "embed"
+	"errors"
 	"fmt"
 	"io"
-	osExec "os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/kballard/go-shellquote"
-
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal"
+	"github.com/influxdata/telegraf/models"
 	"github.com/influxdata/telegraf/plugins/inputs"
-	"github.com/influxdata/telegraf/plugins/parsers"
 	"github.com/influxdata/telegraf/plugins/parsers/nagios"
 )
 
-const sampleConfig = `
-  ## Commands array
-  commands = [
-    "/tmp/test.sh",
-    "/usr/bin/mycollector --foo=bar",
-    "/tmp/collect_*.sh"
-  ]
+//go:embed sample.conf
+var sampleConfig string
 
-  ## Timeout for each command to complete.
-  timeout = "5s"
+var once sync.Once
 
-  ## measurement name suffix (for separating different commands)
-  name_suffix = "_mycollector"
-
-  ## Data format to consume.
-  ## Each data format has its own unique set of configuration options, read
-  ## more about them here:
-  ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_INPUT.md
-  data_format = "influx"
-`
-
-const MaxStderrBytes int = 512
+const maxStderrBytes int = 512
 
 type Exec struct {
-	Commands []string        `toml:"commands"`
-	Command  string          `toml:"command"`
-	Timeout  config.Duration `toml:"timeout"`
+	Commands    []string        `toml:"commands"`
+	Command     string          `toml:"command"`
+	Environment []string        `toml:"environment"`
+	IgnoreError bool            `toml:"ignore_error"`
+	Timeout     config.Duration `toml:"timeout"`
+	Log         telegraf.Logger `toml:"-"`
 
-	parser parsers.Parser
+	parser telegraf.Parser
 
-	runner Runner
-	Log    telegraf.Logger `toml:"-"`
+	runner runner
+
+	// Allow post-processing of command exit codes
+	exitCodeHandler   exitCodeHandlerFunc
+	parseDespiteError bool
 }
 
-func NewExec() *Exec {
-	return &Exec{
-		runner:  CommandRunner{},
-		Timeout: config.Duration(time.Second * 5),
-	}
+type exitCodeHandlerFunc func([]telegraf.Metric, error, []byte) []telegraf.Metric
+
+type runner interface {
+	run(string, []string, time.Duration) ([]byte, []byte, error)
 }
 
-type Runner interface {
-	Run(string, time.Duration) ([]byte, []byte, error)
+type commandRunner struct {
+	debug bool
 }
 
-type CommandRunner struct{}
-
-func (c CommandRunner) Run(
-	command string,
-	timeout time.Duration,
-) ([]byte, []byte, error) {
-	splitCmd, err := shellquote.Split(command)
-	if err != nil || len(splitCmd) == 0 {
-		return nil, nil, fmt.Errorf("exec: unable to parse command, %s", err)
-	}
-
-	cmd := osExec.Command(splitCmd[0], splitCmd[1:]...)
-
-	var (
-		out    bytes.Buffer
-		stderr bytes.Buffer
-	)
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-
-	runErr := internal.RunTimeout(cmd, timeout)
-
-	out = removeWindowsCarriageReturns(out)
-	if stderr.Len() > 0 && !telegraf.Debug {
-		stderr = removeWindowsCarriageReturns(stderr)
-		stderr = c.truncate(stderr)
-	}
-
-	return out.Bytes(), stderr.Bytes(), runErr
-}
-
-func (c CommandRunner) truncate(buf bytes.Buffer) bytes.Buffer {
-	// Limit the number of bytes.
-	didTruncate := false
-	if buf.Len() > MaxStderrBytes {
-		buf.Truncate(MaxStderrBytes)
-		didTruncate = true
-	}
-	if i := bytes.IndexByte(buf.Bytes(), '\n'); i > 0 {
-		// Only show truncation if the newline wasn't the last character.
-		if i < buf.Len()-1 {
-			didTruncate = true
-		}
-		buf.Truncate(i)
-	}
-	if didTruncate {
-		//nolint:errcheck,revive // Will always return nil or panic
-		buf.WriteString("...")
-	}
-	return buf
-}
-
-// removeWindowsCarriageReturns removes all carriage returns from the input if the
-// OS is Windows. It does not return any errors.
-func removeWindowsCarriageReturns(b bytes.Buffer) bytes.Buffer {
-	if runtime.GOOS == "windows" {
-		var buf bytes.Buffer
-		for {
-			byt, err := b.ReadBytes(0x0D)
-			byt = bytes.TrimRight(byt, "\x0d")
-			if len(byt) > 0 {
-				_, _ = buf.Write(byt)
-			}
-			if err == io.EOF {
-				return buf
-			}
-		}
-	}
-	return b
-}
-
-func (e *Exec) ProcessCommand(command string, acc telegraf.Accumulator, wg *sync.WaitGroup) {
-	defer wg.Done()
-	_, isNagios := e.parser.(*nagios.NagiosParser)
-
-	out, errbuf, runErr := e.runner.Run(command, time.Duration(e.Timeout))
-	if !isNagios && runErr != nil {
-		err := fmt.Errorf("exec: %s for command '%s': %s", runErr, command, string(errbuf))
-		acc.AddError(err)
-		return
-	}
-
-	metrics, err := e.parser.Parse(out)
-	if err != nil {
-		acc.AddError(err)
-		return
-	}
-
-	if isNagios {
-		metrics, err = nagios.TryAddState(runErr, metrics)
-		if err != nil {
-			e.Log.Errorf("Failed to add nagios state: %s", err)
-		}
-	}
-
-	for _, m := range metrics {
-		acc.AddMetric(m)
-	}
-}
-
-func (e *Exec) SampleConfig() string {
+func (*Exec) SampleConfig() string {
 	return sampleConfig
 }
 
-func (e *Exec) Description() string {
-	return "Read metrics from one or more commands that can output to stdout"
+func (*Exec) Init() error {
+	return nil
 }
 
-func (e *Exec) SetParser(parser parsers.Parser) {
+func (e *Exec) SetParser(parser telegraf.Parser) {
 	e.parser = parser
+	unwrapped, ok := parser.(*models.RunningParser)
+	if ok {
+		if _, ok := unwrapped.Parser.(*nagios.Parser); ok {
+			e.exitCodeHandler = nagiosHandler
+			e.parseDespiteError = true
+		}
+	}
 }
 
 func (e *Exec) Gather(acc telegraf.Accumulator) error {
@@ -219,18 +115,95 @@ func (e *Exec) Gather(acc telegraf.Accumulator) error {
 
 	wg.Add(len(commands))
 	for _, command := range commands {
-		go e.ProcessCommand(command, acc, &wg)
+		go e.processCommand(command, acc, &wg)
 	}
 	wg.Wait()
 	return nil
 }
 
-func (e *Exec) Init() error {
-	return nil
+func truncate(buf bytes.Buffer) bytes.Buffer {
+	// Limit the number of bytes.
+	didTruncate := false
+	if buf.Len() > maxStderrBytes {
+		buf.Truncate(maxStderrBytes)
+		didTruncate = true
+	}
+	if i := bytes.IndexByte(buf.Bytes(), '\n'); i > 0 {
+		// Only show truncation if the newline wasn't the last character.
+		if i < buf.Len()-1 {
+			didTruncate = true
+		}
+		buf.Truncate(i)
+	}
+	if didTruncate {
+		buf.WriteString("...")
+	}
+	return buf
+}
+
+// removeWindowsCarriageReturns removes all carriage returns from the input if the
+// OS is Windows. It does not return any errors.
+func removeWindowsCarriageReturns(b bytes.Buffer) bytes.Buffer {
+	if runtime.GOOS == "windows" {
+		var buf bytes.Buffer
+		for {
+			byt, err := b.ReadBytes(0x0D)
+			byt = bytes.TrimRight(byt, "\x0d")
+			if len(byt) > 0 {
+				buf.Write(byt)
+			}
+			if errors.Is(err, io.EOF) {
+				return buf
+			}
+		}
+	}
+	return b
+}
+
+func (e *Exec) processCommand(command string, acc telegraf.Accumulator, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	out, errBuf, runErr := e.runner.run(command, e.Environment, time.Duration(e.Timeout))
+	if !e.IgnoreError && !e.parseDespiteError && runErr != nil {
+		err := fmt.Errorf("exec: %w for command %q: %s", runErr, command, string(errBuf))
+		acc.AddError(err)
+		return
+	}
+
+	metrics, err := e.parser.Parse(out)
+	if err != nil {
+		acc.AddError(err)
+		return
+	}
+
+	if len(metrics) == 0 {
+		once.Do(func() {
+			e.Log.Debug(internal.NoMetricsCreatedMsg)
+		})
+	}
+
+	if e.exitCodeHandler != nil {
+		metrics = e.exitCodeHandler(metrics, runErr, errBuf)
+	}
+
+	for _, m := range metrics {
+		acc.AddMetric(m)
+	}
+}
+
+func nagiosHandler(metrics []telegraf.Metric, err error, msg []byte) []telegraf.Metric {
+	return nagios.AddState(err, msg, metrics)
+}
+
+func newExec() *Exec {
+	return &Exec{
+		runner:  commandRunner{},
+		Timeout: config.Duration(time.Second * 5),
+	}
 }
 
 func init() {
 	inputs.Add("exec", func() telegraf.Input {
-		return NewExec()
+		return newExec()
 	})
 }

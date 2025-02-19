@@ -1,8 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package nsd
 
 import (
 	"bufio"
 	"bytes"
+	_ "embed"
 	"fmt"
 	"net"
 	"os/exec"
@@ -16,89 +18,34 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-type runner func(cmdName string, timeout config.Duration, useSudo bool, Server string, ConfigFile string) (*bytes.Buffer, error)
+//go:embed sample.conf
+var sampleConfig string
 
-// NSD is used to store configuration values
+var (
+	defaultBinary  = "/usr/sbin/nsd-control"
+	defaultTimeout = config.Duration(time.Second)
+)
+
 type NSD struct {
-	Binary     string
-	Timeout    config.Duration
-	UseSudo    bool
-	Server     string
-	ConfigFile string
+	Binary     string          `toml:"binary"`
+	Timeout    config.Duration `toml:"timeout"`
+	UseSudo    bool            `toml:"use_sudo"`
+	Server     string          `toml:"server"`
+	ConfigFile string          `toml:"config_file"`
 
 	run runner
 }
 
-var defaultBinary = "/usr/sbin/nsd-control"
-var defaultTimeout = config.Duration(time.Second)
+type runner func(cmdName string, timeout config.Duration, useSudo bool, Server string, ConfigFile string) (*bytes.Buffer, error)
 
-var sampleConfig = `
-  ## Address of server to connect to, optionally ':port'. Defaults to the
-  ## address in the nsd config file.
-  server = "127.0.0.1:8953"
-
-  ## If running as a restricted user you can prepend sudo for additional access:
-  # use_sudo = false
-
-  ## The default location of the nsd-control binary can be overridden with:
-  # binary = "/usr/sbin/nsd-control"
-
-  ## The default location of the nsd config file can be overridden with:
-  # config_file = "/etc/nsd/nsd.conf"
-
-  ## The default timeout of 1s can be overridden with:
-  # timeout = "1s"
-`
-
-// Description displays what this plugin is about
-func (s *NSD) Description() string {
-	return "A plugin to collect stats from the NSD authoritative DNS name server"
-}
-
-// SampleConfig displays configuration instructions
-func (s *NSD) SampleConfig() string {
+func (*NSD) SampleConfig() string {
 	return sampleConfig
 }
 
-// Shell out to nsd_stat and return the output
-func nsdRunner(cmdName string, timeout config.Duration, useSudo bool, server string, configFile string) (*bytes.Buffer, error) {
-	cmdArgs := []string{"stats_noreset"}
-
-	if server != "" {
-		host, port, err := net.SplitHostPort(server)
-		if err == nil {
-			server = host + "@" + port
-		}
-
-		cmdArgs = append([]string{"-s", server}, cmdArgs...)
-	}
-
-	if configFile != "" {
-		cmdArgs = append([]string{"-c", configFile}, cmdArgs...)
-	}
-
-	cmd := exec.Command(cmdName, cmdArgs...)
-
-	if useSudo {
-		cmdArgs = append([]string{cmdName}, cmdArgs...)
-		cmd = exec.Command("sudo", cmdArgs...)
-	}
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := internal.RunTimeout(cmd, time.Duration(timeout))
-	if err != nil {
-		return &out, fmt.Errorf("error running nsd-control: %s (%s %v)", err, cmdName, cmdArgs)
-	}
-
-	return &out, nil
-}
-
-// Gather collects stats from nsd-control and adds them to the Accumulator
 func (s *NSD) Gather(acc telegraf.Accumulator) error {
 	out, err := s.run(s.Binary, s.Timeout, s.UseSudo, s.Server, s.ConfigFile)
 	if err != nil {
-		return fmt.Errorf("error gathering metrics: %s", err)
+		return fmt.Errorf("error gathering metrics: %w", err)
 	}
 
 	// Process values
@@ -138,7 +85,7 @@ func (s *NSD) Gather(acc telegraf.Accumulator) error {
 				}
 			}
 		} else {
-			field := strings.Replace(stat, ".", "_", -1)
+			field := strings.ReplaceAll(stat, ".", "_")
 			fields[field] = fieldValue
 		}
 	}
@@ -150,6 +97,40 @@ func (s *NSD) Gather(acc telegraf.Accumulator) error {
 	}
 
 	return nil
+}
+
+// Shell out to nsd_stat and return the output
+func nsdRunner(cmdName string, timeout config.Duration, useSudo bool, server, configFile string) (*bytes.Buffer, error) {
+	cmdArgs := []string{"stats_noreset"}
+
+	if server != "" {
+		host, port, err := net.SplitHostPort(server)
+		if err == nil {
+			server = host + "@" + port
+		}
+
+		cmdArgs = append([]string{"-s", server}, cmdArgs...)
+	}
+
+	if configFile != "" {
+		cmdArgs = append([]string{"-c", configFile}, cmdArgs...)
+	}
+
+	cmd := exec.Command(cmdName, cmdArgs...)
+
+	if useSudo {
+		cmdArgs = append([]string{cmdName}, cmdArgs...)
+		cmd = exec.Command("sudo", cmdArgs...)
+	}
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := internal.RunTimeout(cmd, time.Duration(timeout))
+	if err != nil {
+		return &out, fmt.Errorf("error running nsd-control: %w (%s %v)", err, cmdName, cmdArgs)
+	}
+
+	return &out, nil
 }
 
 func init() {

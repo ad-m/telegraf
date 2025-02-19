@@ -1,83 +1,242 @@
 package clone
 
 import (
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
-	"github.com/stretchr/testify/assert"
+	"github.com/influxdata/telegraf/testutil"
 )
 
-func createTestMetric() telegraf.Metric {
-	m := metric.New("m1",
+func TestRetainsTags(t *testing.T) {
+	input := metric.New(
+		"m1",
 		map[string]string{"metric_tag": "from_metric"},
 		map[string]interface{}{"value": int64(1)},
-		time.Now(),
+		time.Unix(0, 0),
 	)
-	return m
-}
 
-func calculateProcessedTags(processor Clone, metric telegraf.Metric) map[string]string {
-	processed := processor.Apply(metric)
-	return processed[0].Tags()
-}
+	expected := []telegraf.Metric{
+		metric.New(
+			"m1",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"m1",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+	}
 
-func TestRetainsTags(t *testing.T) {
-	processor := Clone{}
-
-	tags := calculateProcessedTags(processor, createTestMetric())
-
-	value, present := tags["metric_tag"]
-	assert.True(t, present, "Tag of metric was not present")
-	assert.Equal(t, "from_metric", value, "Value of Tag was changed")
+	plugin := &Clone{}
+	actual := plugin.Apply(input)
+	testutil.RequireMetricsEqual(t, expected, actual)
 }
 
 func TestAddTags(t *testing.T) {
-	processor := Clone{Tags: map[string]string{"added_tag": "from_config", "another_tag": ""}}
+	input := metric.New(
+		"m1",
+		map[string]string{"metric_tag": "from_metric"},
+		map[string]interface{}{"value": int64(1)},
+		time.Unix(0, 0),
+	)
 
-	tags := calculateProcessedTags(processor, createTestMetric())
+	expected := []telegraf.Metric{
+		metric.New(
+			"m1",
+			map[string]string{
+				"metric_tag":  "from_metric",
+				"added_tag":   "from_config",
+				"another_tag": "",
+			},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"m1",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+	}
 
-	value, present := tags["added_tag"]
-	assert.True(t, present, "Additional Tag of metric was not present")
-	assert.Equal(t, "from_config", value, "Value of Tag was changed")
-	assert.Equal(t, 3, len(tags), "Should have one previous and two added tags.")
+	plugin := &Clone{
+		Tags: map[string]string{
+			"added_tag":   "from_config",
+			"another_tag": "",
+		},
+	}
+	actual := plugin.Apply(input)
+	testutil.RequireMetricsEqual(t, expected, actual)
 }
 
 func TestOverwritesPresentTagValues(t *testing.T) {
-	processor := Clone{Tags: map[string]string{"metric_tag": "from_config"}}
+	input := metric.New(
+		"m1",
+		map[string]string{"metric_tag": "from_metric"},
+		map[string]interface{}{"value": int64(1)},
+		time.Unix(0, 0),
+	)
 
-	tags := calculateProcessedTags(processor, createTestMetric())
+	expected := []telegraf.Metric{
+		metric.New(
+			"m1",
+			map[string]string{"metric_tag": "from_config"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"m1",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+	}
 
-	value, present := tags["metric_tag"]
-	assert.True(t, present, "Tag of metric was not present")
-	assert.Equal(t, 1, len(tags), "Should only have one tag.")
-	assert.Equal(t, "from_config", value, "Value of Tag was not changed")
+	plugin := &Clone{
+		Tags: map[string]string{"metric_tag": "from_config"},
+	}
+	actual := plugin.Apply(input)
+	testutil.RequireMetricsEqual(t, expected, actual)
 }
 
 func TestOverridesName(t *testing.T) {
-	processor := Clone{NameOverride: "overridden"}
+	input := metric.New(
+		"m1",
+		map[string]string{"metric_tag": "from_metric"},
+		map[string]interface{}{"value": int64(1)},
+		time.Unix(0, 0),
+	)
 
-	processed := processor.Apply(createTestMetric())
+	expected := []telegraf.Metric{
+		metric.New(
+			"overridden",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"m1",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+	}
 
-	assert.Equal(t, "overridden", processed[0].Name(), "Name was not overridden")
-	assert.Equal(t, "m1", processed[1].Name(), "Original metric was modified")
+	plugin := &Clone{NameOverride: "overridden"}
+	actual := plugin.Apply(input)
+	testutil.RequireMetricsEqual(t, expected, actual)
 }
 
 func TestNamePrefix(t *testing.T) {
-	processor := Clone{NamePrefix: "Pre-"}
+	input := metric.New(
+		"m1",
+		map[string]string{"metric_tag": "from_metric"},
+		map[string]interface{}{"value": int64(1)},
+		time.Unix(0, 0),
+	)
 
-	processed := processor.Apply(createTestMetric())
+	expected := []telegraf.Metric{
+		metric.New(
+			"Pre-m1",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"m1",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+	}
 
-	assert.Equal(t, "Pre-m1", processed[0].Name(), "Prefix was not applied")
-	assert.Equal(t, "m1", processed[1].Name(), "Original metric was modified")
+	plugin := &Clone{NamePrefix: "Pre-"}
+	actual := plugin.Apply(input)
+	testutil.RequireMetricsEqual(t, expected, actual)
 }
 
 func TestNameSuffix(t *testing.T) {
-	processor := Clone{NameSuffix: "-suff"}
+	input := metric.New(
+		"m1",
+		map[string]string{"metric_tag": "from_metric"},
+		map[string]interface{}{"value": int64(1)},
+		time.Unix(0, 0),
+	)
 
-	processed := processor.Apply(createTestMetric())
+	expected := []telegraf.Metric{
+		metric.New(
+			"m1-suff",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"m1",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Unix(0, 0),
+		),
+	}
 
-	assert.Equal(t, "m1-suff", processed[0].Name(), "Suffix was not applied")
-	assert.Equal(t, "m1", processed[1].Name(), "Original metric was modified")
+	plugin := &Clone{NameSuffix: "-suff"}
+	actual := plugin.Apply(input)
+	testutil.RequireMetricsEqual(t, expected, actual)
+}
+
+func TestTracking(t *testing.T) {
+	inputRaw := []telegraf.Metric{
+		metric.New(
+			"m1",
+			map[string]string{"metric_tag": "from_metric"},
+			map[string]interface{}{"value": int64(1)},
+			time.Now(),
+		),
+		metric.New(
+			"m2",
+			map[string]string{"metric_tag": "foo_metric"},
+			map[string]interface{}{"value": int64(2)},
+			time.Now(),
+		),
+	}
+
+	var mu sync.Mutex
+	delivered := make([]telegraf.DeliveryInfo, 0, len(inputRaw))
+	notify := func(di telegraf.DeliveryInfo) {
+		mu.Lock()
+		defer mu.Unlock()
+		delivered = append(delivered, di)
+	}
+	input := make([]telegraf.Metric, 0, len(inputRaw))
+	expected := make([]telegraf.Metric, 0, 2*len(input))
+	for _, m := range inputRaw {
+		tm, _ := metric.WithTracking(m, notify)
+		input = append(input, tm)
+		expected = append(expected, m)
+	}
+	expected = append(expected, input...)
+
+	// Process expected metrics and compare with resulting metrics
+	plugin := &Clone{}
+	actual := plugin.Apply(input...)
+	testutil.RequireMetricsEqual(t, expected, actual)
+
+	// Simulate output acknowledging delivery
+	for _, m := range actual {
+		m.Accept()
+	}
+
+	// Check delivery
+	require.Eventuallyf(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(input) == len(delivered)
+	}, time.Second, 100*time.Millisecond, "%d delivered but %d expected", len(delivered), len(expected))
 }

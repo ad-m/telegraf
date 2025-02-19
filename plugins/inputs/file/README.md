@@ -1,18 +1,46 @@
 # File Input Plugin
 
-The file plugin parses the **complete** contents of a file **every interval** using
-the selected [input data format][].
+This plugin reads the __complete__ contents of the configured files in
+__every__ interval. The file content is split line-wise and parsed according to
+one of the supported [data formats][data_formats].
 
-**Note:** If you wish to parse only newly appended lines use the [tail][] input
-plugin instead.
+> [!TIP]
+> If you wish to only process newly appended lines use the [tail][tail] input
+> plugin instead.
 
-### Configuration:
+⭐ Telegraf v1.8.0
+🏷️ system
+💻 all
 
-```toml
+[data_formats]: /docs/DATA_FORMATS_INPUT.md
+[tail]: /plugins/inputs/tail
+
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
+
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Configuration
+
+```toml @sample.conf
+# Parse a complete file each interval
 [[inputs.file]]
   ## Files to parse each interval.  Accept standard unix glob matching rules,
   ## as well as ** to match recursive files and directories.
   files = ["/tmp/metrics.out"]
+
+  ## Character encoding to use when interpreting the file contents.  Invalid
+  ## characters are replaced using the unicode replacement character.  When set
+  ## to the empty string the data is not decoded to text.
+  ##   ex: character_encoding = "utf-8"
+  ##       character_encoding = "utf-16le"
+  ##       character_encoding = "utf-16be"
+  ##       character_encoding = ""
+  # character_encoding = ""
 
   ## Data format to consume.
   ## Each data format has its own unique set of configuration options, read
@@ -20,13 +48,22 @@ plugin instead.
   ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_INPUT.md
   data_format = "influx"
 
-  
-  ## Name a tag containing the name of the file the data was parsed from.  Leave empty
-  ## to disable. Cautious when file name variation is high, this can increase the cardinality 
-  ## significantly. Read more about cardinality here: 
+  ## Please use caution when using the following options: when file name
+  ## variation is high, this can increase the cardinality significantly. Read
+  ## more about cardinality here:
   ## https://docs.influxdata.com/influxdb/cloud/reference/glossary/#series-cardinality
+
+  ## Name of tag to store the name of the file. Disabled if not set.
   # file_tag = ""
+
+  ## Name of tag to store the absolute path and name of the file. Disabled if
+  ## not set.
+  # file_path_tag = ""
 ```
 
-[input data format]: /docs/DATA_FORMATS_INPUT.md
-[tail]: /plugins/inputs/tail
+## Metrics
+
+The format of metrics produced by this plugin depends on the content and data
+format of the file.
+
+## Example Output

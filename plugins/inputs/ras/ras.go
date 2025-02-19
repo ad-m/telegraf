@@ -1,48 +1,30 @@
+//go:generate ../../../tools/readme_config_includer/generator
 //go:build linux && (386 || amd64 || arm || arm64)
-// +build linux
-// +build 386 amd64 arm arm64
 
 package ras
 
 import (
 	"database/sql"
+	_ "embed"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" //to register SQLite driver
+	// Required for SQL framework driver
+	_ "modernc.org/sqlite"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-// Ras plugin gathers and counts errors provided by RASDaemon
-type Ras struct {
-	DBPath string `toml:"db_path"`
-
-	Log telegraf.Logger `toml:"-"`
-	db  *sql.DB         `toml:"-"`
-
-	latestTimestamp   time.Time              `toml:"-"`
-	cpuSocketCounters map[int]metricCounters `toml:"-"`
-	serverCounters    metricCounters         `toml:"-"`
-}
-
-type machineCheckError struct {
-	ID           int
-	Timestamp    string
-	SocketID     int
-	ErrorMsg     string
-	MciStatusMsg string
-}
-
-type metricCounters map[string]int64
+//go:embed sample.conf
+var sampleConfig string
 
 const (
 	mceQuery = `
-		SELECT 
+		SELECT
 			id, timestamp, error_msg, mcistatus_msg, socketid
 		FROM mce_record
 		WHERE timestamp > ?
@@ -68,18 +50,28 @@ const (
 	unclassifiedMCEBase    = "unclassified_mce_errors"
 )
 
-// SampleConfig returns sample configuration for this plugin.
-func (r *Ras) SampleConfig() string {
-	return `
-  ## Optional path to RASDaemon sqlite3 database.
-  ## Default: /var/lib/rasdaemon/ras-mc_event.db
-  # db_path = ""
-`
+type Ras struct {
+	DBPath string          `toml:"db_path"`
+	Log    telegraf.Logger `toml:"-"`
+
+	db                *sql.DB
+	latestTimestamp   time.Time
+	cpuSocketCounters map[int]metricCounters
+	serverCounters    metricCounters
 }
 
-// Description returns the plugin description.
-func (r *Ras) Description() string {
-	return "RAS plugin exposes counter metrics for Machine Check Errors provided by RASDaemon (sqlite3 output is required)."
+type machineCheckError struct {
+	id           int
+	timestamp    string
+	socketID     int
+	errorMsg     string
+	mciStatusMsg string
+}
+
+type metricCounters map[string]int64
+
+func (*Ras) SampleConfig() string {
+	return sampleConfig
 }
 
 // Start initializes connection to DB, metrics are gathered in Gather
@@ -97,16 +89,6 @@ func (r *Ras) Start(telegraf.Accumulator) error {
 	return nil
 }
 
-// Stop closes any existing DB connection
-func (r *Ras) Stop() {
-	if r.db != nil {
-		err := r.db.Close()
-		if err != nil {
-			r.Log.Errorf("Error appeared during closing DB (%s): %v", r.DBPath, err)
-		}
-	}
-}
-
 // Gather reads the stats provided by RASDaemon and writes it to the Accumulator.
 func (r *Ras) Gather(acc telegraf.Accumulator) error {
 	rows, err := r.db.Query(mceQuery, r.latestTimestamp)
@@ -120,7 +102,7 @@ func (r *Ras) Gather(acc telegraf.Accumulator) error {
 		if err != nil {
 			return err
 		}
-		tsErr := r.updateLatestTimestamp(mcError.Timestamp)
+		tsErr := r.updateLatestTimestamp(mcError.timestamp)
 		if tsErr != nil {
 			return err
 		}
@@ -131,6 +113,16 @@ func (r *Ras) Gather(acc telegraf.Accumulator) error {
 	addServerMetrics(acc, r.serverCounters)
 
 	return nil
+}
+
+// Stop closes any existing DB connection
+func (r *Ras) Stop() {
+	if r.db != nil {
+		err := r.db.Close()
+		if err != nil {
+			r.Log.Errorf("Error appeared during closing DB (%s): %v", r.DBPath, err)
+		}
+	}
 }
 
 func (r *Ras) updateLatestTimestamp(timestamp string) error {
@@ -146,11 +138,11 @@ func (r *Ras) updateLatestTimestamp(timestamp string) error {
 }
 
 func (r *Ras) updateCounters(mcError *machineCheckError) {
-	if strings.Contains(mcError.ErrorMsg, "No Error") {
+	if strings.Contains(mcError.errorMsg, "No Error") {
 		return
 	}
 
-	r.initializeCPUMetricDataIfRequired(mcError.SocketID)
+	r.initializeCPUMetricDataIfRequired(mcError.socketID)
 	r.updateSocketCounters(mcError)
 	r.updateServerCounters(mcError)
 }
@@ -176,11 +168,11 @@ func newMetricCounters() *metricCounters {
 }
 
 func (r *Ras) updateServerCounters(mcError *machineCheckError) {
-	if strings.Contains(mcError.ErrorMsg, "CACHE Level-2") && strings.Contains(mcError.ErrorMsg, "Error") {
+	if strings.Contains(mcError.errorMsg, "CACHE Level-2") && strings.Contains(mcError.errorMsg, "Error") {
 		r.serverCounters[levelTwoCache]++
 	}
 
-	if strings.Contains(mcError.ErrorMsg, "UPI:") {
+	if strings.Contains(mcError.errorMsg, "UPI:") {
 		r.serverCounters[upi]++
 	}
 }
@@ -192,7 +184,7 @@ func validateDbPath(dbPath string) error {
 	}
 
 	if err != nil {
-		return fmt.Errorf("cannot get system information for db_path file: [%s] - %v", dbPath, err)
+		return fmt.Errorf("cannot get system information for db_path file %q: %w", dbPath, err)
 	}
 
 	if mode := pathInfo.Mode(); !mode.IsRegular() {
@@ -216,71 +208,71 @@ func (r *Ras) updateSocketCounters(mcError *machineCheckError) {
 	r.updateMemoryCounters(mcError)
 	r.updateProcessorBaseCounters(mcError)
 
-	if strings.Contains(mcError.ErrorMsg, "Instruction TLB") && strings.Contains(mcError.ErrorMsg, "Error") {
-		r.cpuSocketCounters[mcError.SocketID][instructionTLB]++
+	if strings.Contains(mcError.errorMsg, "Instruction TLB") && strings.Contains(mcError.errorMsg, "Error") {
+		r.cpuSocketCounters[mcError.socketID][instructionTLB]++
 	}
 
-	if strings.Contains(mcError.ErrorMsg, "BUS") && strings.Contains(mcError.ErrorMsg, "Error") {
-		r.cpuSocketCounters[mcError.SocketID][processorBus]++
+	if strings.Contains(mcError.errorMsg, "BUS") && strings.Contains(mcError.errorMsg, "Error") {
+		r.cpuSocketCounters[mcError.socketID][processorBus]++
 	}
 
-	if (strings.Contains(mcError.ErrorMsg, "CACHE Level-0") ||
-		strings.Contains(mcError.ErrorMsg, "CACHE Level-1")) &&
-		strings.Contains(mcError.ErrorMsg, "Error") {
-		r.cpuSocketCounters[mcError.SocketID][instructionCache]++
+	if (strings.Contains(mcError.errorMsg, "CACHE Level-0") ||
+		strings.Contains(mcError.errorMsg, "CACHE Level-1")) &&
+		strings.Contains(mcError.errorMsg, "Error") {
+		r.cpuSocketCounters[mcError.socketID][instructionCache]++
 	}
 }
 
 func (r *Ras) updateProcessorBaseCounters(mcError *machineCheckError) {
-	if strings.Contains(mcError.ErrorMsg, "Internal Timer error") {
-		r.cpuSocketCounters[mcError.SocketID][internalTimer]++
-		r.cpuSocketCounters[mcError.SocketID][processorBase]++
+	if strings.Contains(mcError.errorMsg, "Internal Timer error") {
+		r.cpuSocketCounters[mcError.socketID][internalTimer]++
+		r.cpuSocketCounters[mcError.socketID][processorBase]++
 	}
 
-	if strings.Contains(mcError.ErrorMsg, "SMM Handler Code Access Violation") {
-		r.cpuSocketCounters[mcError.SocketID][smmHandlerCode]++
-		r.cpuSocketCounters[mcError.SocketID][processorBase]++
+	if strings.Contains(mcError.errorMsg, "SMM Handler Code Access Violation") {
+		r.cpuSocketCounters[mcError.socketID][smmHandlerCode]++
+		r.cpuSocketCounters[mcError.socketID][processorBase]++
 	}
 
-	if strings.Contains(mcError.ErrorMsg, "Internal parity error") {
-		r.cpuSocketCounters[mcError.SocketID][internalParity]++
-		r.cpuSocketCounters[mcError.SocketID][processorBase]++
+	if strings.Contains(mcError.errorMsg, "Internal parity error") {
+		r.cpuSocketCounters[mcError.socketID][internalParity]++
+		r.cpuSocketCounters[mcError.socketID][processorBase]++
 	}
 
-	if strings.Contains(mcError.ErrorMsg, "FRC error") {
-		r.cpuSocketCounters[mcError.SocketID][frc]++
-		r.cpuSocketCounters[mcError.SocketID][processorBase]++
+	if strings.Contains(mcError.errorMsg, "FRC error") {
+		r.cpuSocketCounters[mcError.socketID][frc]++
+		r.cpuSocketCounters[mcError.socketID][processorBase]++
 	}
 
-	if strings.Contains(mcError.ErrorMsg, "External error") {
-		r.cpuSocketCounters[mcError.SocketID][externalMCEBase]++
-		r.cpuSocketCounters[mcError.SocketID][processorBase]++
+	if strings.Contains(mcError.errorMsg, "External error") {
+		r.cpuSocketCounters[mcError.socketID][externalMCEBase]++
+		r.cpuSocketCounters[mcError.socketID][processorBase]++
 	}
 
-	if strings.Contains(mcError.ErrorMsg, "Microcode ROM parity error") {
-		r.cpuSocketCounters[mcError.SocketID][microcodeROMParity]++
-		r.cpuSocketCounters[mcError.SocketID][processorBase]++
+	if strings.Contains(mcError.errorMsg, "Microcode ROM parity error") {
+		r.cpuSocketCounters[mcError.socketID][microcodeROMParity]++
+		r.cpuSocketCounters[mcError.socketID][processorBase]++
 	}
 
-	if strings.Contains(mcError.ErrorMsg, "Unclassified") || strings.Contains(mcError.ErrorMsg, "Internal unclassified") {
-		r.cpuSocketCounters[mcError.SocketID][unclassifiedMCEBase]++
-		r.cpuSocketCounters[mcError.SocketID][processorBase]++
+	if strings.Contains(mcError.errorMsg, "Unclassified") || strings.Contains(mcError.errorMsg, "Internal unclassified") {
+		r.cpuSocketCounters[mcError.socketID][unclassifiedMCEBase]++
+		r.cpuSocketCounters[mcError.socketID][processorBase]++
 	}
 }
 
 func (r *Ras) updateMemoryCounters(mcError *machineCheckError) {
-	if strings.Contains(mcError.ErrorMsg, "Memory read error") {
-		if strings.Contains(mcError.MciStatusMsg, "Corrected_error") {
-			r.cpuSocketCounters[mcError.SocketID][memoryReadCorrected]++
+	if strings.Contains(mcError.errorMsg, "Memory read error") {
+		if strings.Contains(mcError.mciStatusMsg, "Corrected_error") {
+			r.cpuSocketCounters[mcError.socketID][memoryReadCorrected]++
 		} else {
-			r.cpuSocketCounters[mcError.SocketID][memoryReadUncorrected]++
+			r.cpuSocketCounters[mcError.socketID][memoryReadUncorrected]++
 		}
 	}
-	if strings.Contains(mcError.ErrorMsg, "Memory write error") {
-		if strings.Contains(mcError.MciStatusMsg, "Corrected_error") {
-			r.cpuSocketCounters[mcError.SocketID][memoryWriteCorrected]++
+	if strings.Contains(mcError.errorMsg, "Memory write error") {
+		if strings.Contains(mcError.mciStatusMsg, "Corrected_error") {
+			r.cpuSocketCounters[mcError.socketID][memoryWriteCorrected]++
 		} else {
-			r.cpuSocketCounters[mcError.SocketID][memoryWriteUncorrected]++
+			r.cpuSocketCounters[mcError.socketID][memoryWriteUncorrected]++
 		}
 	}
 }
@@ -306,12 +298,12 @@ func addServerMetrics(acc telegraf.Accumulator, counters map[string]int64) {
 		fields[errorName] = count
 	}
 
-	acc.AddCounter("ras", fields, map[string]string{})
+	acc.AddCounter("ras", fields, make(map[string]string))
 }
 
 func fetchMachineCheckError(rows *sql.Rows) (*machineCheckError, error) {
 	mcError := &machineCheckError{}
-	err := rows.Scan(&mcError.ID, &mcError.Timestamp, &mcError.ErrorMsg, &mcError.MciStatusMsg, &mcError.SocketID)
+	err := rows.Scan(&mcError.id, &mcError.timestamp, &mcError.errorMsg, &mcError.mciStatusMsg, &mcError.socketID)
 
 	if err != nil {
 		return nil, err
@@ -326,6 +318,7 @@ func parseDate(date string) (time.Time, error) {
 
 func init() {
 	inputs.Add("ras", func() telegraf.Input {
+		//nolint:errcheck // known timestamp
 		defaultTimestamp, _ := parseDate("1970-01-01 00:00:01 -0700")
 		return &Ras{
 			DBPath:          defaultDbPath,

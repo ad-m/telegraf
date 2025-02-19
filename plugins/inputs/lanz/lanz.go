@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package lanz
 
 import (
+	_ "embed"
 	"net/url"
 	"strconv"
 	"sync"
@@ -13,18 +15,8 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-var sampleConfig = `
-  ## URL to Arista LANZ endpoint
-  servers = [
-    "tcp://127.0.0.1:50001"
-  ]
-`
-
-func init() {
-	inputs.Add("lanz", func() telegraf.Input {
-		return NewLanz()
-	})
-}
+//go:embed sample.conf
+var sampleConfig string
 
 type Lanz struct {
 	Servers []string `toml:"servers"`
@@ -32,20 +24,8 @@ type Lanz struct {
 	wg      sync.WaitGroup
 }
 
-func NewLanz() *Lanz {
-	return &Lanz{}
-}
-
-func (l *Lanz) SampleConfig() string {
+func (*Lanz) SampleConfig() string {
 	return sampleConfig
-}
-
-func (l *Lanz) Description() string {
-	return "Read metrics off Arista LANZ, via socket"
-}
-
-func (l *Lanz) Gather(_ telegraf.Accumulator) error {
-	return nil
 }
 
 func (l *Lanz) Start(acc telegraf.Accumulator) error {
@@ -75,6 +55,10 @@ func (l *Lanz) Start(acc telegraf.Accumulator) error {
 			receive(acc, in, deviceURL)
 		}()
 	}
+	return nil
+}
+
+func (*Lanz) Gather(telegraf.Accumulator) error {
 	return nil
 }
 
@@ -135,4 +119,10 @@ func msgToAccumulator(acc telegraf.Accumulator, msg *pb.LanzRecord, deviceURL *u
 		}
 		acc.AddFields("lanz_global_buffer_usage_record", vals, tags)
 	}
+}
+
+func init() {
+	inputs.Add("lanz", func() telegraf.Input {
+		return &Lanz{}
+	})
 }

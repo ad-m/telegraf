@@ -5,13 +5,13 @@ import (
 
 	"github.com/stretchr/testify/mock"
 
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/disk"
-	"github.com/shirou/gopsutil/host"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/sensors"
 
-	"github.com/shirou/gopsutil/load"
-	"github.com/shirou/gopsutil/mem"
-	"github.com/shirou/gopsutil/net"
+	"github.com/shirou/gopsutil/v4/load"
+	"github.com/shirou/gopsutil/v4/mem"
+	"github.com/shirou/gopsutil/v4/net"
 )
 
 type MockPS struct {
@@ -46,8 +46,8 @@ func (m *MockPS) CPUTimes(_, _ bool) ([]cpu.TimesStat, error) {
 	return r0, r1
 }
 
-func (m *MockPS) DiskUsage(mountPointFilter []string, fstypeExclude []string) ([]*disk.UsageStat, []*disk.PartitionStat, error) {
-	ret := m.Called(mountPointFilter, fstypeExclude)
+func (m *MockPS) DiskUsage(mountPointFilter, mountOptsExclude, fstypeExclude []string) ([]*disk.UsageStat, []*disk.PartitionStat, error) {
+	ret := m.Called(mountPointFilter, mountOptsExclude, fstypeExclude)
 
 	r0 := ret.Get(0).([]*disk.UsageStat)
 	r1 := ret.Get(1).([]*disk.PartitionStat)
@@ -101,10 +101,10 @@ func (m *MockPS) SwapStat() (*mem.SwapMemoryStat, error) {
 	return r0, r1
 }
 
-func (m *MockPS) Temperature() ([]host.TemperatureStat, error) {
+func (m *MockPS) Temperature() ([]sensors.TemperatureStat, error) {
 	ret := m.Called()
 
-	r0 := ret.Get(0).([]host.TemperatureStat)
+	r0 := ret.Get(0).([]sensors.TemperatureStat)
 	r1 := ret.Error(1)
 
 	return r0, r1
@@ -114,6 +114,15 @@ func (m *MockPS) NetConnections() ([]net.ConnectionStat, error) {
 	ret := m.Called()
 
 	r0 := ret.Get(0).([]net.ConnectionStat)
+	r1 := ret.Error(1)
+
+	return r0, r1
+}
+
+func (m *MockPS) NetConntrack(perCPU bool) ([]net.ConntrackStat, error) {
+	ret := m.Called(perCPU)
+
+	r0 := ret.Get(0).([]net.ConntrackStat)
 	r1 := ret.Error(1)
 
 	return r0, r1

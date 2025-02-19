@@ -13,8 +13,7 @@ also update their expiration time based on the most recently received data.
 If incoming metrics stop updating specific buckets or quantiles but continue
 reporting others every bucket/quantile will continue to exist.
 
-
-### Configuration
+## Configuration
 
 ```toml
 [[outputs.file]]
@@ -32,11 +31,21 @@ reporting others every bucket/quantile will continue to exist.
   ## discarded.
   prometheus_string_as_label = false
 
+  ## Encode metrics without HELP metadata. This helps reduce the payload
+  ## size.
+  prometheus_compact_encoding = false
+
   ## Data format to output.
   ## Each data format has its own unique set of configuration options, read
   ## more about them here:
   ##   https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_INPUT.md
   data_format = "prometheus"
+
+  ## Specify the metric type explicitly.
+  ## This overrides the metric-type of the Telegraf metric. Globbing is allowed.
+  [outputs.file.prometheus_metric_types]
+    counter = []
+    gauge = []
 ```
 
 ### Metrics
@@ -52,18 +61,20 @@ Prometheus labels are produced for each tag.
 
 **Note:** String fields are ignored and do not produce Prometheus metrics.
 
-### Example
+## Example
 
-**Example Input**
-```
+### Example Input
+
+```text
 cpu,cpu=cpu0 time_guest=8022.6,time_system=26145.98,time_user=92512.89 1574317740000000000
 cpu,cpu=cpu1 time_guest=8097.88,time_system=25223.35,time_user=96519.58 1574317740000000000
 cpu,cpu=cpu2 time_guest=7386.28,time_system=24870.37,time_user=95631.59 1574317740000000000
 cpu,cpu=cpu3 time_guest=7434.19,time_system=24843.71,time_user=93753.88 1574317740000000000
 ```
 
-**Example Output**
-```
+### Example Output
+
+```text
 # HELP cpu_time_guest Telegraf collected metric
 # TYPE cpu_time_guest counter
 cpu_time_guest{cpu="cpu0"} 9582.54

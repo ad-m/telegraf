@@ -1,12 +1,15 @@
-package taglimit
+package tag_limit
 
 import (
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
-	"github.com/stretchr/testify/assert"
+	"github.com/influxdata/telegraf/testutil"
 )
 
 func MustMetric(name string, tags map[string]string, fields map[string]interface{}, metricTime time.Time) telegraf.Metric {
@@ -46,8 +49,8 @@ func TestUnderLimit(t *testing.T) {
 	m1 := MustMetric("foo", oneTags, nil, currentTime)
 	m2 := MustMetric("bar", tenTags, nil, currentTime)
 	limitApply := tagLimitConfig.Apply(m1, m2)
-	assert.Equal(t, oneTags, limitApply[0].Tags(), "one tag")
-	assert.Equal(t, tenTags, limitApply[1].Tags(), "ten tags")
+	require.Equal(t, oneTags, limitApply[0].Tags(), "one tag")
+	require.Equal(t, tenTags, limitApply[1].Tags(), "ten tags")
 }
 
 func TestTrim(t *testing.T) {
@@ -78,9 +81,73 @@ func TestTrim(t *testing.T) {
 	m1 := MustMetric("foo", threeTags, nil, currentTime)
 	m2 := MustMetric("bar", tenTags, nil, currentTime)
 	limitApply := tagLimitConfig.Apply(m1, m2)
-	assert.Equal(t, threeTags, limitApply[0].Tags(), "three tags")
+	require.Equal(t, threeTags, limitApply[0].Tags(), "three tags")
 	trimmedTags := limitApply[1].Tags()
-	assert.Equal(t, 3, len(trimmedTags), "ten tags")
-	assert.Equal(t, "foo", trimmedTags["a"], "preserved: a")
-	assert.Equal(t, "bar", trimmedTags["b"], "preserved: b")
+	require.Len(t, trimmedTags, 3, "ten tags")
+	require.Equal(t, "foo", trimmedTags["a"], "preserved: a")
+	require.Equal(t, "bar", trimmedTags["b"], "preserved: b")
+}
+
+func TestTracking(t *testing.T) {
+	inputRaw := []telegraf.Metric{
+		metric.New("foo", map[string]string{"tag": "testing"}, map[string]interface{}{"value": 42}, time.Unix(0, 0)),
+		metric.New("bar", map[string]string{"tag": "other", "host": "localhost"}, map[string]interface{}{"value": 23}, time.Unix(0, 0)),
+		metric.New("baz", map[string]string{"tag": "value", "host": "localhost", "module": "main"}, map[string]interface{}{"value": 99}, time.Unix(0, 0)),
+	}
+
+	var mu sync.Mutex
+	delivered := make([]telegraf.DeliveryInfo, 0, len(inputRaw))
+	notify := func(di telegraf.DeliveryInfo) {
+		mu.Lock()
+		defer mu.Unlock()
+		delivered = append(delivered, di)
+	}
+
+	input := make([]telegraf.Metric, 0, len(inputRaw))
+	for _, m := range inputRaw {
+		tm, _ := metric.WithTracking(m, notify)
+		input = append(input, tm)
+	}
+
+	expected := []telegraf.Metric{
+		metric.New(
+			"foo",
+			map[string]string{"tag": "testing"},
+			map[string]interface{}{"value": 42},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"bar",
+			map[string]string{"tag": "other", "host": "localhost"},
+			map[string]interface{}{"value": 23},
+			time.Unix(0, 0),
+		),
+		metric.New(
+			"baz",
+			map[string]string{"tag": "value", "host": "localhost"},
+			map[string]interface{}{"value": 99},
+			time.Unix(0, 0),
+		),
+	}
+
+	plugin := &TagLimit{
+		Limit: 2,
+		Keep:  []string{"tag", "host"},
+	}
+
+	// Process expected metrics and compare with resulting metrics
+	actual := plugin.Apply(input...)
+	testutil.RequireMetricsEqual(t, expected, actual)
+
+	// Simulate output acknowledging delivery
+	for _, m := range actual {
+		m.Accept()
+	}
+
+	// Check delivery
+	require.Eventuallyf(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(input) == len(delivered)
+	}, time.Second, 100*time.Millisecond, "%d delivered but %d expected", len(delivered), len(expected))
 }

@@ -12,9 +12,19 @@ Minimum Version of Monit tested with is 5.16.
 [monit]: https://mmonit.com/
 [httpd]: https://mmonit.com/monit/documentation/monit.html#TCP-PORT
 
-### Configuration
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
 
-```toml
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Configuration
+
+```toml @sample.conf
+# Read metrics and status information about processes managed by Monit
 [[inputs.monit]]
   ## Monit HTTPD address
   address = "http://127.0.0.1:2812"
@@ -34,7 +44,7 @@ Minimum Version of Monit tested with is 5.16.
   # insecure_skip_verify = false
 ```
 
-### Metrics
+## Metrics
 
 - monit_filesystem
   - tags:
@@ -57,7 +67,7 @@ Minimum Version of Monit tested with is 5.16.
     - inode_usage
     - inode_total
 
-+ monit_directory
+- monit_directory
   - tags:
     - address
     - version
@@ -88,7 +98,7 @@ Minimum Version of Monit tested with is 5.16.
     - size
     - permissions
 
-+ monit_process
+- monit_process
   - tags:
     - address
     - version
@@ -132,7 +142,7 @@ Minimum Version of Monit tested with is 5.16.
     - protocol
     - type
 
-+ monit_system
+- monit_system
   - tags:
     - address
     - version
@@ -169,9 +179,9 @@ Minimum Version of Monit tested with is 5.16.
     - status_code
     - monitoring_status_code
     - monitoring_mode_code
-	- permissions
+    - permissions
 
-+ monit_program
+- monit_program
   - tags:
     - address
     - version
@@ -199,7 +209,7 @@ Minimum Version of Monit tested with is 5.16.
     - monitoring_status_code
     - monitoring_mode_code
 
-+ monit_program
+- monit_program
   - tags:
     - address
     - version
@@ -227,8 +237,9 @@ Minimum Version of Monit tested with is 5.16.
     - monitoring_status_code
     - monitoring_mode_code
 
-### Example Output
-```
+## Example Output
+
+```text
 monit_file,monitoring_mode=active,monitoring_status=monitored,pending_action=none,platform_name=Linux,service=rsyslog_pid,source=xyzzy.local,status=running,version=5.20.0 mode=644i,monitoring_mode_code=0i,monitoring_status_code=1i,pending_action_code=0i,size=3i,status_code=0i 1579735047000000000
 monit_process,monitoring_mode=active,monitoring_status=monitored,pending_action=none,platform_name=Linux,service=rsyslog,source=xyzzy.local,status=running,version=5.20.0 children=0i,cpu_percent=0,cpu_percent_total=0,mem_kb=3148i,mem_kb_total=3148i,mem_percent=0.2,mem_percent_total=0.2,monitoring_mode_code=0i,monitoring_status_code=1i,parent_pid=1i,pending_action_code=0i,pid=318i,status_code=0i,threads=4i 1579735047000000000
 monit_program,monitoring_mode=active,monitoring_status=initializing,pending_action=none,platform_name=Linux,service=echo,source=xyzzy.local,status=running,version=5.20.0 monitoring_mode_code=0i,monitoring_status_code=2i,pending_action_code=0i,program_started=0i,program_status=0i,status_code=0i 1579735047000000000

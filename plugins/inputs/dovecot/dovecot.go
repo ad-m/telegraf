@@ -1,7 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package dovecot
 
 import (
 	"bytes"
+	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,41 +17,26 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
+var (
+	defaultTimeout = time.Second * time.Duration(5)
+	validQuery     = map[string]bool{
+		"user": true, "domain": true, "global": true, "ip": true,
+	}
+)
+
 type Dovecot struct {
-	Type    string
-	Filters []string
-	Servers []string
+	Type    string   `toml:"type"`
+	Filters []string `toml:"filters"`
+	Servers []string `toml:"servers"`
 }
 
-func (d *Dovecot) Description() string {
-	return "Read statistics from one or many dovecot servers"
+func (*Dovecot) SampleConfig() string {
+	return sampleConfig
 }
 
-var sampleConfig = `
-  ## specify dovecot servers via an address:port list
-  ##  e.g.
-  ##    localhost:24242
-  ##
-  ## If no servers are specified, then localhost is used as the host.
-  servers = ["localhost:24242"]
-
-  ## Type is one of "user", "domain", "ip", or "global"
-  type = "global"
-
-  ## Wildcard matches like "*.com". An empty string "" is same as "*"
-  ## If type = "ip" filters should be <IP/network>
-  filters = [""]
-`
-
-var defaultTimeout = time.Second * time.Duration(5)
-
-var validQuery = map[string]bool{
-	"user": true, "domain": true, "global": true, "ip": true,
-}
-
-func (d *Dovecot) SampleConfig() string { return sampleConfig }
-
-// Reads stats from all configured servers.
 func (d *Dovecot) Gather(acc telegraf.Accumulator) error {
 	if !validQuery[d.Type] {
 		return fmt.Errorf("error: %s is not a valid query type", d.Type)
@@ -58,7 +46,7 @@ func (d *Dovecot) Gather(acc telegraf.Accumulator) error {
 		d.Servers = append(d.Servers, "127.0.0.1:24242")
 	}
 
-	if len(d.Filters) <= 0 {
+	if len(d.Filters) == 0 {
 		d.Filters = append(d.Filters, "")
 	}
 
@@ -68,7 +56,7 @@ func (d *Dovecot) Gather(acc telegraf.Accumulator) error {
 			wg.Add(1)
 			go func(s string, f string) {
 				defer wg.Done()
-				acc.AddError(d.gatherServer(s, acc, d.Type, f))
+				acc.AddError(gatherServer(s, acc, d.Type, f))
 			}(server, filter)
 		}
 	}
@@ -77,7 +65,7 @@ func (d *Dovecot) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func (d *Dovecot) gatherServer(addr string, acc telegraf.Accumulator, qtype string, filter string) error {
+func gatherServer(addr string, acc telegraf.Accumulator, qtype, filter string) error {
 	var proto string
 
 	if strings.HasPrefix(addr, "/") {
@@ -87,37 +75,38 @@ func (d *Dovecot) gatherServer(addr string, acc telegraf.Accumulator, qtype stri
 
 		_, _, err := net.SplitHostPort(addr)
 		if err != nil {
-			return fmt.Errorf("%q on url %s", err.Error(), addr)
+			return fmt.Errorf("%w on url %q", err, addr)
 		}
 	}
 
 	c, err := net.DialTimeout(proto, addr, defaultTimeout)
 	if err != nil {
-		return fmt.Errorf("unable to connect to dovecot server '%s': %s", addr, err)
+		return fmt.Errorf("unable to connect to dovecot server %q: %w", addr, err)
 	}
 	defer c.Close()
 
 	// Extend connection
 	if err := c.SetDeadline(time.Now().Add(defaultTimeout)); err != nil {
-		return fmt.Errorf("setting deadline failed for dovecot server '%s': %s", addr, err)
+		return fmt.Errorf("setting deadline failed for dovecot server %q: %w", addr, err)
 	}
 
-	msg := fmt.Sprintf("EXPORT\t%s", qtype)
+	msg := "EXPORT\t" + qtype
 	if len(filter) > 0 {
 		msg += fmt.Sprintf("\t%s=%s", qtype, filter)
 	}
 	msg += "\n"
 
 	if _, err := c.Write([]byte(msg)); err != nil {
-		return fmt.Errorf("writing message %q failed for dovecot server '%s': %s", msg, addr, err)
+		return fmt.Errorf("writing message %q failed for dovecot server %q: %w", msg, addr, err)
 	}
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, c); err != nil {
 		// We need to accept the timeout here as reading from the connection will only terminate on EOF
 		// or on a timeout to happen. As EOF for TCP connections will only be sent on connection closing,
 		// the only way to get the whole message is to wait for the timeout to happen.
-		if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
-			return fmt.Errorf("copying message failed for dovecot server '%s': %s", addr, err)
+		var nerr net.Error
+		if !errors.As(err, &nerr) || !nerr.Timeout() {
+			return fmt.Errorf("copying message failed for dovecot server %q: %w", addr, err)
 		}
 	}
 
@@ -125,13 +114,17 @@ func (d *Dovecot) gatherServer(addr string, acc telegraf.Accumulator, qtype stri
 	if strings.HasPrefix(addr, "/") {
 		host = addr
 	} else {
-		host, _, _ = net.SplitHostPort(addr)
+		host, _, err = net.SplitHostPort(addr)
+		if err != nil {
+			return fmt.Errorf("reading address failed for dovecot server %q: %w", addr, err)
+		}
 	}
 
-	return gatherStats(&buf, acc, host, qtype)
+	gatherStats(&buf, acc, host, qtype)
+	return nil
 }
 
-func gatherStats(buf *bytes.Buffer, acc telegraf.Accumulator, host string, qtype string) error {
+func gatherStats(buf *bytes.Buffer, acc telegraf.Accumulator, host, qtype string) {
 	lines := strings.Split(buf.String(), "\n")
 	head := strings.Split(lines[0], "\t")
 	vals := lines[1:]
@@ -165,11 +158,9 @@ func gatherStats(buf *bytes.Buffer, acc telegraf.Accumulator, host string, qtype
 
 		acc.AddFields("dovecot", fields, tags)
 	}
-
-	return nil
 }
 
-func splitSec(tm string) (sec int64, msec int64) {
+func splitSec(tm string) (sec, msec int64) {
 	var err error
 	ss := strings.Split(tm, ".")
 

@@ -29,6 +29,7 @@ type Conn interface {
 type UDPConfig struct {
 	MaxPayloadSize int
 	URL            *url.URL
+	LocalAddr      *net.UDPAddr
 	Serializer     *influx.Serializer
 	Dialer         Dialer
 	Log            telegraf.Logger
@@ -46,14 +47,16 @@ func NewUDPClient(config UDPConfig) (*udpClient, error) {
 
 	serializer := config.Serializer
 	if serializer == nil {
-		s := influx.NewSerializer()
-		serializer = s
+		serializer = &influx.Serializer{}
+		if err := serializer.Init(); err != nil {
+			return nil, err
+		}
 	}
-	serializer.SetMaxLineBytes(size)
+	serializer.MaxLineBytes = size
 
 	dialer := config.Dialer
 	if dialer == nil {
-		dialer = &netDialer{net.Dialer{}}
+		dialer = &netDialer{net.Dialer{LocalAddr: config.LocalAddr}}
 	}
 
 	client := &udpClient{
@@ -77,7 +80,7 @@ func (c *udpClient) URL() string {
 	return c.url.String()
 }
 
-func (c *udpClient) Database() string {
+func (*udpClient) Database() string {
 	return ""
 }
 
@@ -85,7 +88,7 @@ func (c *udpClient) Write(ctx context.Context, metrics []telegraf.Metric) error 
 	if c.conn == nil {
 		conn, err := c.dialer.DialContext(ctx, c.url.Scheme, c.url.Host)
 		if err != nil {
-			return fmt.Errorf("error dialing address [%s]: %s", c.url, err)
+			return fmt.Errorf("error dialing address [%s]: %w", c.url, err)
 		}
 		c.conn = conn
 	}
@@ -106,7 +109,7 @@ func (c *udpClient) Write(ctx context.Context, metrics []telegraf.Metric) error 
 			_, err = c.conn.Write(scanner.Bytes())
 		}
 		if err != nil {
-			c.conn.Close()
+			_ = c.conn.Close()
 			c.conn = nil
 			return err
 		}
@@ -115,7 +118,7 @@ func (c *udpClient) Write(ctx context.Context, metrics []telegraf.Metric) error 
 	return nil
 }
 
-func (c *udpClient) CreateDatabase(_ context.Context, _ string) error {
+func (*udpClient) CreateDatabase(_ context.Context, _ string) error {
 	return nil
 }
 
@@ -138,5 +141,5 @@ func scanLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	return 0, nil, nil
 }
 
-func (c *udpClient) Close() {
+func (*udpClient) Close() {
 }

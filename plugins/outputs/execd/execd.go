@@ -1,7 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package execd
 
 import (
 	"bufio"
+	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -11,52 +14,39 @@ import (
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal/process"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	"github.com/influxdata/telegraf/plugins/serializers"
 )
 
-const sampleConfig = `
-  ## Program to run as daemon
-  command = ["my-telegraf-output", "--some-flag", "value"]
-
-  ## Delay before the process is restarted after an unexpected termination
-  restart_delay = "10s"
-
-  ## Data format to export.
-  ## Each data format has its own unique set of configuration options, read
-  ## more about them here:
-  ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_OUTPUT.md
-  data_format = "influx"
-`
+//go:embed sample.conf
+var sampleConfig string
 
 type Execd struct {
-	Command      []string        `toml:"command"`
-	RestartDelay config.Duration `toml:"restart_delay"`
-	Log          telegraf.Logger
+	Command                  []string        `toml:"command"`
+	Environment              []string        `toml:"environment"`
+	RestartDelay             config.Duration `toml:"restart_delay"`
+	IgnoreSerializationError bool            `toml:"ignore_serialization_error"`
+	UseBatchFormat           bool            `toml:"use_batch_format"`
+	Log                      telegraf.Logger
 
 	process    *process.Process
-	serializer serializers.Serializer
+	serializer telegraf.Serializer
 }
 
-func (e *Execd) SampleConfig() string {
+func (*Execd) SampleConfig() string {
 	return sampleConfig
 }
 
-func (e *Execd) Description() string {
-	return "Run executable as long-running output plugin"
-}
-
-func (e *Execd) SetSerializer(s serializers.Serializer) {
+func (e *Execd) SetSerializer(s telegraf.Serializer) {
 	e.serializer = s
 }
 
 func (e *Execd) Init() error {
 	if len(e.Command) == 0 {
-		return fmt.Errorf("no command specified")
+		return errors.New("no command specified")
 	}
 
 	var err error
 
-	e.process, err = process.New(e.Command)
+	e.process, err = process.New(e.Command, e.Environment)
 	if err != nil {
 		return fmt.Errorf("error creating process %s: %w", e.Command, err)
 	}
@@ -89,14 +79,29 @@ func (e *Execd) Close() error {
 }
 
 func (e *Execd) Write(metrics []telegraf.Metric) error {
-	for _, m := range metrics {
-		b, err := e.serializer.Serialize(m)
+	if e.UseBatchFormat {
+		b, err := e.serializer.SerializeBatch(metrics)
 		if err != nil {
-			return fmt.Errorf("error serializing metrics: %s", err)
+			return fmt.Errorf("error serializing metrics: %w", err)
 		}
 
 		if _, err = e.process.Stdin.Write(b); err != nil {
-			return fmt.Errorf("error writing metrics %s", err)
+			return fmt.Errorf("error writing metrics: %w", err)
+		}
+		return nil
+	}
+	for _, m := range metrics {
+		b, err := e.serializer.Serialize(m)
+		if err != nil {
+			if !e.IgnoreSerializationError {
+				return fmt.Errorf("error serializing metrics: %w", err)
+			}
+			e.Log.Errorf("Skipping metric due to a serialization error: %v", err)
+			continue
+		}
+
+		if _, err = e.process.Stdin.Write(b); err != nil {
+			return fmt.Errorf("error writing metrics: %w", err)
 		}
 	}
 	return nil

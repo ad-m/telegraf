@@ -4,9 +4,28 @@ The `ifname` plugin looks up network interface names using SNMP.
 
 Telegraf minimum version: Telegraf 1.15.0
 
-### Configuration:
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
 
-```toml
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Secret-store support
+
+This plugin supports secrets from secret-stores for the `auth_password` and
+`priv_password` option.
+See the [secret-store documentation][SECRETSTORE] for more details on how
+to use them.
+
+[SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
+
+## Configuration
+
+```toml @sample.conf
+# Add a tag of the network interface name looked up over SNMP by interface number
 [[processors.ifname]]
   ## Name of tag holding the interface number
   # tag = "ifIndex"
@@ -15,6 +34,7 @@ Telegraf minimum version: Telegraf 1.15.0
   # dest = "ifName"
 
   ## Name of tag of the SNMP agent to request the interface name from
+  ##   example: agent = "source"
   # agent = "agent"
 
   ## Timeout for each request.
@@ -66,7 +86,7 @@ Telegraf minimum version: Telegraf 1.15.0
   # cache_ttl = "8h"
 ```
 
-### Example processing:
+## Example
 
 Example config:
 

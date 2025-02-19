@@ -23,7 +23,7 @@ import (
 func NewSeriesGrouper() *SeriesGrouper {
 	return &SeriesGrouper{
 		metrics:  make(map[uint64]telegraf.Metric),
-		ordered:  []telegraf.Metric{},
+		ordered:  make([]telegraf.Metric, 0),
 		hashSeed: maphash.MakeSeed(),
 	}
 }
@@ -42,7 +42,7 @@ func (g *SeriesGrouper) Add(
 	tm time.Time,
 	field string,
 	fieldValue interface{},
-) error {
+) {
 	taglist := make([]*telegraf.Tag, 0, len(tags))
 	for k, v := range tags {
 		taglist = append(taglist,
@@ -59,7 +59,6 @@ func (g *SeriesGrouper) Add(
 	} else {
 		m.AddField(field, fieldValue)
 	}
-	return nil
 }
 
 // AddMetric adds a metric to the series, merging with any previous matching metrics.

@@ -10,7 +10,7 @@ import (
 // Other than resetting r.err and r.transformComplete in Read() this
 // was copied from x/text
 
-func newDecoder(t transform.Transformer) *Decoder {
+func createDecoder(t transform.Transformer) *Decoder {
 	return &Decoder{Transformer: t}
 }
 
@@ -23,7 +23,7 @@ type Decoder struct {
 	transform.Transformer
 
 	// This forces external creators of Decoders to use names in struct
-	// initializers, allowing for future extendibility without having to break
+	// initializers, allowing for future extensibility without having to break
 	// code.
 	_ struct{}
 }
@@ -73,19 +73,11 @@ type Reader struct {
 	src0, src1 int
 
 	// transformComplete is whether the transformation is complete,
-	// regardless of whether or not it was successful.
+	// regardless of whether it was successful.
 	transformComplete bool
 }
 
 var (
-	// ErrShortDst means that the destination buffer was too short to
-	// receive all of the transformed bytes.
-	ErrShortDst = errors.New("transform: short destination buffer")
-
-	// ErrShortSrc means that the source buffer has insufficient data to
-	// complete the transformation.
-	ErrShortSrc = errors.New("transform: short source buffer")
-
 	// errInconsistentByteCount means that Transform returned success (nil
 	// error) but also returned nSrc inconsistent with the src argument.
 	errInconsistentByteCount = errors.New("transform: inconsistent byte count returned")
@@ -133,7 +125,7 @@ func (r *Reader) Read(p []byte) (int, error) {
 		if r.src0 != r.src1 || r.err != nil {
 			var err error
 			r.dst0 = 0
-			r.dst1, n, err = r.t.Transform(r.dst, r.src[r.src0:r.src1], r.err == io.EOF)
+			r.dst1, n, err = r.t.Transform(r.dst, r.src[r.src0:r.src1], errors.Is(r.err, io.EOF))
 			r.src0 += n
 
 			switch {
@@ -145,16 +137,16 @@ func (r *Reader) Read(p []byte) (int, error) {
 				// cannot read more bytes into src.
 				r.transformComplete = r.err != nil
 				continue
-			case err == ErrShortDst && (r.dst1 != 0 || n != 0):
+			case errors.Is(err, transform.ErrShortDst) && (r.dst1 != 0 || n != 0):
 				// Make room in dst by copying out, and try again.
 				continue
-			case err == ErrShortSrc && r.src1-r.src0 != len(r.src) && r.err == nil:
+			case errors.Is(err, transform.ErrShortSrc) && r.src1-r.src0 != len(r.src) && r.err == nil:
 				// Read more bytes into src via the code below, and try again.
 			default:
 				r.transformComplete = true
 				// The reader error (r.err) takes precedence over the
 				// transformer error (err) unless r.err is nil or io.EOF.
-				if r.err == nil || r.err == io.EOF {
+				if r.err == nil || errors.Is(r.err, io.EOF) {
 					r.err = err
 				}
 				continue

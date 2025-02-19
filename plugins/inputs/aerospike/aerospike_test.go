@@ -1,21 +1,41 @@
 package aerospike
 
 import (
+	"fmt"
+	"strconv"
 	"testing"
 
-	as "github.com/aerospike/aerospike-client-go"
+	as "github.com/aerospike/aerospike-client-go/v5"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/influxdata/telegraf/testutil"
 )
+
+const servicePort = "3000"
+
+func launchTestServer(t *testing.T) *testutil.Container {
+	container := testutil.Container{
+		Image:        "aerospike:ce-6.0.0.1",
+		ExposedPorts: []string{servicePort},
+		WaitingFor:   wait.ForLog("migrations: complete"),
+	}
+	err := container.Start()
+	require.NoError(t, err, "failed to start container")
+
+	return &container
+}
 
 func TestAerospikeStatisticsIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping aerospike integration tests.")
 	}
 
+	container := launchTestServer(t)
+	defer container.Terminate()
+
 	a := &Aerospike{
-		Servers: []string{testutil.GetLocalHost() + ":3000"},
+		Servers: []string{fmt.Sprintf("%s:%s", container.Address, container.Ports[servicePort])},
 	}
 
 	var acc testutil.Accumulator
@@ -38,9 +58,12 @@ func TestAerospikeStatisticsPartialErrIntegration(t *testing.T) {
 		t.Skip("Skipping aerospike integration tests.")
 	}
 
+	container := launchTestServer(t)
+	defer container.Terminate()
+
 	a := &Aerospike{
 		Servers: []string{
-			testutil.GetLocalHost() + ":3000",
+			fmt.Sprintf("%s:%s", container.Address, container.Ports[servicePort]),
 			testutil.GetLocalHost() + ":9999",
 		},
 	}
@@ -62,9 +85,12 @@ func TestSelectNamespacesIntegration(t *testing.T) {
 		t.Skip("Skipping aerospike integration tests.")
 	}
 
+	container := launchTestServer(t)
+	defer container.Terminate()
+
 	// Select nonexistent namespace
 	a := &Aerospike{
-		Servers:    []string{testutil.GetLocalHost() + ":3000"},
+		Servers:    []string{fmt.Sprintf("%s:%s", container.Address, container.Ports[servicePort])},
 		Namespaces: []string{"notTest"},
 	}
 
@@ -96,9 +122,12 @@ func TestDisableQueryNamespacesIntegration(t *testing.T) {
 		t.Skip("Skipping aerospike integration tests.")
 	}
 
+	container := launchTestServer(t)
+	defer container.Terminate()
+
 	a := &Aerospike{
 		Servers: []string{
-			testutil.GetLocalHost() + ":3000",
+			fmt.Sprintf("%s:%s", container.Address, container.Ports[servicePort]),
 		},
 		DisableQueryNamespaces: true,
 	}
@@ -123,33 +152,39 @@ func TestQuerySetsIntegration(t *testing.T) {
 		t.Skip("Skipping aerospike integration tests.")
 	}
 
+	container := launchTestServer(t)
+	defer container.Terminate()
+
+	portInt, err := strconv.Atoi(container.Ports[servicePort])
+	require.NoError(t, err)
+
 	// create a set
 	// test is the default namespace from aerospike
 	policy := as.NewClientPolicy()
-	client, err := as.NewClientWithPolicy(policy, testutil.GetLocalHost(), 3000)
-	require.NoError(t, err)
+	client, errAs := as.NewClientWithPolicy(policy, container.Address, portInt)
+	require.NoError(t, errAs)
 
-	key, err := as.NewKey("test", "foo", 123)
-	require.NoError(t, err)
+	key, errAs := as.NewKey("test", "foo", 123)
+	require.NoError(t, errAs)
 	bins := as.BinMap{
 		"e":  2,
 		"pi": 3,
 	}
-	err = client.Add(nil, key, bins)
-	require.NoError(t, err)
+	errAs = client.Add(nil, key, bins)
+	require.NoError(t, errAs)
 
-	key, err = as.NewKey("test", "bar", 1234)
-	require.NoError(t, err)
+	key, errAs = as.NewKey("test", "bar", 1234)
+	require.NoError(t, errAs)
 	bins = as.BinMap{
 		"e":  2,
 		"pi": 3,
 	}
-	err = client.Add(nil, key, bins)
-	require.NoError(t, err)
+	errAs = client.Add(nil, key, bins)
+	require.NoError(t, errAs)
 
 	a := &Aerospike{
 		Servers: []string{
-			testutil.GetLocalHost() + ":3000",
+			fmt.Sprintf("%s:%s", container.Address, container.Ports[servicePort]),
 		},
 		QuerySets:              true,
 		DisableQueryNamespaces: true,
@@ -172,33 +207,39 @@ func TestSelectQuerySetsIntegration(t *testing.T) {
 		t.Skip("Skipping aerospike integration tests.")
 	}
 
+	container := launchTestServer(t)
+	defer container.Terminate()
+
+	portInt, err := strconv.Atoi(container.Ports[servicePort])
+	require.NoError(t, err)
+
 	// create a set
 	// test is the default namespace from aerospike
 	policy := as.NewClientPolicy()
-	client, err := as.NewClientWithPolicy(policy, testutil.GetLocalHost(), 3000)
-	require.NoError(t, err)
+	client, errAs := as.NewClientWithPolicy(policy, container.Address, portInt)
+	require.NoError(t, errAs)
 
-	key, err := as.NewKey("test", "foo", 123)
-	require.NoError(t, err)
+	key, errAs := as.NewKey("test", "foo", 123)
+	require.NoError(t, errAs)
 	bins := as.BinMap{
 		"e":  2,
 		"pi": 3,
 	}
-	err = client.Add(nil, key, bins)
-	require.NoError(t, err)
+	errAs = client.Add(nil, key, bins)
+	require.NoError(t, errAs)
 
-	key, err = as.NewKey("test", "bar", 1234)
-	require.NoError(t, err)
+	key, errAs = as.NewKey("test", "bar", 1234)
+	require.NoError(t, errAs)
 	bins = as.BinMap{
 		"e":  2,
 		"pi": 3,
 	}
-	err = client.Add(nil, key, bins)
-	require.NoError(t, err)
+	errAs = client.Add(nil, key, bins)
+	require.NoError(t, errAs)
 
 	a := &Aerospike{
 		Servers: []string{
-			testutil.GetLocalHost() + ":3000",
+			fmt.Sprintf("%s:%s", container.Address, container.Ports[servicePort]),
 		},
 		QuerySets:              true,
 		Sets:                   []string{"test/foo"},
@@ -221,9 +262,13 @@ func TestDisableTTLHistogramIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping aerospike integration tests.")
 	}
+
+	container := launchTestServer(t)
+	defer container.Terminate()
+
 	a := &Aerospike{
 		Servers: []string{
-			testutil.GetLocalHost() + ":3000",
+			fmt.Sprintf("%s:%s", container.Address, container.Ports[servicePort]),
 		},
 		QuerySets:          true,
 		EnableTTLHistogram: false,
@@ -237,40 +282,18 @@ func TestDisableTTLHistogramIntegration(t *testing.T) {
 
 	require.False(t, acc.HasMeasurement("aerospike_histogram_ttl"))
 }
-func TestTTLHistogramIntegration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping aerospike integration tests.")
-	} else {
-		t.Skip("Skipping, only passes if the aerospike db has been running for at least 1 hour")
-	}
-	a := &Aerospike{
-		Servers: []string{
-			testutil.GetLocalHost() + ":3000",
-		},
-		QuerySets:          true,
-		EnableTTLHistogram: true,
-	}
-	/*
-		Produces histogram
-		Measurement exists
-		Has appropriate tags (node name etc)
-		Has appropriate keys (time:value)
-		may be able to leverage histogram plugin
-	*/
-	var acc testutil.Accumulator
-	err := acc.GatherError(a.Gather)
-	require.NoError(t, err)
 
-	require.True(t, acc.HasMeasurement("aerospike_histogram_ttl"))
-	require.True(t, FindTagValue(&acc, "aerospike_histogram_ttl", "namespace", "test"))
-}
 func TestDisableObjectSizeLinearHistogramIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping aerospike integration tests.")
 	}
+
+	container := launchTestServer(t)
+	defer container.Terminate()
+
 	a := &Aerospike{
 		Servers: []string{
-			testutil.GetLocalHost() + ":3000",
+			fmt.Sprintf("%s:%s", container.Address, container.Ports[servicePort]),
 		},
 		QuerySets:                       true,
 		EnableObjectSizeLinearHistogram: false,
@@ -284,41 +307,10 @@ func TestDisableObjectSizeLinearHistogramIntegration(t *testing.T) {
 
 	require.False(t, acc.HasMeasurement("aerospike_histogram_object_size_linear"))
 }
-func TestObjectSizeLinearHistogramIntegration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping aerospike integration tests.")
-	} else {
-		t.Skip("Skipping, only passes if the aerospike db has been running for at least 1 hour")
-	}
-	a := &Aerospike{
-		Servers: []string{
-			testutil.GetLocalHost() + ":3000",
-		},
-		QuerySets:                       true,
-		EnableObjectSizeLinearHistogram: true,
-	}
-	/*
-		Produces histogram
-		Measurement exists
-		Has appropriate tags (node name etc)
-		Has appropriate keys (time:value)
-
-	*/
-	var acc testutil.Accumulator
-	err := acc.GatherError(a.Gather)
-	require.NoError(t, err)
-	require.True(t, acc.HasMeasurement("aerospike_histogram_object_size_linear"))
-	require.True(t, FindTagValue(&acc, "aerospike_histogram_object_size_linear", "namespace", "test"))
-}
 
 func TestParseNodeInfo(t *testing.T) {
-	a := &Aerospike{}
-	var acc testutil.Accumulator
-
 	stats := map[string]string{
-		"early_tsvc_from_proxy_error": "0",
-		"cluster_principal":           "BB9020012AC4202",
-		"cluster_is_member":           "true",
+		"statistics": "early_tsvc_from_proxy_error=0;cluster_principal=BB9020012AC4202;cluster_is_member=true",
 	}
 
 	expectedFields := map[string]interface{}{
@@ -332,14 +324,12 @@ func TestParseNodeInfo(t *testing.T) {
 		"node_name":      "TestNodeName",
 	}
 
-	a.parseNodeInfo(&acc, stats, "127.0.0.1:3000", "TestNodeName")
+	var acc testutil.Accumulator
+	parseNodeInfo(&acc, stats, "127.0.0.1:3000", "TestNodeName")
 	acc.AssertContainsTaggedFields(t, "aerospike_node", expectedFields, expectedTags)
 }
 
 func TestParseNamespaceInfo(t *testing.T) {
-	a := &Aerospike{}
-	var acc testutil.Accumulator
-
 	stats := map[string]string{
 		"namespace/test": "ns_cluster_size=1;effective_replication_factor=1;objects=2;tombstones=0;master_objects=2",
 	}
@@ -358,15 +348,12 @@ func TestParseNamespaceInfo(t *testing.T) {
 		"namespace":      "test",
 	}
 
-	a.parseNamespaceInfo(&acc, stats, "127.0.0.1:3000", "test", "TestNodeName")
+	var acc testutil.Accumulator
+	parseNamespaceInfo(&acc, stats, "127.0.0.1:3000", "test", "TestNodeName")
 	acc.AssertContainsTaggedFields(t, "aerospike_namespace", expectedFields, expectedTags)
 }
 
 func TestParseSetInfo(t *testing.T) {
-	a := &Aerospike{}
-
-	var acc testutil.Accumulator
-
 	stats := map[string]string{
 		"sets/test/foo": "objects=1:tombstones=0:memory_data_bytes=26;",
 	}
@@ -382,7 +369,9 @@ func TestParseSetInfo(t *testing.T) {
 		"node_name":      "TestNodeName",
 		"set":            "test/foo",
 	}
-	a.parseSetInfo(&acc, stats, "127.0.0.1:3000", "test/foo", "TestNodeName")
+
+	var acc testutil.Accumulator
+	parseSetInfo(&acc, stats, "127.0.0.1:3000", "test/foo", "TestNodeName")
 	acc.AssertContainsTaggedFields(t, "aerospike_set", expectedFields, expectedTags)
 }
 
@@ -418,6 +407,7 @@ func TestParseHistogramSet(t *testing.T) {
 	a.parseHistogram(&acc, stats, nTags, "object-size-linear")
 	acc.AssertContainsTaggedFields(t, "aerospike_histogram_object_size_linear", expectedFields, expectedTags)
 }
+
 func TestParseHistogramNamespace(t *testing.T) {
 	a := &Aerospike{
 		NumberHistogramBuckets: 10,
@@ -449,13 +439,16 @@ func TestParseHistogramNamespace(t *testing.T) {
 	a.parseHistogram(&acc, stats, nTags, "object-size-linear")
 	acc.AssertContainsTaggedFields(t, "aerospike_histogram_object_size_linear", expectedFields, expectedTags)
 }
+
 func TestAerospikeParseValue(t *testing.T) {
 	// uint64 with value bigger than int64 max
 	val := parseAerospikeValue("", "18446744041841121751")
 	require.Equal(t, uint64(18446744041841121751), val)
 
 	val = parseAerospikeValue("", "true")
-	require.Equal(t, true, val)
+	v, ok := val.(bool)
+	require.Truef(t, ok, "bool type expected, got '%T' with '%v' value instead", val, val)
+	require.True(t, v)
 
 	// int values
 	val = parseAerospikeValue("", "42")
@@ -474,7 +467,7 @@ func TestAerospikeParseValue(t *testing.T) {
 	require.Equal(t, `1992929191`, val, "must be left as a string")
 }
 
-func FindTagValue(acc *testutil.Accumulator, measurement string, key string, value string) bool {
+func FindTagValue(acc *testutil.Accumulator, measurement, key, value string) bool {
 	for _, p := range acc.Metrics {
 		if p.Measurement == measurement {
 			v, ok := p.Tags[key]

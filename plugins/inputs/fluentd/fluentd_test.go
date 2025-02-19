@@ -88,8 +88,53 @@ const sampleJSON = `
       },
       "output_plugin": true,
       "buffer_queue_length": 0,
+      "retry_count": 0,
+      "buffer_total_queued_size": 0
+    },
+    {
+      "plugin_id": "object:output_td_1",
+      "plugin_category": "output",
+      "type": "tdlog",
+      "config": {
+        "@type": "tdlog",
+        "@id": "output_td",
+        "apikey": "xxxxxx",
+        "auto_create_table": ""
+      },
+      "output_plugin": true,
+      "buffer_queue_length": 0,
       "buffer_total_queued_size": 0,
-      "retry_count": 0
+      "retry_count": 0,
+      "emit_records": 0,
+      "emit_size": 0,
+      "emit_count": 0,
+      "write_count": 0,
+      "rollback_count": 0,
+      "slow_flush_count": 0,
+      "flush_time_count": 0,
+      "buffer_stage_length": 0,
+      "buffer_stage_byte_size": 0,
+      "buffer_queue_byte_size": 0,
+      "buffer_available_buffer_space_ratios": 0
+    },
+    {
+      "plugin_id": "object:output_td_2",
+      "plugin_category": "output",
+      "type": "tdlog",
+      "config": {
+        "@type": "tdlog",
+        "@id": "output_td",
+        "apikey": "xxxxxx",
+        "auto_create_table": ""
+      },
+      "output_plugin": true,
+      "buffer_queue_length": 0,
+      "buffer_total_queued_size": 0,
+      "retry_count": 0,
+      "rollback_count": 0,
+      "emit_records": 0,
+      "slow_flush_count": 0,
+      "buffer_available_buffer_space_ratios": 0
     }
   ]
 }
@@ -101,8 +146,10 @@ var (
 		// 		{"object:f48698", "dummy", "input", nil, nil, nil},
 		// 		{"object:e27138", "dummy", "input", nil, nil, nil},
 		// 		{"object:d74060", "monitor_agent", "input", nil, nil, nil},
-		{"object:11a5e2c", "stdout", "output", &zero, nil, nil},
-		{"object:11237ec", "s3", "output", &zero, &zero, &zero},
+		{"object:11a5e2c", "stdout", "output", &zero, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{"object:11237ec", "s3", "output", &zero, &zero, &zero, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{"object:output_td_1", "tdlog", "output", &zero, &zero, &zero, &zero, &zero, &zero, &zero, &zero, &zero, &zero, &zero, &zero, &zero, &zero},
+		{"object:output_td_2", "tdlog", "output", &zero, &zero, &zero, &zero, &zero, nil, nil, nil, &zero, nil, nil, nil, nil, &zero},
 	}
 	fluentdTest = &Fluentd{
 		Endpoint: "http://localhost:8081",
@@ -111,6 +158,7 @@ var (
 
 func Test_parse(t *testing.T) {
 	t.Log("Testing parser function")
+	t.Logf("JSON (%s) ", sampleJSON)
 	_, err := parse([]byte(sampleJSON))
 
 	if err != nil {
@@ -121,17 +169,21 @@ func Test_parse(t *testing.T) {
 func Test_Gather(t *testing.T) {
 	t.Logf("Start HTTP mock (%s) with sampleJSON", fluentdTest.Endpoint)
 
-	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, err := fmt.Fprintf(w, "%s", string(sampleJSON))
-		require.NoError(t, err)
+		if _, err := fmt.Fprintf(w, "%s", sampleJSON); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			t.Error(err)
+			return
+		}
 	}))
 
 	requestURL, err := url.Parse(fluentdTest.Endpoint)
 	require.NoError(t, err)
 	require.NotNil(t, requestURL)
 
-	ts.Listener, _ = net.Listen("tcp", fmt.Sprintf("%s:%s", requestURL.Hostname(), requestURL.Port()))
+	ts.Listener, err = net.Listen("tcp", fmt.Sprintf("%s:%s", requestURL.Hostname(), requestURL.Port()))
+	require.NoError(t, err)
 
 	ts.Start()
 
@@ -151,12 +203,41 @@ func Test_Gather(t *testing.T) {
 	require.Equal(t, expectedOutput[0].PluginID, acc.Metrics[0].Tags["plugin_id"])
 	require.Equal(t, expectedOutput[0].PluginType, acc.Metrics[0].Tags["plugin_type"])
 	require.Equal(t, expectedOutput[0].PluginCategory, acc.Metrics[0].Tags["plugin_category"])
-	require.Equal(t, *expectedOutput[0].RetryCount, acc.Metrics[0].Fields["retry_count"])
+	require.InDelta(t, *expectedOutput[0].RetryCount, acc.Metrics[0].Fields["retry_count"], testutil.DefaultDelta)
 
 	require.Equal(t, expectedOutput[1].PluginID, acc.Metrics[1].Tags["plugin_id"])
 	require.Equal(t, expectedOutput[1].PluginType, acc.Metrics[1].Tags["plugin_type"])
 	require.Equal(t, expectedOutput[1].PluginCategory, acc.Metrics[1].Tags["plugin_category"])
-	require.Equal(t, *expectedOutput[1].RetryCount, acc.Metrics[1].Fields["retry_count"])
-	require.Equal(t, *expectedOutput[1].BufferQueueLength, acc.Metrics[1].Fields["buffer_queue_length"])
-	require.Equal(t, *expectedOutput[1].BufferTotalQueuedSize, acc.Metrics[1].Fields["buffer_total_queued_size"])
+	require.InDelta(t, *expectedOutput[1].RetryCount, acc.Metrics[1].Fields["retry_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[1].BufferQueueLength, acc.Metrics[1].Fields["buffer_queue_length"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[1].BufferTotalQueuedSize, acc.Metrics[1].Fields["buffer_total_queued_size"], testutil.DefaultDelta)
+
+	require.Equal(t, expectedOutput[2].PluginID, acc.Metrics[2].Tags["plugin_id"])
+	require.Equal(t, expectedOutput[2].PluginType, acc.Metrics[2].Tags["plugin_type"])
+	require.Equal(t, expectedOutput[2].PluginCategory, acc.Metrics[2].Tags["plugin_category"])
+	require.InDelta(t, *expectedOutput[2].RetryCount, acc.Metrics[2].Fields["retry_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].BufferQueueLength, acc.Metrics[2].Fields["buffer_queue_length"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].BufferTotalQueuedSize, acc.Metrics[2].Fields["buffer_total_queued_size"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].EmitRecords, acc.Metrics[2].Fields["emit_records"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].EmitSize, acc.Metrics[2].Fields["emit_size"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].EmitCount, acc.Metrics[2].Fields["emit_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].RollbackCount, acc.Metrics[2].Fields["rollback_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].SlowFlushCount, acc.Metrics[2].Fields["slow_flush_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].WriteCount, acc.Metrics[2].Fields["write_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].FlushTimeCount, acc.Metrics[2].Fields["flush_time_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].BufferStageLength, acc.Metrics[2].Fields["buffer_stage_length"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].BufferStageByteSize, acc.Metrics[2].Fields["buffer_stage_byte_size"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].BufferQueueByteSize, acc.Metrics[2].Fields["buffer_queue_byte_size"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[2].AvailBufferSpaceRatios, acc.Metrics[2].Fields["buffer_available_buffer_space_ratios"], testutil.DefaultDelta)
+
+	require.Equal(t, expectedOutput[3].PluginID, acc.Metrics[3].Tags["plugin_id"])
+	require.Equal(t, expectedOutput[3].PluginType, acc.Metrics[3].Tags["plugin_type"])
+	require.Equal(t, expectedOutput[3].PluginCategory, acc.Metrics[3].Tags["plugin_category"])
+	require.InDelta(t, *expectedOutput[3].RetryCount, acc.Metrics[3].Fields["retry_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[3].BufferQueueLength, acc.Metrics[3].Fields["buffer_queue_length"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[3].BufferTotalQueuedSize, acc.Metrics[3].Fields["buffer_total_queued_size"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[3].EmitRecords, acc.Metrics[3].Fields["emit_records"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[3].RollbackCount, acc.Metrics[3].Fields["rollback_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[3].SlowFlushCount, acc.Metrics[3].Fields["slow_flush_count"], testutil.DefaultDelta)
+	require.InDelta(t, *expectedOutput[3].AvailBufferSpaceRatios, acc.Metrics[3].Fields["buffer_available_buffer_space_ratios"], testutil.DefaultDelta)
 }

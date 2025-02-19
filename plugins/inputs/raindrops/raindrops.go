@@ -1,7 +1,9 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package raindrops
 
 import (
 	"bufio"
+	_ "embed"
 	"fmt"
 	"net"
 	"net/http"
@@ -15,22 +17,16 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 type Raindrops struct {
-	Urls       []string
+	Urls       []string `toml:"urls"`
 	httpClient *http.Client
 }
 
-var sampleConfig = `
-  ## An array of raindrops middleware URI to gather stats.
-  urls = ["http://localhost:8080/_raindrops"]
-`
-
-func (r *Raindrops) SampleConfig() string {
+func (*Raindrops) SampleConfig() string {
 	return sampleConfig
-}
-
-func (r *Raindrops) Description() string {
-	return "Read raindrops stats (raindrops - real-time stats for preforking Rack servers)"
 }
 
 func (r *Raindrops) Gather(acc telegraf.Accumulator) error {
@@ -39,7 +35,7 @@ func (r *Raindrops) Gather(acc telegraf.Accumulator) error {
 	for _, u := range r.Urls {
 		addr, err := url.Parse(u)
 		if err != nil {
-			acc.AddError(fmt.Errorf("unable to parse address '%s': %s", u, err))
+			acc.AddError(fmt.Errorf("unable to parse address %q: %w", u, err))
 			continue
 		}
 
@@ -58,7 +54,7 @@ func (r *Raindrops) Gather(acc telegraf.Accumulator) error {
 func (r *Raindrops) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 	resp, err := r.httpClient.Get(addr.String())
 	if err != nil {
-		return fmt.Errorf("error making HTTP request to %s: %s", addr.String(), err)
+		return fmt.Errorf("error making HTTP request to %q: %w", addr.String(), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -93,7 +89,7 @@ func (r *Raindrops) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 	if err != nil {
 		return err
 	}
-	tags := r.getTags(addr)
+	tags := getTags(addr)
 	fields := map[string]interface{}{
 		"calling": calling,
 		"writing": writing,
@@ -116,7 +112,6 @@ func (r *Raindrops) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 		}
 		activeLineStr, activeErr = buf.ReadString('\n')
 		if activeErr != nil {
-			iterate = false
 			break
 		}
 		if strings.Compare(activeLineStr, "\n") == 0 {
@@ -158,7 +153,7 @@ func (r *Raindrops) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 }
 
 // Get tag(s) for the raindrops calling/writing plugin
-func (r *Raindrops) getTags(addr *url.URL) map[string]string {
+func getTags(addr *url.URL) map[string]string {
 	h := addr.Host
 	host, port, err := net.SplitHostPort(h)
 	if err != nil {

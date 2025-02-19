@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 // TODO: Windows - should be enabled for Windows when super asterisk is fixed on Windows
 // https://github.com/influxdata/telegraf/issues/6248
@@ -16,12 +15,10 @@ import (
 	"github.com/influxdata/telegraf/testutil"
 )
 
-var (
-	testdataDir = getTestdataDir()
-)
+var testdataDir = getTestdataDir()
 
 func TestGatherNoMd5(t *testing.T) {
-	fs := NewFileStat()
+	fs := newFileStat()
 	fs.Log = testutil.Logger{}
 	fs.Files = []string{
 		filepath.Join(testdataDir, "log1.log"),
@@ -51,7 +48,7 @@ func TestGatherNoMd5(t *testing.T) {
 }
 
 func TestGatherExplicitFiles(t *testing.T) {
-	fs := NewFileStat()
+	fs := newFileStat()
 	fs.Log = testutil.Logger{}
 	fs.Md5 = true
 	fs.Files = []string{
@@ -84,7 +81,7 @@ func TestGatherExplicitFiles(t *testing.T) {
 }
 
 func TestNonExistentFile(t *testing.T) {
-	fs := NewFileStat()
+	fs := newFileStat()
 	fs.Log = testutil.Logger{}
 	fs.Md5 = true
 	fs.Files = []string{
@@ -101,7 +98,7 @@ func TestNonExistentFile(t *testing.T) {
 }
 
 func TestGatherGlob(t *testing.T) {
-	fs := NewFileStat()
+	fs := newFileStat()
 	fs.Log = testutil.Logger{}
 	fs.Md5 = true
 	fs.Files = []string{
@@ -127,7 +124,7 @@ func TestGatherGlob(t *testing.T) {
 }
 
 func TestGatherSuperAsterisk(t *testing.T) {
-	fs := NewFileStat()
+	fs := newFileStat()
 	fs.Log = testutil.Logger{}
 	fs.Md5 = true
 	fs.Files = []string{
@@ -160,7 +157,7 @@ func TestGatherSuperAsterisk(t *testing.T) {
 }
 
 func TestModificationTime(t *testing.T) {
-	fs := NewFileStat()
+	fs := newFileStat()
 	fs.Log = testutil.Logger{}
 	fs.Files = []string{
 		filepath.Join(testdataDir, "log1.log"),
@@ -178,7 +175,7 @@ func TestModificationTime(t *testing.T) {
 }
 
 func TestNoModificationTime(t *testing.T) {
-	fs := NewFileStat()
+	fs := newFileStat()
 	fs.Log = testutil.Logger{}
 	fs.Files = []string{
 		filepath.Join(testdataDir, "non_existent_file"),

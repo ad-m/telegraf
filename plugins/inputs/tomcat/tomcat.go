@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package tomcat
 
 import (
+	_ "embed"
 	"encoding/xml"
 	"fmt"
 	"net/http"
@@ -14,23 +16,37 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-type TomcatStatus struct {
-	TomcatJvm        TomcatJvm         `xml:"jvm"`
-	TomcatConnectors []TomcatConnector `xml:"connector"`
+//go:embed sample.conf
+var sampleConfig string
+
+type Tomcat struct {
+	URL      string          `toml:"url"`
+	Username string          `toml:"username"`
+	Password string          `toml:"password"`
+	Timeout  config.Duration `toml:"timeout"`
+	tls.ClientConfig
+
+	client  *http.Client
+	request *http.Request
 }
 
-type TomcatJvm struct {
-	JvmMemory      JvmMemoryStat       `xml:"memory"`
-	JvmMemoryPools []JvmMemoryPoolStat `xml:"memorypool"`
+type tomcatStatus struct {
+	TomcatJvm        tomcatJvm         `xml:"jvm"`
+	TomcatConnectors []tomcatConnector `xml:"connector"`
 }
 
-type JvmMemoryStat struct {
+type tomcatJvm struct {
+	JvmMemory      jvmMemoryStat       `xml:"memory"`
+	JvmMemoryPools []jvmMemoryPoolStat `xml:"memorypool"`
+}
+
+type jvmMemoryStat struct {
 	Free  int64 `xml:"free,attr"`
 	Total int64 `xml:"total,attr"`
 	Max   int64 `xml:"max,attr"`
 }
 
-type JvmMemoryPoolStat struct {
+type jvmMemoryPoolStat struct {
 	Name           string `xml:"name,attr"`
 	Type           string `xml:"type,attr"`
 	UsageInit      int64  `xml:"usageInit,attr"`
@@ -39,18 +55,19 @@ type JvmMemoryPoolStat struct {
 	UsageUsed      int64  `xml:"usageUsed,attr"`
 }
 
-type TomcatConnector struct {
+type tomcatConnector struct {
 	Name        string      `xml:"name,attr"`
-	ThreadInfo  ThreadInfo  `xml:"threadInfo"`
-	RequestInfo RequestInfo `xml:"requestInfo"`
+	ThreadInfo  threadInfo  `xml:"threadInfo"`
+	RequestInfo requestInfo `xml:"requestInfo"`
 }
 
-type ThreadInfo struct {
+type threadInfo struct {
 	MaxThreads         int64 `xml:"maxThreads,attr"`
 	CurrentThreadCount int64 `xml:"currentThreadCount,attr"`
 	CurrentThreadsBusy int64 `xml:"currentThreadsBusy,attr"`
 }
-type RequestInfo struct {
+
+type requestInfo struct {
 	MaxTime        int   `xml:"maxTime,attr"`
 	ProcessingTime int   `xml:"processingTime,attr"`
 	RequestCount   int   `xml:"requestCount,attr"`
@@ -59,42 +76,8 @@ type RequestInfo struct {
 	BytesSent      int64 `xml:"bytesSent,attr"`
 }
 
-type Tomcat struct {
-	URL      string
-	Username string
-	Password string
-	Timeout  config.Duration
-	tls.ClientConfig
-
-	client  *http.Client
-	request *http.Request
-}
-
-var sampleconfig = `
-  ## URL of the Tomcat server status
-  # url = "http://127.0.0.1:8080/manager/status/all?XML=true"
-
-  ## HTTP Basic Auth Credentials
-  # username = "tomcat"
-  # password = "s3cret"
-
-  ## Request timeout
-  # timeout = "5s"
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-`
-
-func (s *Tomcat) Description() string {
-	return "Gather metrics from the Tomcat server status page."
-}
-
-func (s *Tomcat) SampleConfig() string {
-	return sampleconfig
+func (*Tomcat) SampleConfig() string {
+	return sampleConfig
 }
 
 func (s *Tomcat) Gather(acc telegraf.Accumulator) error {
@@ -130,9 +113,13 @@ func (s *Tomcat) Gather(acc telegraf.Accumulator) error {
 			resp.StatusCode, s.URL)
 	}
 
-	var status TomcatStatus
+	var status tomcatStatus
 	if err := xml.NewDecoder(resp.Body).Decode(&status); err != nil {
 		return err
+	}
+
+	tags := map[string]string{
+		"source": s.URL,
 	}
 
 	// add tomcat_jvm_memory measurements
@@ -141,13 +128,14 @@ func (s *Tomcat) Gather(acc telegraf.Accumulator) error {
 		"total": status.TomcatJvm.JvmMemory.Total,
 		"max":   status.TomcatJvm.JvmMemory.Max,
 	}
-	acc.AddFields("tomcat_jvm_memory", tcm, nil)
+	acc.AddFields("tomcat_jvm_memory", tcm, tags)
 
 	// add tomcat_jvm_memorypool measurements
 	for _, mp := range status.TomcatJvm.JvmMemoryPools {
 		tcmpTags := map[string]string{
-			"name": mp.Name,
-			"type": mp.Type,
+			"name":   mp.Name,
+			"type":   mp.Type,
+			"source": s.URL,
 		}
 
 		tcmpFields := map[string]interface{}{
@@ -168,7 +156,8 @@ func (s *Tomcat) Gather(acc telegraf.Accumulator) error {
 		}
 
 		tccTags := map[string]string{
-			"name": name,
+			"name":   name,
+			"source": s.URL,
 		}
 
 		tccFields := map[string]interface{}{
