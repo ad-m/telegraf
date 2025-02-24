@@ -2,21 +2,22 @@ package cloud_pubsub
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
-	"fmt"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
 
-	"encoding/base64"
-
 	"cloud.google.com/go/pubsub"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/api/support/bundler"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
-	"github.com/influxdata/telegraf/plugins/parsers"
-	"github.com/influxdata/telegraf/plugins/serializers"
-	"google.golang.org/api/support/bundler"
+	"github.com/influxdata/telegraf/internal"
+	"github.com/influxdata/telegraf/plugins/parsers/influx"
+	serializers_influx "github.com/influxdata/telegraf/plugins/serializers/influx"
 )
 
 const (
@@ -35,7 +36,7 @@ type (
 	}
 
 	stubResult struct {
-		metricIds []string
+		metricIDs []string
 
 		sendError bool
 		err       chan error
@@ -45,8 +46,10 @@ type (
 	stubTopic struct {
 		Settings  pubsub.PublishSettings
 		ReturnErr map[string]bool
-		parsers.Parser
+		telegraf.Parser
 		*testing.T
+		Base64Data      bool
+		ContentEncoding string
 
 		stopped bool
 		pLock   sync.Mutex
@@ -60,17 +63,20 @@ type (
 )
 
 func getTestResources(tT *testing.T, settings pubsub.PublishSettings, testM []testMetric) (*PubSub, *stubTopic, []telegraf.Metric) {
-	s, _ := serializers.NewInfluxSerializer()
+	// Instantiate a Influx line-protocol serializer
+	s := &serializers_influx.Serializer{}
+	require.NoError(tT, s.Init())
 
-	metrics := make([]telegraf.Metric, len(testM))
+	metrics := make([]telegraf.Metric, 0, len(testM))
 	t := &stubTopic{
-		T:         tT,
-		ReturnErr: make(map[string]bool),
-		published: make(map[string]*pubsub.Message),
+		T:               tT,
+		ReturnErr:       make(map[string]bool),
+		published:       make(map[string]*pubsub.Message),
+		ContentEncoding: "identity",
 	}
 
-	for i, tm := range testM {
-		metrics[i] = tm.m
+	for _, tm := range testM {
+		metrics = append(metrics, tm.m)
 		if tm.returnErr {
 			v, _ := tm.m.GetField("value")
 			t.ReturnErr[v.(string)] = true
@@ -85,13 +91,19 @@ func getTestResources(tT *testing.T, settings pubsub.PublishSettings, testM []te
 		PublishByteThreshold:  settings.ByteThreshold,
 		PublishNumGoroutines:  settings.NumGoroutines,
 		PublishTimeout:        config.Duration(settings.Timeout),
+		ContentEncoding:       "identity",
 	}
+
+	require.NoError(tT, ps.Init())
+	var err error
+	ps.encoder, err = internal.NewContentEncoder(ps.ContentEncoding)
+	require.NoError(tT, err)
 	ps.SetSerializer(s)
 
 	return ps, t, metrics
 }
 
-func (t *stubTopic) ID() string {
+func (*stubTopic) ID() string {
 	return "test-topic"
 }
 
@@ -113,7 +125,7 @@ func (t *stubTopic) Publish(ctx context.Context, msg *pubsub.Message) publishRes
 
 	ids := t.parseIDs(msg)
 	r := &stubResult{
-		metricIds: ids,
+		metricIDs: ids,
 		err:       make(chan error, 1),
 		done:      make(chan struct{}, 1),
 	}
@@ -162,7 +174,7 @@ func (t *stubTopic) sendBundle() func(items interface{}) {
 
 		for _, msg := range bundled {
 			r := msg.stubResult
-			for _, id := range r.metricIds {
+			for _, id := range r.metricIDs {
 				t.published[id] = msg.Message
 			}
 
@@ -178,24 +190,32 @@ func (t *stubTopic) sendBundle() func(items interface{}) {
 }
 
 func (t *stubTopic) parseIDs(msg *pubsub.Message) []string {
-	p, _ := parsers.NewInfluxParser()
-	metrics, err := p.Parse(msg.Data)
+	p := influx.Parser{}
+	err := p.Init()
+	require.NoError(t, err)
+
+	decoder, err := internal.NewContentDecoder(t.ContentEncoding)
+	require.NoError(t, err)
+	d, err := decoder.Decode(msg.Data)
 	if err != nil {
-		// Just attempt to base64-decode first before returning error.
-		d, err := base64.StdEncoding.DecodeString(string(msg.Data))
+		t.Errorf("unable to decode message: %v", err)
+	}
+	if t.Base64Data {
+		strData, err := base64.StdEncoding.DecodeString(string(d))
 		if err != nil {
-			t.Errorf("unable to base64-decode potential test message: %v", err)
+			t.Errorf("unable to base64 decode message: %v", err)
 		}
-		metrics, err = p.Parse(d)
-		if err != nil {
-			t.Fatalf("unexpected parsing error: %v", err)
-		}
+		d = strData
+	}
+	metrics, err := p.Parse(d)
+	if err != nil {
+		t.Fatalf("unexpected parsing error: %v", err)
 	}
 
-	ids := make([]string, len(metrics))
-	for i, met := range metrics {
+	ids := make([]string, 0, len(metrics))
+	for _, met := range metrics {
 		id, _ := met.GetField("value")
-		ids[i] = id.(string)
+		ids = append(ids, id.(string))
 	}
 	return ids
 }
@@ -207,7 +227,7 @@ func (r *stubResult) Get(ctx context.Context) (string, error) {
 	case err := <-r.err:
 		return "", err
 	case <-r.done:
-		return fmt.Sprintf("id-%s", r.metricIds[0]), nil
+		return "id-" + r.metricIDs[0], nil
 	}
 }
 

@@ -1,12 +1,33 @@
 # Apache Input Plugin
 
-The Apache plugin collects server performance information using the [`mod_status`](https://httpd.apache.org/docs/2.4/mod/mod_status.html) module of the [Apache HTTP Server](https://httpd.apache.org/).
+This plugin collects performance information from [Apache HTTP Servers][apache]
+using the [`mod_status` module][mod_status_module]. Typically, this module is
+configured to expose a page at the `/server-status?auto` endpoint the server.
 
-Typically, the `mod_status` module is configured to expose a page at the `/server-status?auto` location of the Apache server.  The [ExtendedStatus](https://httpd.apache.org/docs/2.4/mod/core.html#extendedstatus) option must be enabled in order to collect all available fields.  For information about how to configure your server reference the [module documentation](https://httpd.apache.org/docs/2.4/mod/mod_status.html#enable).
+The [ExtendedStatus option][extended_status] must be enabled in order to collect
+all available fields. For information about configuration of your server check
+the [module documentation][mod_status_module].
 
-### Configuration:
+⭐ Telegraf v1.8.0
+🏷️ server, web
+💻 all
 
-```toml
+[apache]: https://httpd.apache.org
+[extended_status]: https://httpd.apache.org/docs/current/mod/core.html#extendedstatus
+[mod_status_module]: https://httpd.apache.org/docs/current/mod/mod_status.html
+
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
+
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Configuration
+
+```toml @sample.conf
 # Read Apache status information (mod_status)
 [[inputs.apache]]
   ## An array of URLs to gather from, must be directed at the machine
@@ -29,7 +50,7 @@ Typically, the `mod_status` module is configured to expose a page at the `/serve
   # insecure_skip_verify = false
 ```
 
-### Measurements & Fields:
+## Metrics
 
 - apache
   - BusyWorkers (float)
@@ -56,7 +77,8 @@ Typically, the `mod_status` module is configured to expose a page at the `/serve
   - TotalkBytes (float)
   - Uptime (float)
 
-The following fields are collected from the `Scoreboard`, and represent the number of requests in the given state:
+The following fields are collected from the `Scoreboard`, and represent the
+number of requests in the given state:
 
 - apache
   - scboard_closing (float)
@@ -71,14 +93,14 @@ The following fields are collected from the `Scoreboard`, and represent the numb
   - scboard_starting (float)
   - scboard_waiting (float)
 
-### Tags:
+## Tags
 
 - All measurements have the following tags:
-    - port
-    - server
+  - port
+  - server
 
-### Example Output:
+## Example Output
 
-```
+```text
 apache,port=80,server=debian-stretch-apache BusyWorkers=1,BytesPerReq=0,BytesPerSec=0,CPUChildrenSystem=0,CPUChildrenUser=0,CPULoad=0.00995025,CPUSystem=0.01,CPUUser=0.01,ConnsAsyncClosing=0,ConnsAsyncKeepAlive=0,ConnsAsyncWriting=0,ConnsTotal=0,IdleWorkers=49,Load1=0.01,Load15=0,Load5=0,ParentServerConfigGeneration=3,ParentServerMPMGeneration=2,ReqPerSec=0.00497512,ServerUptimeSeconds=201,TotalAccesses=1,TotalkBytes=0,Uptime=201,scboard_closing=0,scboard_dnslookup=0,scboard_finishing=0,scboard_idle_cleanup=0,scboard_keepalive=0,scboard_logging=0,scboard_open=100,scboard_reading=0,scboard_sending=1,scboard_starting=0,scboard_waiting=49 1502489900000000000
 ```

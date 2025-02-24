@@ -1,16 +1,17 @@
+//go:generate ../../../tools/readme_config_includer/generator
 //go:build linux
-// +build linux
 
 package sysstat
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,13 +23,18 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 var (
-	firstTimestamp time.Time
 	execCommand    = exec.Command // execCommand is used to mock commands in tests.
 	dfltActivities = []string{"DISK"}
 )
 
-const parseInterval = 1 // parseInterval is the interval (in seconds) where the parsing of the binary file takes place.
+const (
+	parseInterval = 1 // parseInterval is the interval (in seconds) where the parsing of the binary file takes place.
+	cmd           = "sadf"
+)
 
 type Sysstat struct {
 	// Sadc represents the path to the sadc collector utility.
@@ -43,7 +49,7 @@ type Sysstat struct {
 	// Activities is a list of activities that are passed as argument to the
 	// collector utility (e.g: DISK, SNMP etc...)
 	// The more activities that are added, the more data is collected.
-	Activities []string
+	Activities []string `toml:"activities"`
 
 	// Options is a map of options.
 	//
@@ -59,81 +65,40 @@ type Sysstat struct {
 	// and represents itself a measurement.
 	//
 	// If Group is true, metrics are grouped to a single measurement with the corresponding description as name.
-	Options map[string]string
+	Options map[string]string `toml:"options"`
 
 	// Group determines if metrics are grouped or not.
-	Group bool
+	Group bool `toml:"group"`
 
 	// DeviceTags adds the possibility to add additional tags for devices.
 	DeviceTags map[string][]map[string]string `toml:"device_tags"`
-	tmpFile    string
-	interval   int
 
-	Log telegraf.Logger
+	Log telegraf.Logger `toml:"-"`
+
+	// Used to autodetect how long the sadc command should run for
+	interval       int
+	firstTimestamp time.Time
 }
-
-func (*Sysstat) Description() string {
-	return "Sysstat metrics collector"
-}
-
-var sampleConfig = `
-  ## Path to the sadc command.
-  #
-  ## Common Defaults:
-  ##   Debian/Ubuntu: /usr/lib/sysstat/sadc
-  ##   Arch:          /usr/lib/sa/sadc
-  ##   RHEL/CentOS:   /usr/lib64/sa/sadc
-  sadc_path = "/usr/lib/sa/sadc" # required
-
-  ## Path to the sadf command, if it is not in PATH
-  # sadf_path = "/usr/bin/sadf"
-
-  ## Activities is a list of activities, that are passed as argument to the
-  ## sadc collector utility (e.g: DISK, SNMP etc...)
-  ## The more activities that are added, the more data is collected.
-  # activities = ["DISK"]
-
-  ## Group metrics to measurements.
-  ##
-  ## If group is false each metric will be prefixed with a description
-  ## and represents itself a measurement.
-  ##
-  ## If Group is true, corresponding metrics are grouped to a single measurement.
-  # group = true
-
-  ## Options for the sadf command. The values on the left represent the sadf
-  ## options and the values on the right their description (which are used for
-  ## grouping and prefixing metrics).
-  ##
-  ## Run 'sar -h' or 'man sar' to find out the supported options for your
-  ## sysstat version.
-  [inputs.sysstat.options]
-    -C = "cpu"
-    -B = "paging"
-    -b = "io"
-    -d = "disk"             # requires DISK activity
-    "-n ALL" = "network"
-    "-P ALL" = "per_cpu"
-    -q = "queue"
-    -R = "mem"
-    -r = "mem_util"
-    -S = "swap_util"
-    -u = "cpu_util"
-    -v = "inode"
-    -W = "swap"
-    -w = "task"
-  #  -H = "hugepages"        # only available for newer linux distributions
-  #  "-I ALL" = "interrupts" # requires INT activity
-
-  ## Device tags can be used to add additional tags for devices.
-  ## For example the configuration below adds a tag vg with value rootvg for
-  ## all metrics with sda devices.
-  # [[inputs.sysstat.device_tags.sda]]
-  #  vg = "rootvg"
-`
 
 func (*Sysstat) SampleConfig() string {
 	return sampleConfig
+}
+
+func (s *Sysstat) Init() error {
+	// Set defaults
+	if s.Sadf == "" {
+		sadf, err := exec.LookPath(cmd)
+		if err != nil {
+			return fmt.Errorf("looking up %q failed: %w", cmd, err)
+		}
+		s.Sadf = sadf
+	}
+
+	if s.Sadf == "" {
+		return fmt.Errorf("no path specified for %q", cmd)
+	}
+
+	return nil
 }
 
 func (s *Sysstat) Gather(acc telegraf.Accumulator) error {
@@ -143,14 +108,22 @@ func (s *Sysstat) Gather(acc telegraf.Accumulator) error {
 	}
 
 	if s.interval == 0 {
-		if firstTimestamp.IsZero() {
-			firstTimestamp = time.Now()
+		if s.firstTimestamp.IsZero() {
+			s.firstTimestamp = time.Now()
 		} else {
-			s.interval = int(time.Since(firstTimestamp).Seconds() + 0.5)
+			s.interval = int(time.Since(s.firstTimestamp).Seconds() + 0.5)
 		}
 	}
+
+	tmpfile, err := os.CreateTemp("", "sysstat-*")
+	if err != nil {
+		return fmt.Errorf("failed to create tmp file: %w", err)
+	}
+	defer os.Remove(tmpfile.Name())
+	defer tmpfile.Close()
+
 	ts := time.Now().Add(time.Duration(s.interval) * time.Second)
-	if err := s.collect(); err != nil {
+	if err := s.collect(tmpfile.Name()); err != nil {
 		return err
 	}
 	var wg sync.WaitGroup
@@ -158,45 +131,40 @@ func (s *Sysstat) Gather(acc telegraf.Accumulator) error {
 		wg.Add(1)
 		go func(acc telegraf.Accumulator, option string) {
 			defer wg.Done()
-			acc.AddError(s.parse(acc, option, ts))
+			acc.AddError(s.parse(acc, option, tmpfile.Name(), ts))
 		}(acc, option)
 	}
 	wg.Wait()
-
-	if _, err := os.Stat(s.tmpFile); err == nil {
-		acc.AddError(os.Remove(s.tmpFile))
-	}
 
 	return nil
 }
 
 // collect collects sysstat data with the collector utility sadc.
 // It runs the following command:
-//     Sadc -S <Activity1> -S <Activity2> ... <collectInterval> 2 tmpFile
+//
+//	Sadc -S <Activity1> -S <Activity2> ... <collectInterval> 2 tmpFile
+//
 // The above command collects system metrics during <collectInterval> and
 // saves it in binary form to tmpFile.
-func (s *Sysstat) collect() error {
-	options := []string{}
+func (s *Sysstat) collect(tempfile string) error {
+	options := make([]string, 0, len(s.Activities))
 	for _, act := range s.Activities {
 		options = append(options, "-S", act)
 	}
-	s.tmpFile = path.Join("/tmp", fmt.Sprintf("sysstat-%d", time.Now().Unix()))
+
 	// collectInterval has to be smaller than the telegraf data collection interval
 	collectInterval := s.interval - parseInterval
 
 	// If true, interval is not defined yet and Gather is run for the first time.
-	if collectInterval < 0 {
+	if collectInterval <= 0 {
 		collectInterval = 1 // In that case we only collect for 1 second.
 	}
 
-	options = append(options, strconv.Itoa(collectInterval), "2", s.tmpFile)
+	options = append(options, strconv.Itoa(collectInterval), "2", tempfile)
 	cmd := execCommand(s.Sadc, options...)
 	out, err := internal.CombinedOutputTimeout(cmd, time.Second*time.Duration(collectInterval+parseInterval))
 	if err != nil {
-		if err := os.Remove(s.tmpFile); err != nil {
-			s.Log.Errorf("Failed to remove tmp file after %q command: %s", strings.Join(cmd.Args, " "), err.Error())
-		}
-		return fmt.Errorf("failed to run command %s: %s - %s", strings.Join(cmd.Args, " "), err, string(out))
+		return fmt.Errorf("failed to run command %q: %w - %q", strings.Join(cmd.Args, " "), err, string(out))
 	}
 	return nil
 }
@@ -227,23 +195,25 @@ func withCLocale(cmd *exec.Cmd) *exec.Cmd {
 }
 
 // parse runs Sadf on the previously saved tmpFile:
-//    Sadf -p -- -p <option> tmpFile
+//
+//	Sadf -p -- -p <option> tmpFile
+//
 // and parses the output to add it to the telegraf.Accumulator acc.
-func (s *Sysstat) parse(acc telegraf.Accumulator, option string, ts time.Time) error {
-	cmd := execCommand(s.Sadf, s.sadfOptions(option)...)
+func (s *Sysstat) parse(acc telegraf.Accumulator, option, tmpfile string, ts time.Time) error {
+	cmd := execCommand(s.Sadf, sadfOptions(option, tmpfile)...)
 	cmd = withCLocale(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("running command '%s' failed: %s", strings.Join(cmd.Args, " "), err)
+		return fmt.Errorf("running command %q failed: %w", strings.Join(cmd.Args, " "), err)
 	}
 
 	r := bufio.NewReader(stdout)
-	csv := csv.NewReader(r)
-	csv.Comma = '\t'
-	csv.FieldsPerRecord = 6
+	csvReader := csv.NewReader(r)
+	csvReader.Comma = '\t'
+	csvReader.FieldsPerRecord = 6
 	var measurement string
 	// groupData to accumulate data when Group=true
 	type groupData struct {
@@ -252,8 +222,8 @@ func (s *Sysstat) parse(acc telegraf.Accumulator, option string, ts time.Time) e
 	}
 	m := make(map[string]groupData)
 	for {
-		record, err := csv.Read()
-		if err == io.EOF {
+		record, err := csvReader.Read()
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -266,7 +236,7 @@ func (s *Sysstat) parse(acc telegraf.Accumulator, option string, ts time.Time) e
 			return err
 		}
 
-		tags := map[string]string{}
+		tags := make(map[string]string)
 		if device != "-" {
 			tags["device"] = device
 			if addTags, ok := s.DeviceTags[device]; ok {
@@ -307,14 +277,13 @@ func (s *Sysstat) parse(acc telegraf.Accumulator, option string, ts time.Time) e
 		}
 	}
 	if err := internal.WaitTimeout(cmd, time.Second*5); err != nil {
-		return fmt.Errorf("command %s failed with %s",
-			strings.Join(cmd.Args, " "), err)
+		return fmt.Errorf("command %q failed with: %w", strings.Join(cmd.Args, " "), err)
 	}
 	return nil
 }
 
 // sadfOptions creates the correct options for the sadf utility.
-func (s *Sysstat) sadfOptions(activityOption string) []string {
+func sadfOptions(activityOption, tmpfile string) []string {
 	options := []string{
 		"-p",
 		"--",
@@ -323,7 +292,7 @@ func (s *Sysstat) sadfOptions(activityOption string) []string {
 
 	opts := strings.Split(activityOption, " ")
 	options = append(options, opts...)
-	options = append(options, s.tmpFile)
+	options = append(options, tmpfile)
 
 	return options
 }
@@ -339,15 +308,10 @@ func escape(dirty string) string {
 }
 
 func init() {
-	s := Sysstat{
-		Group:      true,
-		Activities: dfltActivities,
-	}
-	sadf, _ := exec.LookPath("sadf")
-	if len(sadf) > 0 {
-		s.Sadf = sadf
-	}
 	inputs.Add("sysstat", func() telegraf.Input {
-		return &s
+		return &Sysstat{
+			Group:      true,
+			Activities: dfltActivities,
+		}
 	})
 }

@@ -1,6 +1,7 @@
 package beanstalkd_test
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/textproto"
@@ -25,13 +26,11 @@ func TestBeanstalkd(t *testing.T) {
 		expectedError    string
 	}{
 		{
-			name:        "All tubes stats",
-			tubesConfig: []string{},
+			name: "All tubes stats",
 			expectedTubes: []tubeStats{
 				{name: "default", fields: defaultTubeFields},
 				{name: "test", fields: testTubeFields},
 			},
-			notExpectedTubes: []tubeStats{},
 		},
 		{
 			name:        "Specified tubes stats",
@@ -44,9 +43,8 @@ func TestBeanstalkd(t *testing.T) {
 			},
 		},
 		{
-			name:          "Unknown tube stats",
-			tubesConfig:   []string{"unknown"},
-			expectedTubes: []tubeStats{},
+			name:        "Unknown tube stats",
+			tubesConfig: []string{"unknown"},
 			notExpectedTubes: []tubeStats{
 				{name: "default", fields: defaultTubeFields},
 				{name: "test", fields: testTubeFields},
@@ -121,7 +119,7 @@ func startTestServer(t *testing.T) (net.Listener, error) {
 
 		for {
 			cmd, err := tp.ReadLine()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return
 			} else if err != nil {
 				t.Log("Test server: failed read command. Error: ", err)
@@ -344,7 +342,7 @@ func getOverviewTags(server string) map[string]string {
 	}
 }
 
-func getTubeTags(server string, tube string) map[string]string {
+func getTubeTags(server, tube string) map[string]string {
 	return map[string]string{
 		"name":   tube,
 		"server": server,

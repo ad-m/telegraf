@@ -1,80 +1,57 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package loki
 
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/clientcredentials"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 const (
 	defaultEndpoint      = "/loki/api/v1/push"
 	defaultClientTimeout = 5 * time.Second
 )
 
-var sampleConfig = `
-  ## The domain of Loki
-  domain = "https://loki.domain.tld"
-
-  ## Endpoint to write api
-  # endpoint = "/loki/api/v1/push"
-
-  ## Connection timeout, defaults to "5s" if not set.
-  # timeout = "5s"
-
-  ## Basic auth credential
-  # username = "loki"
-  # password = "pass"
-
-  ## Additional HTTP headers
-  # http_headers = {"X-Scope-OrgID" = "1"}
-
-  ## If the request must be gzip encoded
-  # gzip_request = false
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-`
-
 type Loki struct {
-	Domain       string            `toml:"domain"`
-	Endpoint     string            `toml:"endpoint"`
-	Timeout      config.Duration   `toml:"timeout"`
-	Username     string            `toml:"username"`
-	Password     string            `toml:"password"`
-	Headers      map[string]string `toml:"http_headers"`
-	ClientID     string            `toml:"client_id"`
-	ClientSecret string            `toml:"client_secret"`
-	TokenURL     string            `toml:"token_url"`
-	Scopes       []string          `toml:"scopes"`
-	GZipRequest  bool              `toml:"gzip_request"`
+	Domain             string            `toml:"domain"`
+	Endpoint           string            `toml:"endpoint"`
+	Timeout            config.Duration   `toml:"timeout"`
+	Username           config.Secret     `toml:"username"`
+	Password           config.Secret     `toml:"password"`
+	Headers            map[string]string `toml:"http_headers"`
+	ClientID           string            `toml:"client_id"`
+	ClientSecret       string            `toml:"client_secret"`
+	TokenURL           string            `toml:"token_url"`
+	Scopes             []string          `toml:"scopes"`
+	GZipRequest        bool              `toml:"gzip_request"`
+	MetricNameLabel    string            `toml:"metric_name_label"`
+	SanitizeLabelNames bool              `toml:"sanitize_label_names"`
 
 	url    string
 	client *http.Client
 	tls.ClientConfig
-}
-
-func (l *Loki) SampleConfig() string {
-	return sampleConfig
-}
-
-func (l *Loki) Description() string {
-	return "Send logs to Loki"
 }
 
 func (l *Loki) createClient(ctx context.Context) (*http.Client, error) {
@@ -105,9 +82,13 @@ func (l *Loki) createClient(ctx context.Context) (*http.Client, error) {
 	return client, nil
 }
 
+func (*Loki) SampleConfig() string {
+	return sampleConfig
+}
+
 func (l *Loki) Connect() (err error) {
 	if l.Domain == "" {
-		return fmt.Errorf("domain is required")
+		return errors.New("domain is required")
 	}
 
 	if l.Endpoint == "" {
@@ -126,7 +107,7 @@ func (l *Loki) Connect() (err error) {
 		return fmt.Errorf("http client fail: %w", err)
 	}
 
-	return
+	return nil
 }
 
 func (l *Loki) Close() error {
@@ -143,20 +124,29 @@ func (l *Loki) Write(metrics []telegraf.Metric) error {
 	})
 
 	for _, m := range metrics {
-		tags := m.TagList()
-		var line string
+		if l.MetricNameLabel != "" {
+			m.AddTag(l.MetricNameLabel, m.Name())
+		}
 
+		tags := m.TagList()
+		if l.SanitizeLabelNames {
+			for _, t := range tags {
+				t.Key = sanitizeLabelName(t.Key)
+			}
+		}
+
+		var line string
 		for _, f := range m.FieldList() {
 			line += fmt.Sprintf("%s=\"%v\" ", f.Key, f.Value)
 		}
 
-		s.insertLog(tags, Log{fmt.Sprintf("%d", m.Time().UnixNano()), line})
+		s.insertLog(tags, Log{strconv.FormatInt(m.Time().UnixNano(), 10), line})
 	}
 
-	return l.write(s)
+	return l.writeMetrics(s)
 }
 
-func (l *Loki) write(s Streams) error {
+func (l *Loki) writeMetrics(s Streams) error {
 	bs, err := json.Marshal(s)
 	if err != nil {
 		return fmt.Errorf("json.Marshal: %w", err)
@@ -165,10 +155,7 @@ func (l *Loki) write(s Streams) error {
 	var reqBodyBuffer io.Reader = bytes.NewBuffer(bs)
 
 	if l.GZipRequest {
-		rc, err := internal.CompressWithGzip(reqBodyBuffer)
-		if err != nil {
-			return err
-		}
+		rc := internal.CompressWithGzip(reqBodyBuffer)
 		defer rc.Close()
 		reqBodyBuffer = rc
 	}
@@ -178,12 +165,23 @@ func (l *Loki) write(s Streams) error {
 		return err
 	}
 
-	if l.Username != "" {
-		req.SetBasicAuth(l.Username, l.Password)
+	if !l.Username.Empty() {
+		username, err := l.Username.Get()
+		if err != nil {
+			return fmt.Errorf("getting username failed: %w", err)
+		}
+		password, err := l.Password.Get()
+		if err != nil {
+			username.Destroy()
+			return fmt.Errorf("getting password failed: %w", err)
+		}
+		req.SetBasicAuth(username.String(), password.String())
+		username.Destroy()
+		password.Destroy()
 	}
 
 	for k, v := range l.Headers {
-		if strings.ToLower(k) == "host" {
+		if strings.EqualFold(k, "host") {
 			req.Host = v
 		}
 		req.Header.Set(k, v)
@@ -199,17 +197,30 @@ func (l *Loki) write(s Streams) error {
 	if err != nil {
 		return err
 	}
-	_ = resp.Body.Close()
+	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("when writing to [%s] received status code: %d", l.url, resp.StatusCode)
+		//nolint:errcheck // err can be ignored since it is just for logging
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("when writing to [%s] received status code, %d: %s", l.url, resp.StatusCode, body)
 	}
 
 	return nil
 }
 
+// Verify the label name matches the regex [a-zA-Z_:][a-zA-Z0-9_:]*
+func sanitizeLabelName(name string) string {
+	re := regexp.MustCompile(`^[^a-zA-Z_:]`)
+	result := re.ReplaceAllString(name, "_")
+
+	re = regexp.MustCompile(`[^a-zA-Z0-9_:]`)
+	return re.ReplaceAllString(result, "_")
+}
+
 func init() {
 	outputs.Add("loki", func() telegraf.Output {
-		return &Loki{}
+		return &Loki{
+			MetricNameLabel: "__name",
+		}
 	})
 }

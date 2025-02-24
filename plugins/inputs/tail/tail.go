@@ -1,11 +1,12 @@
+//go:generate ../../../tools/readme_config_includer/generator
 //go:build !solaris
-// +build !solaris
 
 package tail
 
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"errors"
 	"io"
 	"strings"
@@ -14,45 +15,49 @@ import (
 
 	"github.com/dimchansky/utfbom"
 	"github.com/influxdata/tail"
+	"github.com/pborman/ansi"
+
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/internal/globpath"
 	"github.com/influxdata/telegraf/plugins/common/encoding"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/plugins/parsers"
-	"github.com/influxdata/telegraf/plugins/parsers/csv"
 )
 
-const (
-	defaultWatchMethod = "inotify"
-)
+//go:embed sample.conf
+var sampleConfig string
 
 var (
+	once sync.Once
+
 	offsets      = make(map[string]int64)
 	offsetsMutex = new(sync.Mutex)
 )
 
-type empty struct{}
-type semaphore chan empty
-
 type Tail struct {
 	Files               []string `toml:"files"`
-	FromBeginning       bool     `toml:"from_beginning"`
+	FromBeginning       bool     `toml:"from_beginning" deprecated:"1.34.0;1.40.0;use 'initial_read_offset' with value 'beginning' instead"`
+	InitialReadOffset   string   `toml:"initial_read_offset"`
 	Pipe                bool     `toml:"pipe"`
 	WatchMethod         string   `toml:"watch_method"`
 	MaxUndeliveredLines int      `toml:"max_undelivered_lines"`
 	CharacterEncoding   string   `toml:"character_encoding"`
 	PathTag             string   `toml:"path_tag"`
 
+	Filters      []string `toml:"filters"`
+	filterColors bool
+
 	Log        telegraf.Logger `toml:"-"`
 	tailers    map[string]*tail.Tail
 	offsets    map[string]int64
-	parserFunc parsers.ParserFunc
+	parserFunc telegraf.ParserFunc
 	wg         sync.WaitGroup
 
 	acc telegraf.TrackingAccumulator
 
-	MultilineConfig MultilineConfig `toml:"multiline"`
-	multiline       *Multiline
+	MultilineConfig multilineConfig `toml:"multiline"`
+	multiline       *multiline
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -60,95 +65,15 @@ type Tail struct {
 	decoder *encoding.Decoder
 }
 
-func NewTail() *Tail {
-	offsetsMutex.Lock()
-	offsetsCopy := make(map[string]int64, len(offsets))
-	for k, v := range offsets {
-		offsetsCopy[k] = v
-	}
-	offsetsMutex.Unlock()
+type empty struct{}
+type semaphore chan empty
 
-	return &Tail{
-		FromBeginning:       false,
-		MaxUndeliveredLines: 1000,
-		offsets:             offsetsCopy,
-		PathTag:             "path",
-	}
-}
-
-const sampleConfig = `
-  ## File names or a pattern to tail.
-  ## These accept standard unix glob matching rules, but with the addition of
-  ## ** as a "super asterisk". ie:
-  ##   "/var/log/**.log"  -> recursively find all .log files in /var/log
-  ##   "/var/log/*/*.log" -> find all .log files with a parent dir in /var/log
-  ##   "/var/log/apache.log" -> just tail the apache log file
-  ##   "/var/log/log[!1-2]*  -> tail files without 1-2
-  ##   "/var/log/log[^1-2]*  -> identical behavior as above
-  ## See https://github.com/gobwas/glob for more examples
-  ##
-  files = ["/var/mymetrics.out"]
-
-  ## Read file from beginning.
-  # from_beginning = false
-
-  ## Whether file is a named pipe
-  # pipe = false
-
-  ## Method used to watch for file updates.  Can be either "inotify" or "poll".
-  # watch_method = "inotify"
-
-  ## Maximum lines of the file to process that have not yet be written by the
-  ## output.  For best throughput set based on the number of metrics on each
-  ## line and the size of the output's metric_batch_size.
-  # max_undelivered_lines = 1000
-
-  ## Character encoding to use when interpreting the file contents.  Invalid
-  ## characters are replaced using the unicode replacement character.  When set
-  ## to the empty string the data is not decoded to text.
-  ##   ex: character_encoding = "utf-8"
-  ##       character_encoding = "utf-16le"
-  ##       character_encoding = "utf-16be"
-  ##       character_encoding = ""
-  # character_encoding = ""
-
-  ## Data format to consume.
-  ## Each data format has its own unique set of configuration options, read
-  ## more about them here:
-  ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_INPUT.md
-  data_format = "influx"
-
-  ## Set the tag that will contain the path of the tailed file. If you don't want this tag, set it to an empty string.
-  # path_tag = "path"
-
-  ## multiline parser/codec
-  ## https://www.elastic.co/guide/en/logstash/2.4/plugins-filters-multiline.html
-  #[inputs.tail.multiline]
-    ## The pattern should be a regexp which matches what you believe to be an
-	## indicator that the field is part of an event consisting of multiple lines of log data.
-    #pattern = "^\s"
-
-    ## This field must be either "previous" or "next".
-	## If a line matches the pattern, "previous" indicates that it belongs to the previous line,
-	## whereas "next" indicates that the line belongs to the next one.
-    #match_which_line = "previous"
-
-    ## The invert_match field can be true or false (defaults to false).
-    ## If true, a message not matching the pattern will constitute a match of the multiline
-	## filter and the what will be applied. (vice-versa is also true)
-    #invert_match = false
-
-    ## After the specified timeout, this plugin sends a multiline event even if no new pattern
-	## is found to start a new event. The default timeout is 5s.
-    #timeout = 5s
-`
-
-func (t *Tail) SampleConfig() string {
+func (*Tail) SampleConfig() string {
 	return sampleConfig
 }
 
-func (t *Tail) Description() string {
-	return "Parse the new lines appended to a file"
+func (t *Tail) SetParserFunc(fn telegraf.ParserFunc) {
+	t.parserFunc = fn
 }
 
 func (t *Tail) Init() error {
@@ -157,13 +82,25 @@ func (t *Tail) Init() error {
 	}
 	t.sem = make(semaphore, t.MaxUndeliveredLines)
 
+	for _, filter := range t.Filters {
+		if filter == "ansi_color" {
+			t.filterColors = true
+		}
+	}
+	// init offsets
+	t.offsets = make(map[string]int64)
+
+	if t.InitialReadOffset == "" {
+		if t.FromBeginning {
+			t.InitialReadOffset = "beginning"
+		} else {
+			t.InitialReadOffset = "save-or-end"
+		}
+	}
+
 	var err error
 	t.decoder, err = encoding.NewDecoder(t.CharacterEncoding)
 	return err
-}
-
-func (t *Tail) Gather(_ telegraf.Accumulator) error {
-	return t.tailNewFiles(true)
 }
 
 func (t *Tail) Start(acc telegraf.Accumulator) error {
@@ -185,7 +122,7 @@ func (t *Tail) Start(acc telegraf.Accumulator) error {
 	}()
 
 	var err error
-	t.multiline, err = t.MultilineConfig.NewMultiline()
+	t.multiline, err = t.MultilineConfig.newMultiline()
 
 	if err != nil {
 		return err
@@ -193,10 +130,11 @@ func (t *Tail) Start(acc telegraf.Accumulator) error {
 
 	t.tailers = make(map[string]*tail.Tail)
 
-	err = t.tailNewFiles(t.FromBeginning)
+	err = t.tailNewFiles()
+	if err != nil {
+		return err
+	}
 
-	// clear offsets
-	t.offsets = make(map[string]int64)
 	// assumption that once Start is called, all parallel plugins have already been initialized
 	offsetsMutex.Lock()
 	offsets = make(map[string]int64)
@@ -205,7 +143,78 @@ func (t *Tail) Start(acc telegraf.Accumulator) error {
 	return err
 }
 
-func (t *Tail) tailNewFiles(fromBeginning bool) error {
+func (t *Tail) getSeekInfo(file string) (*tail.SeekInfo, error) {
+	switch t.InitialReadOffset {
+	case "beginning":
+		return &tail.SeekInfo{Whence: 0, Offset: 0}, nil
+	case "end":
+		return &tail.SeekInfo{Whence: 2, Offset: 0}, nil
+	case "", "save-or-end":
+		if offset, ok := t.offsets[file]; ok {
+			t.Log.Debugf("Using offset %d for %q", offset, file)
+			return &tail.SeekInfo{Whence: 0, Offset: offset}, nil
+		}
+		return &tail.SeekInfo{Whence: 2, Offset: 0}, nil
+	case "save-or-beginning":
+		if offset, ok := t.offsets[file]; ok {
+			t.Log.Debugf("Using offset %d for %q", offset, file)
+			return &tail.SeekInfo{Whence: 0, Offset: offset}, nil
+		}
+		return &tail.SeekInfo{Whence: 0, Offset: 0}, nil
+	default:
+		return nil, errors.New("invalid 'initial_read_offset' setting")
+	}
+}
+
+func (t *Tail) GetState() interface{} {
+	return t.offsets
+}
+
+func (t *Tail) SetState(state interface{}) error {
+	offsetsState, ok := state.(map[string]int64)
+	if !ok {
+		return errors.New("state has to be of type 'map[string]int64'")
+	}
+	for k, v := range offsetsState {
+		t.offsets[k] = v
+	}
+	return nil
+}
+
+func (t *Tail) Gather(_ telegraf.Accumulator) error {
+	return t.tailNewFiles()
+}
+
+func (t *Tail) Stop() {
+	for _, tailer := range t.tailers {
+		if !t.Pipe {
+			// store offset for resume
+			offset, err := tailer.Tell()
+			if err == nil {
+				t.Log.Debugf("Recording offset %d for %q", offset, tailer.Filename)
+				t.offsets[tailer.Filename] = offset
+			} else {
+				t.Log.Errorf("Recording offset for %q: %s", tailer.Filename, err.Error())
+			}
+		}
+		err := tailer.Stop()
+		if err != nil {
+			t.Log.Errorf("Stopping tail on %q: %s", tailer.Filename, err.Error())
+		}
+	}
+
+	t.cancel()
+	t.wg.Wait()
+
+	// persist offsets
+	offsetsMutex.Lock()
+	for k, v := range t.offsets {
+		offsets[k] = v
+	}
+	offsetsMutex.Unlock()
+}
+
+func (t *Tail) tailNewFiles() error {
 	var poll bool
 	if t.WatchMethod == "poll" {
 		poll = true
@@ -223,20 +232,9 @@ func (t *Tail) tailNewFiles(fromBeginning bool) error {
 				continue
 			}
 
-			var seek *tail.SeekInfo
-			if !t.Pipe && !fromBeginning {
-				if offset, ok := t.offsets[file]; ok {
-					t.Log.Debugf("Using offset %d for %q", offset, file)
-					seek = &tail.SeekInfo{
-						Whence: 0,
-						Offset: offset,
-					}
-				} else {
-					seek = &tail.SeekInfo{
-						Whence: 2,
-						Offset: 0,
-					}
-				}
+			seek, err := t.getSeekInfo(file)
+			if err != nil {
+				return err
 			}
 
 			tailer, err := tail.TailFile(file,
@@ -277,7 +275,12 @@ func (t *Tail) tailNewFiles(fromBeginning bool) error {
 				t.Log.Debugf("Tail removed for %q", tailer.Filename)
 
 				if err := tailer.Err(); err != nil {
-					t.Log.Errorf("Tailing %q: %s", tailer.Filename, err.Error())
+					if strings.HasSuffix(err.Error(), "permission denied") {
+						t.Log.Errorf("Deleting tailer for %q due to: %v", tailer.Filename, err)
+						delete(t.tailers, tailer.Filename)
+					} else {
+						t.Log.Errorf("Tailing %q: %s", tailer.Filename, err.Error())
+					}
 				}
 			}()
 
@@ -287,36 +290,20 @@ func (t *Tail) tailNewFiles(fromBeginning bool) error {
 	return nil
 }
 
-// ParseLine parses a line of text.
-func parseLine(parser parsers.Parser, line string, firstLine bool) ([]telegraf.Metric, error) {
-	switch parser.(type) {
-	case *csv.Parser:
-		// The csv parser parses headers in Parse and skips them in ParseLine.
-		// As a temporary solution call Parse only when getting the first
-		// line from the file.
-		if firstLine {
-			return parser.Parse([]byte(line))
+func parseLine(parser telegraf.Parser, line string) ([]telegraf.Metric, error) {
+	m, err := parser.Parse([]byte(line))
+	if err != nil {
+		if errors.Is(err, parsers.ErrEOF) {
+			return nil, nil
 		}
-
-		m, err := parser.ParseLine(line)
-		if err != nil {
-			return nil, err
-		}
-
-		if m != nil {
-			return []telegraf.Metric{m}, nil
-		}
-		return []telegraf.Metric{}, nil
-	default:
-		return parser.Parse([]byte(line))
+		return nil, err
 	}
+	return m, err
 }
 
-// Receiver is launched as a goroutine to continuously watch a tailed logfile
-// for changes, parse any incoming msgs, and add to the accumulator.
-func (t *Tail) receiver(parser parsers.Parser, tailer *tail.Tail) {
-	var firstLine = true
-
+// receiver is launched as a goroutine to continuously watch a tailed logfile
+// for changes, parse any incoming messages, and add to the accumulator.
+func (t *Tail) receiver(parser telegraf.Parser, tailer *tail.Tail) {
 	// holds the individual lines of multi-line log entries.
 	var buffer bytes.Buffer
 
@@ -325,7 +312,7 @@ func (t *Tail) receiver(parser parsers.Parser, tailer *tail.Tail) {
 
 	// The multiline mode requires a timer in order to flush the multiline buffer
 	// if no new lines are incoming.
-	if t.multiline.IsEnabled() {
+	if t.multiline.isEnabled() {
 		timer = time.NewTimer(time.Duration(*t.MultilineConfig.Timeout))
 		timeout = timer.C
 	}
@@ -357,14 +344,14 @@ func (t *Tail) receiver(parser parsers.Parser, tailer *tail.Tail) {
 			// Fix up files with Windows line endings.
 			text = strings.TrimRight(line.Text, "\r")
 
-			if t.multiline.IsEnabled() {
-				if text = t.multiline.ProcessLine(text, &buffer); text == "" {
+			if t.multiline.isEnabled() {
+				if text = t.multiline.processLine(text, &buffer); text == "" {
 					continue
 				}
 			}
 		}
 		if line == nil || !channelOpen || !tailerOpen {
-			if text += t.multiline.Flush(&buffer); text == "" {
+			if text += flush(&buffer); text == "" {
 				if !channelOpen {
 					return
 				}
@@ -378,14 +365,25 @@ func (t *Tail) receiver(parser parsers.Parser, tailer *tail.Tail) {
 			continue
 		}
 
-		metrics, err := parseLine(parser, text, firstLine)
+		if t.filterColors {
+			out, err := ansi.Strip([]byte(text))
+			if err != nil {
+				t.Log.Errorf("Cannot strip ansi colors from %s: %s", text, err)
+			}
+			text = string(out)
+		}
+
+		metrics, err := parseLine(parser, text)
 		if err != nil {
 			t.Log.Errorf("Malformed log line in %q: [%q]: %s",
 				tailer.Filename, text, err.Error())
 			continue
 		}
-		firstLine = false
-
+		if len(metrics) == 0 {
+			once.Do(func() {
+				t.Log.Debug(internal.NoMetricsCreatedMsg)
+			})
+		}
 		if t.PathTag != "" {
 			for _, metric := range metrics {
 				metric.AddTag(t.PathTag, tailer.Filename)
@@ -408,46 +406,35 @@ func (t *Tail) receiver(parser parsers.Parser, tailer *tail.Tail) {
 		select {
 		case <-t.ctx.Done():
 			return
+		// Tail is trying to close so drain the sem to allow the receiver
+		// to exit. This condition is hit when the tailer may have hit the
+		// maximum undelivered lines and is trying to close.
+		case <-tailer.Dying():
+			<-t.sem
 		case t.sem <- empty{}:
 			t.acc.AddTrackingMetricGroup(metrics)
 		}
 	}
 }
 
-func (t *Tail) Stop() {
-	for _, tailer := range t.tailers {
-		if !t.Pipe && !t.FromBeginning {
-			// store offset for resume
-			offset, err := tailer.Tell()
-			if err == nil {
-				t.Log.Debugf("Recording offset %d for %q", offset, tailer.Filename)
-			} else {
-				t.Log.Errorf("Recording offset for %q: %s", tailer.Filename, err.Error())
-			}
-		}
-		err := tailer.Stop()
-		if err != nil {
-			t.Log.Errorf("Stopping tail on %q: %s", tailer.Filename, err.Error())
-		}
-	}
-
-	t.cancel()
-	t.wg.Wait()
-
-	// persist offsets
+func newTail() *Tail {
 	offsetsMutex.Lock()
-	for k, v := range t.offsets {
-		offsets[k] = v
+	offsetsCopy := make(map[string]int64, len(offsets))
+	for k, v := range offsets {
+		offsetsCopy[k] = v
 	}
 	offsetsMutex.Unlock()
-}
 
-func (t *Tail) SetParserFunc(fn parsers.ParserFunc) {
-	t.parserFunc = fn
+	return &Tail{
+		FromBeginning:       false,
+		MaxUndeliveredLines: 1000,
+		offsets:             offsetsCopy,
+		PathTag:             "path",
+	}
 }
 
 func init() {
 	inputs.Add("tail", func() telegraf.Input {
-		return NewTail()
+		return newTail()
 	})
 }

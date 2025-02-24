@@ -94,20 +94,22 @@ func TestNFSClientProcessStat(t *testing.T) {
 	nfsclient := NFSClient{}
 	nfsclient.Fullstat = false
 
-	file, _ := os.Open(getMountStatsPath())
+	file, err := os.Open(getMountStatsPath())
+	require.NoError(t, err)
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 
-	err := nfsclient.processText(scanner, &acc)
+	err = nfsclient.processText(scanner, &acc)
 	require.NoError(t, err)
 
 	fieldsReadstat := map[string]interface{}{
-		"ops":     uint64(600),
-		"retrans": uint64(1),
-		"bytes":   uint64(1207),
-		"rtt":     uint64(606),
-		"exe":     uint64(607),
+		"ops":        uint64(600),
+		"retrans":    uint64(1),
+		"bytes":      uint64(1207),
+		"rtt":        uint64(606),
+		"exe":        uint64(607),
+		"rtt_per_op": float64(1.01),
 	}
 
 	readTags := map[string]string{
@@ -119,11 +121,12 @@ func TestNFSClientProcessStat(t *testing.T) {
 	acc.AssertContainsTaggedFields(t, "nfsstat", fieldsReadstat, readTags)
 
 	fieldsWritestat := map[string]interface{}{
-		"ops":     uint64(700),
-		"retrans": uint64(1),
-		"bytes":   uint64(1407),
-		"rtt":     uint64(706),
-		"exe":     uint64(707),
+		"ops":        uint64(700),
+		"retrans":    uint64(1),
+		"bytes":      uint64(1407),
+		"rtt":        uint64(706),
+		"exe":        uint64(707),
+		"rtt_per_op": float64(1.0085714285714287),
 	}
 
 	writeTags := map[string]string{
@@ -140,12 +143,13 @@ func TestNFSClientProcessFull(t *testing.T) {
 	nfsclient := NFSClient{}
 	nfsclient.Fullstat = true
 
-	file, _ := os.Open(getMountStatsPath())
+	file, err := os.Open(getMountStatsPath())
+	require.NoError(t, err)
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 
-	err := nfsclient.processText(scanner, &acc)
+	err = nfsclient.processText(scanner, &acc)
 	require.NoError(t, err)
 
 	fieldsEvents := map[string]interface{}{
@@ -202,4 +206,11 @@ func TestNFSClientProcessFull(t *testing.T) {
 	acc.AssertContainsFields(t, "nfs_events", fieldsEvents)
 	acc.AssertContainsFields(t, "nfs_bytes", fieldsBytes)
 	acc.AssertContainsFields(t, "nfs_xprt_tcp", fieldsXprtTCP)
+}
+
+func TestNFSClientFileDoesNotExist(t *testing.T) {
+	var acc testutil.Accumulator
+	nfsclient := NFSClient{Fullstat: true}
+	nfsclient.mountstatsPath = "/does_not_exist"
+	require.Error(t, nfsclient.Gather(&acc))
 }

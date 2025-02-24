@@ -1,12 +1,16 @@
-//nolint
+//go:generate ../../../tools/readme_config_includer/generator
 package influxdb
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/influxdata/telegraf"
@@ -15,6 +19,9 @@ import (
 	"github.com/influxdata/telegraf/plugins/outputs"
 	"github.com/influxdata/telegraf/plugins/serializers/influx"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 var (
 	defaultURL = "http://localhost:8086"
@@ -32,10 +39,10 @@ type Client interface {
 
 // InfluxDB struct is the primary data structure for the plugin
 type InfluxDB struct {
-	URL                       string            // url deprecated in 0.1.9; use urls
 	URLs                      []string          `toml:"urls"`
-	Username                  string            `toml:"username"`
-	Password                  string            `toml:"password"`
+	LocalAddr                 string            `toml:"local_address"`
+	Username                  config.Secret     `toml:"username"`
+	Password                  config.Secret     `toml:"password"`
 	Database                  string            `toml:"database"`
 	DatabaseTag               string            `toml:"database_tag"`
 	ExcludeDatabaseTag        bool              `toml:"exclude_database_tag"`
@@ -51,133 +58,90 @@ type InfluxDB struct {
 	ContentEncoding           string            `toml:"content_encoding"`
 	SkipDatabaseCreation      bool              `toml:"skip_database_creation"`
 	InfluxUintSupport         bool              `toml:"influx_uint_support"`
+	OmitTimestamp             bool              `toml:"influx_omit_timestamp"`
+	Precision                 string            `toml:"precision" deprecated:"1.0.0;1.35.0;option is ignored"`
+	Log                       telegraf.Logger   `toml:"-"`
 	tls.ClientConfig
-
-	Precision string // precision deprecated in 1.0; value is ignored
 
 	clients []Client
 
 	CreateHTTPClientF func(config *HTTPConfig) (Client, error)
 	CreateUDPClientF  func(config *UDPConfig) (Client, error)
-
-	Log telegraf.Logger
 }
 
-var sampleConfig = `
-  ## The full HTTP or UDP URL for your InfluxDB instance.
-  ##
-  ## Multiple URLs can be specified for a single cluster, only ONE of the
-  ## urls will be written to each interval.
-  # urls = ["unix:///var/run/influxdb.sock"]
-  # urls = ["udp://127.0.0.1:8089"]
-  # urls = ["http://127.0.0.1:8086"]
-
-  ## The target database for metrics; will be created as needed.
-  ## For UDP url endpoint database needs to be configured on server side.
-  # database = "telegraf"
-
-  ## The value of this tag will be used to determine the database.  If this
-  ## tag is not set the 'database' option is used as the default.
-  # database_tag = ""
-
-  ## If true, the 'database_tag' will not be included in the written metric.
-  # exclude_database_tag = false
-
-  ## If true, no CREATE DATABASE queries will be sent.  Set to true when using
-  ## Telegraf with a user without permissions to create databases or when the
-  ## database already exists.
-  # skip_database_creation = false
-
-  ## Name of existing retention policy to write to.  Empty string writes to
-  ## the default retention policy.  Only takes effect when using HTTP.
-  # retention_policy = ""
-
-  ## The value of this tag will be used to determine the retention policy.  If this
-  ## tag is not set the 'retention_policy' option is used as the default.
-  # retention_policy_tag = ""
-
-  ## If true, the 'retention_policy_tag' will not be included in the written metric.
-  # exclude_retention_policy_tag = false
-
-  ## Write consistency (clusters only), can be: "any", "one", "quorum", "all".
-  ## Only takes effect when using HTTP.
-  # write_consistency = "any"
-
-  ## Timeout for HTTP messages.
-  # timeout = "5s"
-
-  ## HTTP Basic Auth
-  # username = "telegraf"
-  # password = "metricsmetricsmetricsmetrics"
-
-  ## HTTP User-Agent
-  # user_agent = "telegraf"
-
-  ## UDP payload size is the maximum packet size to send.
-  # udp_payload = "512B"
-
-  ## Optional TLS Config for use on HTTP connections.
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-
-  ## HTTP Proxy override, if unset values the standard proxy environment
-  ## variables are consulted to determine which proxy, if any, should be used.
-  # http_proxy = "http://corporate.proxy:3128"
-
-  ## Additional HTTP headers
-  # http_headers = {"X-Special-Header" = "Special-Value"}
-
-  ## HTTP Content-Encoding for write request body, can be set to "gzip" to
-  ## compress body or "identity" to apply no encoding.
-  # content_encoding = "gzip"
-
-  ## When true, Telegraf will output unsigned integers as unsigned values,
-  ## i.e.: "42u".  You will need a version of InfluxDB supporting unsigned
-  ## integer values.  Enabling this option will result in field type errors if
-  ## existing data has been written.
-  # influx_uint_support = false
-`
+func (*InfluxDB) SampleConfig() string {
+	return sampleConfig
+}
 
 func (i *InfluxDB) Connect() error {
 	ctx := context.Background()
 
-	urls := make([]string, 0, len(i.URLs))
-	urls = append(urls, i.URLs...)
-	if i.URL != "" {
-		urls = append(urls, i.URL)
+	if len(i.URLs) == 0 {
+		i.URLs = []string{defaultURL}
 	}
 
-	if len(urls) == 0 {
-		urls = append(urls, defaultURL)
-	}
-
-	for _, u := range urls {
+	for _, u := range i.URLs {
 		parts, err := url.Parse(u)
 		if err != nil {
-			return fmt.Errorf("error parsing url [%q]: %v", u, err)
+			return fmt.Errorf("error parsing url [%q]: %w", u, err)
 		}
 
 		var proxy *url.URL
 		if len(i.HTTPProxy) > 0 {
 			proxy, err = url.Parse(i.HTTPProxy)
 			if err != nil {
-				return fmt.Errorf("error parsing proxy_url [%s]: %v", i.HTTPProxy, err)
+				return fmt.Errorf("error parsing proxy_url [%s]: %w", i.HTTPProxy, err)
+			}
+		}
+
+		var localIP *net.IPAddr
+		var localPort int
+		if i.LocalAddr != "" {
+			var err error
+			// Resolve the local address into IP address and the given port if any
+			addr, sPort, err := net.SplitHostPort(i.LocalAddr)
+			if err != nil {
+				if !strings.Contains(err.Error(), "missing port") {
+					return fmt.Errorf("invalid local address: %w", err)
+				}
+				addr = i.LocalAddr
+			}
+			localIP, err = net.ResolveIPAddr("ip", addr)
+			if err != nil {
+				return fmt.Errorf("cannot resolve local address: %w", err)
+			}
+
+			if sPort != "" {
+				p, err := strconv.ParseUint(sPort, 10, 16)
+				if err != nil {
+					return fmt.Errorf("invalid port: %w", err)
+				}
+				localPort = int(p)
 			}
 		}
 
 		switch parts.Scheme {
 		case "udp", "udp4", "udp6":
-			c, err := i.udpClient(parts)
+			var c Client
+			var err error
+			if i.LocalAddr == "" {
+				c, err = i.udpClient(parts, nil)
+			} else {
+				c, err = i.udpClient(parts, &net.UDPAddr{IP: localIP.IP, Port: localPort, Zone: localIP.Zone})
+			}
 			if err != nil {
 				return err
 			}
 
 			i.clients = append(i.clients, c)
 		case "http", "https", "unix":
-			c, err := i.httpClient(ctx, parts, proxy)
+			var c Client
+			var err error
+			if i.LocalAddr == "" {
+				c, err = i.httpClient(ctx, parts, nil, proxy)
+			} else {
+				c, err = i.httpClient(ctx, parts, &net.TCPAddr{IP: localIP.IP, Port: localPort, Zone: localIP.Zone}, proxy)
+			}
 			if err != nil {
 				return err
 			}
@@ -198,14 +162,6 @@ func (i *InfluxDB) Close() error {
 	return nil
 }
 
-func (i *InfluxDB) Description() string {
-	return "Configuration for sending metrics to InfluxDB"
-}
-
-func (i *InfluxDB) SampleConfig() string {
-	return sampleConfig
-}
-
 // Write sends metrics to one of the configured servers, logging each
 // unsuccessful. If all servers fail, return an error.
 func (i *InfluxDB) Write(metrics []telegraf.Metric) error {
@@ -223,21 +179,18 @@ func (i *InfluxDB) Write(metrics []telegraf.Metric) error {
 
 		i.Log.Errorf("When writing to [%s]: %v", client.URL(), err)
 
-		switch apiError := err.(type) {
-		case *DatabaseNotFoundError:
+		var apiError *DatabaseNotFoundError
+		if errors.As(err, &apiError) {
 			if i.SkipDatabaseCreation {
 				continue
 			}
 			// retry control
 			// error so the write is retried
-			err := client.CreateDatabase(ctx, apiError.Database)
-			if err != nil {
-				i.Log.Errorf("When writing to [%s]: database %q not found and failed to recreate",
-					client.URL(), apiError.Database)
-			} else {
+			if err := client.CreateDatabase(ctx, apiError.Database); err == nil {
 				return errors.New("database created; retry write")
 			}
-		default:
+			i.Log.Errorf("When writing to [%s]: database %q not found and failed to recreate", client.URL(), apiError.Database)
+		} else {
 			allErrorsAreDatabaseNotFoundErrors = false
 		}
 	}
@@ -249,30 +202,48 @@ func (i *InfluxDB) Write(metrics []telegraf.Metric) error {
 	return errors.New("could not write any address")
 }
 
-func (i *InfluxDB) udpClient(url *url.URL) (Client, error) {
-	config := &UDPConfig{
-		URL:            url,
+func (i *InfluxDB) udpClient(address *url.URL, localAddr *net.UDPAddr) (Client, error) {
+	serializer := &influx.Serializer{
+		UintSupport:   i.InfluxUintSupport,
+		OmitTimestamp: i.OmitTimestamp,
+	}
+	if err := serializer.Init(); err != nil {
+		return nil, err
+	}
+
+	udpConfig := &UDPConfig{
+		URL:            address,
+		LocalAddr:      localAddr,
 		MaxPayloadSize: int(i.UDPPayload),
-		Serializer:     i.newSerializer(),
+		Serializer:     serializer,
 		Log:            i.Log,
 	}
 
-	c, err := i.CreateUDPClientF(config)
+	c, err := i.CreateUDPClientF(udpConfig)
 	if err != nil {
-		return nil, fmt.Errorf("error creating UDP client [%s]: %v", url, err)
+		return nil, fmt.Errorf("error creating UDP client [%s]: %w", address, err)
 	}
 
 	return c, nil
 }
 
-func (i *InfluxDB) httpClient(ctx context.Context, url *url.URL, proxy *url.URL) (Client, error) {
+func (i *InfluxDB) httpClient(ctx context.Context, address *url.URL, localAddr *net.TCPAddr, proxy *url.URL) (Client, error) {
 	tlsConfig, err := i.ClientConfig.TLSConfig()
 	if err != nil {
 		return nil, err
 	}
 
-	config := &HTTPConfig{
-		URL:                       url,
+	serializer := &influx.Serializer{
+		UintSupport:   i.InfluxUintSupport,
+		OmitTimestamp: i.OmitTimestamp,
+	}
+	if err := serializer.Init(); err != nil {
+		return nil, err
+	}
+
+	httpConfig := &HTTPConfig{
+		URL:                       address,
+		LocalAddr:                 localAddr,
 		Timeout:                   time.Duration(i.Timeout),
 		TLSConfig:                 tlsConfig,
 		UserAgent:                 i.UserAgent,
@@ -289,13 +260,13 @@ func (i *InfluxDB) httpClient(ctx context.Context, url *url.URL, proxy *url.URL)
 		RetentionPolicyTag:        i.RetentionPolicyTag,
 		ExcludeRetentionPolicyTag: i.ExcludeRetentionPolicyTag,
 		Consistency:               i.WriteConsistency,
-		Serializer:                i.newSerializer(),
+		Serializer:                serializer,
 		Log:                       i.Log,
 	}
 
-	c, err := i.CreateHTTPClientF(config)
+	c, err := i.CreateHTTPClientF(httpConfig)
 	if err != nil {
-		return nil, fmt.Errorf("error creating HTTP client [%s]: %v", url, err)
+		return nil, fmt.Errorf("error creating HTTP client [%s]: %w", address, err)
 	}
 
 	if !i.SkipDatabaseCreation {
@@ -307,15 +278,6 @@ func (i *InfluxDB) httpClient(ctx context.Context, url *url.URL, proxy *url.URL)
 	}
 
 	return c, nil
-}
-
-func (i *InfluxDB) newSerializer() *influx.Serializer {
-	serializer := influx.NewSerializer()
-	if i.InfluxUintSupport {
-		serializer.SetFieldTypeSupport(influx.UintSupport)
-	}
-
-	return serializer
 }
 
 func init() {

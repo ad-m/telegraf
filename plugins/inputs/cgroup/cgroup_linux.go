@@ -1,10 +1,10 @@
 //go:build linux
-// +build linux
 
 package cgroup
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -30,7 +30,6 @@ func (g *CGroup) Gather(acc telegraf.Accumulator) error {
 			acc.AddError(err)
 		}
 	}
-
 	return nil
 }
 
@@ -55,7 +54,11 @@ func (g *CGroup) gatherDir(acc telegraf.Accumulator, dir string) error {
 
 		fd := fileData{data: raw, path: file.path}
 		if err := fd.parse(fields); err != nil {
-			return err
+			if !g.logged[file.path] {
+				acc.AddError(err)
+			}
+			g.logged[file.path] = true
+			continue
 		}
 	}
 
@@ -106,6 +109,8 @@ func (g *CGroup) generateDirs(list chan<- pathInfo) {
 }
 
 func (g *CGroup) generateFiles(dir string, list chan<- pathInfo) {
+	dir = strings.Replace(dir, "\\", "\\\\", -1)
+
 	defer close(list)
 	for _, file := range g.Files {
 		// getting all file paths that match the pattern 'dir + file'
@@ -169,8 +174,8 @@ type fileFormat struct {
 	parser  func(measurement string, fields map[string]interface{}, b []byte)
 }
 
-const keyPattern = "[[:alnum:]:_]+"
-const valuePattern = "[\\d-]+"
+const keyPattern = "[[:alnum:]:_.]+"
+const valuePattern = "(?:max|[\\d-\\.]+)"
 
 var fileFormats = [...]fileFormat{
 	// 	VAL\n
@@ -200,9 +205,9 @@ var fileFormats = [...]fileFormat{
 	// 	VAL0 VAL1 ...\n
 	{
 		name:    "Space separated values",
-		pattern: "^(" + valuePattern + " )+\n$",
+		pattern: "^(" + valuePattern + " ?)+\n$",
 		parser: func(measurement string, fields map[string]interface{}, b []byte) {
-			re := regexp.MustCompile("(" + valuePattern + ") ")
+			re := regexp.MustCompile("(" + valuePattern + ")")
 			matches := re.FindAllStringSubmatch(string(b), -1)
 			for i, v := range matches {
 				fields[measurement+"."+strconv.Itoa(i)] = numberOrString(v[1])
@@ -224,12 +229,65 @@ var fileFormats = [...]fileFormat{
 			}
 		},
 	},
+	// 	NAME0 KEY0=VAL0 ...\n
+	// 	NAME1 KEY1=VAL1 ...\n
+	// 	...
+	{
+		name:    "Equal sign separated key-value pairs,  multiple lines with name",
+		pattern: fmt.Sprintf("^(%s( %s=%s)+\n)+$", keyPattern, keyPattern, valuePattern),
+		parser: func(measurement string, fields map[string]interface{}, b []byte) {
+			lines := strings.Split(string(b), "\n")
+			for _, line := range lines {
+				f := strings.Fields(line)
+				if len(f) == 0 {
+					continue
+				}
+				name := f[0]
+				for _, field := range f[1:] {
+					k, v, found := strings.Cut(field, "=")
+					if found {
+						fields[strings.Join([]string{measurement, name, k}, ".")] = numberOrString(v)
+					}
+				}
+			}
+		},
+	},
+	// 	KEY0=VAL0 KEY1=VAL1 ...\n
+	{
+		name:    "Equal sign separated key-value pairs on a single line",
+		pattern: fmt.Sprintf("^(%s=%s ?)+\n$", keyPattern, valuePattern),
+		parser: func(measurement string, fields map[string]interface{}, b []byte) {
+			f := strings.Fields(string(b))
+			if len(f) == 0 {
+				return
+			}
+			for _, field := range f {
+				k, v, found := strings.Cut(field, "=")
+				if found {
+					fields[strings.Join([]string{measurement, k}, ".")] = numberOrString(v)
+				}
+			}
+		},
+	},
 }
 
 func numberOrString(s string) interface{} {
 	i, err := strconv.ParseInt(s, 10, 64)
 	if err == nil {
 		return i
+	}
+	if s == "max" {
+		return int64(math.MaxInt64)
+	}
+
+	// Care should be taken to always interpret each field as the same type on every cycle.
+	// *.pressure files follow the PSI format and contain numbers with fractional parts
+	// that always have a decimal separator, even when the fractional part is 0 (e.g., "0.00"),
+	// thus they will always be interpreted as floats.
+	// https://www.kernel.org/doc/Documentation/accounting/psi.txt
+	f, err := strconv.ParseFloat(s, 64)
+	if err == nil {
+		return f
 	}
 
 	return s

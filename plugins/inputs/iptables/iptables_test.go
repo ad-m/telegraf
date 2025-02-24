@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package iptables
 
@@ -94,7 +93,7 @@ func TestIptables_Gather(t *testing.T) {
 				`Chain FORWARD (policy ACCEPT 58 packets, 5096 bytes)
 		                pkts      bytes target     prot opt in     out     source               destination
 		                300     4520 RETURN     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0  /* bar */
-		                400     4520 RETURN     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0 
+		                400     4520 RETURN     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0
 		                500     4520 RETURN     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0 /* foobar */
 		                `,
 			},
@@ -152,8 +151,6 @@ func TestIptables_Gather(t *testing.T) {
 						a a ACCEPT all -- * * 1.3.5.7 0.0.0.0/0 /* test */
 						a a CLASSIFY all -- * * 1.3.5.7 0.0.0.0/0 /* test2 */ CLASSIFY set 1:4
 						`},
-			tags:   []map[string]string{},
-			fields: [][]map[string]interface{}{},
 		},
 		{ // 11 - all target and ports
 			table:  "all_recv",
@@ -178,7 +175,7 @@ func TestIptables_Gather(t *testing.T) {
 			ipt := &Iptables{
 				Table:  tt.table,
 				Chains: tt.chains,
-				lister: func(table, chain string) (string, error) {
+				lister: func(string, string) (string, error) {
 					if len(tt.values) > 0 {
 						v := tt.values[0]
 						tt.values = tt.values[1:]
@@ -242,7 +239,7 @@ func TestIptables_Gather_listerError(t *testing.T) {
 	ipt := &Iptables{
 		Table:  "nat",
 		Chains: []string{"foo", "bar"},
-		lister: func(table, chain string) (string, error) {
+		lister: func(string, string) (string, error) {
 			return "", errFoo
 		},
 	}

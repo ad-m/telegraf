@@ -1,122 +1,105 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package regex
 
 import (
-	"regexp"
+	_ "embed"
+	"fmt"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/processors"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 type Regex struct {
-	Tags       []converter
-	Fields     []converter
-	regexCache map[string]*regexp.Regexp
+	Tags         []converter     `toml:"tags"`
+	Fields       []converter     `toml:"fields"`
+	TagRename    []converter     `toml:"tag_rename"`
+	FieldRename  []converter     `toml:"field_rename"`
+	MetricRename []converter     `toml:"metric_rename"`
+	Log          telegraf.Logger `toml:"-"`
 }
 
-type converter struct {
-	Key         string
-	Pattern     string
-	Replacement string
-	ResultKey   string
-	Append      bool
-}
-
-const sampleConfig = `
-  ## Tag and field conversions defined in a separate sub-tables
-  # [[processors.regex.tags]]
-  #   ## Tag to change
-  #   key = "resp_code"
-  #   ## Regular expression to match on a tag value
-  #   pattern = "^(\\d)\\d\\d$"
-  #   ## Matches of the pattern will be replaced with this string.  Use ${1}
-  #   ## notation to use the text of the first submatch.
-  #   replacement = "${1}xx"
-
-  # [[processors.regex.fields]]
-  #   ## Field to change
-  #   key = "request"
-  #   ## All the power of the Go regular expressions available here
-  #   ## For example, named subgroups
-  #   pattern = "^/api(?P<method>/[\\w/]+)\\S*"
-  #   replacement = "${method}"
-  #   ## If result_key is present, a new field will be created
-  #   ## instead of changing existing field
-  #   result_key = "method"
-
-  ## Multiple conversions may be applied for one field sequentially
-  ## Let's extract one more value
-  # [[processors.regex.fields]]
-  #   key = "request"
-  #   pattern = ".*category=(\\w+).*"
-  #   replacement = "${1}"
-  #   result_key = "search_category"
-`
-
-func NewRegex() *Regex {
-	return &Regex{
-		regexCache: make(map[string]*regexp.Regexp),
-	}
-}
-
-func (r *Regex) SampleConfig() string {
+func (*Regex) SampleConfig() string {
 	return sampleConfig
 }
 
-func (r *Regex) Description() string {
-	return "Transforms tag and field values with regex pattern"
+func (r *Regex) Init() error {
+	// Compile the regular expressions
+	for i := range r.Tags {
+		if err := r.Tags[i].setup(convertTags, r.Log); err != nil {
+			return fmt.Errorf("'tags' %w", err)
+		}
+	}
+	for i := range r.Fields {
+		if err := r.Fields[i].setup(convertFields, r.Log); err != nil {
+			return fmt.Errorf("'fields' %w", err)
+		}
+	}
+
+	for i, c := range r.TagRename {
+		if c.Key != "" {
+			r.Log.Info("'tag_rename' section contains a key which is ignored during processing")
+		}
+		if err := r.TagRename[i].setup(convertTagRename, r.Log); err != nil {
+			return fmt.Errorf("'tag_rename' %w", err)
+		}
+	}
+
+	for i, c := range r.FieldRename {
+		if c.Key != "" {
+			r.Log.Info("'field_rename' section contains a key which is ignored during processing")
+		}
+
+		if err := r.FieldRename[i].setup(convertFieldRename, r.Log); err != nil {
+			return fmt.Errorf("'field_rename' %w", err)
+		}
+	}
+
+	for i, c := range r.MetricRename {
+		if c.Key != "" {
+			r.Log.Info("'metric_rename' section contains a key which is ignored during processing")
+		}
+
+		if c.ResultKey != "" {
+			r.Log.Info("'metric_rename' section contains a 'result_key' ignored during processing as metrics will ALWAYS the name")
+		}
+
+		if err := r.MetricRename[i].setup(convertMetricRename, r.Log); err != nil {
+			return fmt.Errorf("'metric_rename' %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (r *Regex) Apply(in ...telegraf.Metric) []telegraf.Metric {
 	for _, metric := range in {
-		for _, converter := range r.Tags {
-			if value, ok := metric.GetTag(converter.Key); ok {
-				if key, newValue := r.convert(converter, value); newValue != "" {
-					if converter.Append {
-						if v, ok := metric.GetTag(key); ok {
-							newValue = v + newValue
-						}
-					}
-					metric.AddTag(key, newValue)
-				}
-			}
+		for _, c := range r.Tags {
+			c.apply(metric)
 		}
 
-		for _, converter := range r.Fields {
-			if value, ok := metric.GetField(converter.Key); ok {
-				switch value := value.(type) {
-				case string:
-					if key, newValue := r.convert(converter, value); newValue != "" {
-						metric.AddField(key, newValue)
-					}
-				}
-			}
+		for _, c := range r.Fields {
+			c.apply(metric)
+		}
+
+		for _, c := range r.TagRename {
+			c.apply(metric)
+		}
+
+		for _, c := range r.FieldRename {
+			c.apply(metric)
+		}
+
+		for _, c := range r.MetricRename {
+			c.apply(metric)
 		}
 	}
 
 	return in
 }
 
-func (r *Regex) convert(c converter, src string) (string, string) {
-	regex, compiled := r.regexCache[c.Pattern]
-	if !compiled {
-		regex = regexp.MustCompile(c.Pattern)
-		r.regexCache[c.Pattern] = regex
-	}
-
-	value := ""
-	if c.ResultKey == "" || regex.MatchString(src) {
-		value = regex.ReplaceAllString(src, c.Replacement)
-	}
-
-	if c.ResultKey != "" {
-		return c.ResultKey, value
-	}
-
-	return c.Key, value
-}
-
 func init() {
-	processors.Add("regex", func() telegraf.Processor {
-		return NewRegex()
-	})
+	processors.Add("regex", func() telegraf.Processor { return &Regex{} })
 }

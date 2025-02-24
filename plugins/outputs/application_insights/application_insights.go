@@ -1,16 +1,23 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package application_insights
 
 import (
+	_ "embed"
+	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"time"
-	"unsafe"
+
+	"github.com/microsoft/ApplicationInsights-Go/appinsights"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	"github.com/microsoft/ApplicationInsights-Go/appinsights"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 type TelemetryTransmitter interface {
 	Track(appinsights.Telemetry)
@@ -34,43 +41,13 @@ type ApplicationInsights struct {
 	diagMsgListener   appinsights.DiagnosticsMessageListener
 }
 
-var (
-	sampleConfig = `
-  ## Instrumentation key of the Application Insights resource.
-  instrumentation_key = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxx"
-  
-  ## Regions that require endpoint modification https://docs.microsoft.com/en-us/azure/azure-monitor/app/custom-endpoints
-  # endpoint_url = "https://dc.services.visualstudio.com/v2/track"
-
-  ## Timeout for closing (default: 5s).
-  # timeout = "5s"
-
-  ## Enable additional diagnostic logging.
-  # enable_diagnostic_logging = false
-
-  ## Context Tag Sources add Application Insights context tags to a tag value.
-  ##
-  ## For list of allowed context tag keys see:
-  ## https://github.com/microsoft/ApplicationInsights-Go/blob/master/appinsights/contracts/contexttagkeys.go
-  # [outputs.application_insights.context_tag_sources]
-  #   "ai.cloud.role" = "kubernetes_container_name"
-  #   "ai.cloud.roleInstance" = "kubernetes_pod_name"
-`
-	is32Bit        bool
-	is32BitChecked bool
-)
-
-func (a *ApplicationInsights) SampleConfig() string {
+func (*ApplicationInsights) SampleConfig() string {
 	return sampleConfig
-}
-
-func (a *ApplicationInsights) Description() string {
-	return "Send metrics to Azure Application Insights"
 }
 
 func (a *ApplicationInsights) Connect() error {
 	if a.InstrumentationKey == "" {
-		return fmt.Errorf("instrumentation key is required")
+		return errors.New("instrumentation key is required")
 	}
 
 	if a.transmitter == nil {
@@ -141,7 +118,11 @@ func (a *ApplicationInsights) createTelemetry(metric telegraf.Metric) []appinsig
 	return a.createTelemetryForUnusedFields(metric, nil)
 }
 
-func (a *ApplicationInsights) createSimpleMetricTelemetry(metric telegraf.Metric, fieldName string, useFieldNameInTelemetryName bool) *appinsights.MetricTelemetry {
+func (a *ApplicationInsights) createSimpleMetricTelemetry(
+	metric telegraf.Metric,
+	fieldName string,
+	useFieldNameInTelemetryName bool,
+) *appinsights.MetricTelemetry {
 	telemetryValue, err := getFloat64TelemetryPropertyValue([]string{fieldName}, metric, nil)
 	if err != nil {
 		return nil
@@ -185,9 +166,13 @@ func (a *ApplicationInsights) createAggregateMetricTelemetry(metric telegraf.Met
 	// We attempt to set min, max, variance and stddev fields but do not really care if they are not present--
 	// they are not essential for aggregate metric.
 	// By convention AppInsights prefers stddev over variance, so to be consistent, we test for stddev after testing for variance.
+	//nolint:errcheck // see above
 	telemetry.Min, _ = getFloat64TelemetryPropertyValue([]string{"min"}, metric, &usedFields)
+	//nolint:errcheck // see above
 	telemetry.Max, _ = getFloat64TelemetryPropertyValue([]string{"max"}, metric, &usedFields)
+	//nolint:errcheck // see above
 	telemetry.Variance, _ = getFloat64TelemetryPropertyValue([]string{"variance"}, metric, &usedFields)
+	//nolint:errcheck // see above
 	telemetry.StdDev, _ = getFloat64TelemetryPropertyValue([]string{"stddev"}, metric, &usedFields)
 
 	return telemetry, usedFields
@@ -242,7 +227,7 @@ func getFloat64TelemetryPropertyValue(
 		return metricValue, nil
 	}
 
-	return 0.0, fmt.Errorf("no field from the candidate list was found in the metric")
+	return 0.0, errors.New("no field from the candidate list was found in the metric")
 }
 
 func getIntTelemetryPropertyValue(
@@ -268,7 +253,7 @@ func getIntTelemetryPropertyValue(
 		return metricValue, nil
 	}
 
-	return 0, fmt.Errorf("no field from the candidate list was found in the metric")
+	return 0, errors.New("no field from the candidate list was found in the metric")
 }
 
 func contains(set []string, val string) bool {
@@ -296,20 +281,10 @@ func toFloat64(value interface{}) (float64, error) {
 }
 
 func toInt(value interface{}) (int, error) {
-	if !is32BitChecked {
-		is32BitChecked = true
-		var i int
-		if unsafe.Sizeof(i) == 4 {
-			is32Bit = true
-		} else {
-			is32Bit = false
-		}
-	}
-
 	// Out of all Golang numerical types Telegraf only uses int64, unit64 and float64 for fields
 	switch v := value.(type) {
 	case uint64:
-		if is32Bit {
+		if strconv.IntSize == 32 {
 			if v > math.MaxInt32 {
 				return 0, fmt.Errorf("value [%d] out of range of 32-bit integers", v)
 			}
@@ -322,7 +297,7 @@ func toInt(value interface{}) (int, error) {
 		return int(v), nil
 
 	case int64:
-		if is32Bit {
+		if strconv.IntSize == 32 {
 			if v > math.MaxInt32 || v < math.MinInt32 {
 				return 0, fmt.Errorf("value [%d] out of range of 32-bit integers", v)
 			}

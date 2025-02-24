@@ -1,52 +1,34 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package rethinkdb
 
 import (
+	_ "embed"
 	"fmt"
 	"net/url"
 	"sync"
 
+	"gopkg.in/gorethink/gorethink.v3"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
-
-	"gopkg.in/gorethink/gorethink.v3"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
+var localhost = &server{url: &url.URL{Host: "127.0.0.1:28015"}}
+
 type RethinkDB struct {
-	Servers []string
+	Servers []string `toml:"servers"`
 }
 
-var sampleConfig = `
-  ## An array of URI to gather stats about. Specify an ip or hostname
-  ## with optional port add password. ie,
-  ##   rethinkdb://user:auth_key@10.10.3.30:28105,
-  ##   rethinkdb://10.10.3.33:18832,
-  ##   10.0.0.1:10000, etc.
-  servers = ["127.0.0.1:28015"]
-  ##
-  ## If you use actual rethinkdb of > 2.3.0 with username/password authorization,
-  ## protocol have to be named "rethinkdb2" - it will use 1_0 H.
-  # servers = ["rethinkdb2://username:password@127.0.0.1:28015"]
-  ##
-  ## If you use older versions of rethinkdb (<2.2) with auth_key, protocol
-  ## have to be named "rethinkdb".
-  # servers = ["rethinkdb://username:auth_key@127.0.0.1:28015"]
-`
-
-func (r *RethinkDB) SampleConfig() string {
+func (*RethinkDB) SampleConfig() string {
 	return sampleConfig
 }
 
-func (r *RethinkDB) Description() string {
-	return "Read metrics from one or many RethinkDB servers"
-}
-
-var localhost = &Server{URL: &url.URL{Host: "127.0.0.1:28015"}}
-
-// Reads stats from all configured servers accumulates stats.
-// Returns one of the errors encountered while gather stats (if any).
 func (r *RethinkDB) Gather(acc telegraf.Accumulator) error {
 	if len(r.Servers) == 0 {
-		return r.gatherServer(localhost, acc)
+		return gatherServer(localhost, acc)
 	}
 
 	var wg sync.WaitGroup
@@ -54,7 +36,7 @@ func (r *RethinkDB) Gather(acc telegraf.Accumulator) error {
 	for _, serv := range r.Servers {
 		u, err := url.Parse(serv)
 		if err != nil {
-			acc.AddError(fmt.Errorf("unable to parse to address '%s': %s", serv, err))
+			acc.AddError(fmt.Errorf("unable to parse to address %q: %w", serv, err))
 			continue
 		} else if u.Scheme == "" {
 			// fallback to simple string based address (i.e. "10.0.0.1:10000")
@@ -63,7 +45,7 @@ func (r *RethinkDB) Gather(acc telegraf.Accumulator) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			acc.AddError(r.gatherServer(&Server{URL: u}, acc))
+			acc.AddError(gatherServer(&server{url: u}, acc))
 		}()
 	}
 
@@ -72,23 +54,23 @@ func (r *RethinkDB) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func (r *RethinkDB) gatherServer(server *Server, acc telegraf.Accumulator) error {
+func gatherServer(server *server, acc telegraf.Accumulator) error {
 	var err error
 	connectOpts := gorethink.ConnectOpts{
-		Address:       server.URL.Host,
+		Address:       server.url.Host,
 		DiscoverHosts: false,
 	}
-	if server.URL.User != nil {
-		pwd, set := server.URL.User.Password()
+	if server.url.User != nil {
+		pwd, set := server.url.User.Password()
 		if set && pwd != "" {
 			connectOpts.AuthKey = pwd
 			connectOpts.HandshakeVersion = gorethink.HandshakeV0_4
 		}
 	}
-	if server.URL.Scheme == "rethinkdb2" && server.URL.User != nil {
-		pwd, set := server.URL.User.Password()
+	if server.url.Scheme == "rethinkdb2" && server.url.User != nil {
+		pwd, set := server.url.User.Password()
 		if set && pwd != "" {
-			connectOpts.Username = server.URL.User.Username()
+			connectOpts.Username = server.url.User.Username()
 			connectOpts.Password = pwd
 			connectOpts.HandshakeVersion = gorethink.HandshakeV1_0
 		}
@@ -96,7 +78,7 @@ func (r *RethinkDB) gatherServer(server *Server, acc telegraf.Accumulator) error
 
 	server.session, err = gorethink.Connect(connectOpts)
 	if err != nil {
-		return fmt.Errorf("unable to connect to RethinkDB, %s", err.Error())
+		return fmt.Errorf("unable to connect to RethinkDB: %w", err)
 	}
 	defer server.session.Close()
 

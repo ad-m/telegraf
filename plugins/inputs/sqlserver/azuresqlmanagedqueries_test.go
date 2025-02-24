@@ -1,13 +1,16 @@
 package sqlserver
 
 import (
-	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
 	"os"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/testutil"
 )
 
-func TestAzureSQL_Managed_ResourceStats_Query(t *testing.T) {
+func TestAzureSQLIntegration_Managed_ResourceStats_Query(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -17,9 +20,10 @@ func TestAzureSQL_Managed_ResourceStats_Query(t *testing.T) {
 	}
 
 	connectionString := os.Getenv("AZURESQL_MI_CONNECTION_STRING")
+	sl := config.NewSecret([]byte(connectionString))
 
 	server := &SQLServer{
-		Servers:      []string{connectionString},
+		Servers:      []*config.Secret{&sl},
 		IncludeQuery: []string{"AzureSQLMIResourceStats"},
 		AuthMethod:   "connection_string",
 		DatabaseType: "AzureSQLManagedInstance",
@@ -36,11 +40,11 @@ func TestAzureSQL_Managed_ResourceStats_Query(t *testing.T) {
 	require.True(t, acc.HasTag("sqlserver_azure_db_resource_stats", "replica_updateability"))
 
 	// This query should only return one row
-	require.Equal(t, 1, len(acc.Metrics))
+	require.Len(t, acc.Metrics, 1)
 	server.Stop()
 }
 
-func TestAzureSQL_Managed_ResourceGovernance_Query(t *testing.T) {
+func TestAzureSQLIntegration_Managed_ResourceGovernance_Query(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -50,9 +54,10 @@ func TestAzureSQL_Managed_ResourceGovernance_Query(t *testing.T) {
 	}
 
 	connectionString := os.Getenv("AZURESQL_MI_CONNECTION_STRING")
+	sl := config.NewSecret([]byte(connectionString))
 
 	server := &SQLServer{
-		Servers:      []string{connectionString},
+		Servers:      []*config.Secret{&sl},
 		IncludeQuery: []string{"AzureSQLMIResourceGovernance"},
 		AuthMethod:   "connection_string",
 		DatabaseType: "AzureSQLManagedInstance",
@@ -81,7 +86,7 @@ func TestAzureSQL_Managed_ResourceGovernance_Query(t *testing.T) {
 	server.Stop()
 }
 
-func TestAzureSQL_Managed_DatabaseIO_Query(t *testing.T) {
+func TestAzureSQLIntegration_Managed_DatabaseIO_Query(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -91,9 +96,10 @@ func TestAzureSQL_Managed_DatabaseIO_Query(t *testing.T) {
 	}
 
 	connectionString := os.Getenv("AZURESQL_MI_CONNECTION_STRING")
+	sl := config.NewSecret([]byte(connectionString))
 
 	server := &SQLServer{
-		Servers:      []string{connectionString},
+		Servers:      []*config.Secret{&sl},
 		IncludeQuery: []string{"AzureSQLMIDatabaseIO"},
 		AuthMethod:   "connection_string",
 		DatabaseType: "AzureSQLManagedInstance",
@@ -106,6 +112,7 @@ func TestAzureSQL_Managed_DatabaseIO_Query(t *testing.T) {
 
 	require.True(t, acc.HasMeasurement("sqlserver_database_io"))
 	require.True(t, acc.HasTag("sqlserver_database_io", "sql_instance"))
+	require.True(t, acc.HasTag("sqlserver_database_io", "database_name"))
 	require.True(t, acc.HasTag("sqlserver_database_io", "physical_filename"))
 	require.True(t, acc.HasTag("sqlserver_database_io", "logical_filename"))
 	require.True(t, acc.HasTag("sqlserver_database_io", "file_type"))
@@ -122,7 +129,7 @@ func TestAzureSQL_Managed_DatabaseIO_Query(t *testing.T) {
 	server.Stop()
 }
 
-func TestAzureSQL_Managed_ServerProperties_Query(t *testing.T) {
+func TestAzureSQLIntegration_Managed_ServerProperties_Query(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -132,9 +139,10 @@ func TestAzureSQL_Managed_ServerProperties_Query(t *testing.T) {
 	}
 
 	connectionString := os.Getenv("AZURESQL_MI_CONNECTION_STRING")
+	sl := config.NewSecret([]byte(connectionString))
 
 	server := &SQLServer{
-		Servers:      []string{connectionString},
+		Servers:      []*config.Secret{&sl},
 		IncludeQuery: []string{"AzureSQLMIServerProperties"},
 		AuthMethod:   "connection_string",
 		DatabaseType: "AzureSQLManagedInstance",
@@ -165,11 +173,11 @@ func TestAzureSQL_Managed_ServerProperties_Query(t *testing.T) {
 	require.True(t, acc.HasTag("sqlserver_server_properties", "replica_updateability"))
 
 	// This query should only return one row
-	require.Equal(t, 1, len(acc.Metrics))
+	require.Len(t, acc.Metrics, 1)
 	server.Stop()
 }
 
-func TestAzureSQL_Managed_OsWaitStats_Query(t *testing.T) {
+func TestAzureSQLIntegration_Managed_OsWaitStats_Query(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -179,9 +187,10 @@ func TestAzureSQL_Managed_OsWaitStats_Query(t *testing.T) {
 	}
 
 	connectionString := os.Getenv("AZURESQL_MI_CONNECTION_STRING")
+	sl := config.NewSecret([]byte(connectionString))
 
 	server := &SQLServer{
-		Servers:      []string{connectionString},
+		Servers:      []*config.Secret{&sl},
 		IncludeQuery: []string{"AzureSQLMIOsWaitstats"},
 		AuthMethod:   "connection_string",
 		DatabaseType: "AzureSQLManagedInstance",
@@ -206,7 +215,7 @@ func TestAzureSQL_Managed_OsWaitStats_Query(t *testing.T) {
 	server.Stop()
 }
 
-func TestAzureSQL_Managed_MemoryClerks_Query(t *testing.T) {
+func TestAzureSQLIntegration_Managed_MemoryClerks_Query(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -216,9 +225,10 @@ func TestAzureSQL_Managed_MemoryClerks_Query(t *testing.T) {
 	}
 
 	connectionString := os.Getenv("AZURESQL_MI_CONNECTION_STRING")
+	sl := config.NewSecret([]byte(connectionString))
 
 	server := &SQLServer{
-		Servers:      []string{connectionString},
+		Servers:      []*config.Secret{&sl},
 		IncludeQuery: []string{"AzureSQLMIMemoryClerks"},
 		AuthMethod:   "connection_string",
 		DatabaseType: "AzureSQLManagedInstance",
@@ -238,7 +248,7 @@ func TestAzureSQL_Managed_MemoryClerks_Query(t *testing.T) {
 	server.Stop()
 }
 
-func TestAzureSQL_Managed_PerformanceCounters_Query(t *testing.T) {
+func TestAzureSQLIntegration_Managed_PerformanceCounters_Query(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -248,9 +258,10 @@ func TestAzureSQL_Managed_PerformanceCounters_Query(t *testing.T) {
 	}
 
 	connectionString := os.Getenv("AZURESQL_MI_CONNECTION_STRING")
+	sl := config.NewSecret([]byte(connectionString))
 
 	server := &SQLServer{
-		Servers:      []string{connectionString},
+		Servers:      []*config.Secret{&sl},
 		IncludeQuery: []string{"AzureSQLMIPerformanceCounters"},
 		AuthMethod:   "connection_string",
 		DatabaseType: "AzureSQLManagedInstance",
@@ -273,7 +284,7 @@ func TestAzureSQL_Managed_PerformanceCounters_Query(t *testing.T) {
 	server.Stop()
 }
 
-func TestAzureSQL_Managed_Requests_Query(t *testing.T) {
+func TestAzureSQLIntegration_Managed_Requests_Query(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -283,9 +294,10 @@ func TestAzureSQL_Managed_Requests_Query(t *testing.T) {
 	}
 
 	connectionString := os.Getenv("AZURESQL_MI_CONNECTION_STRING")
+	sl := config.NewSecret([]byte(connectionString))
 
 	server := &SQLServer{
-		Servers:      []string{connectionString},
+		Servers:      []*config.Secret{&sl},
 		IncludeQuery: []string{"AzureSQLMIRequests"},
 		AuthMethod:   "connection_string",
 		DatabaseType: "AzureSQLManagedInstance",
@@ -331,7 +343,7 @@ func TestAzureSQL_Managed_Requests_Query(t *testing.T) {
 	server.Stop()
 }
 
-func TestAzureSQL_Managed_Schedulers_Query(t *testing.T) {
+func TestAzureSQLIntegration_Managed_Schedulers_Query(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -341,9 +353,10 @@ func TestAzureSQL_Managed_Schedulers_Query(t *testing.T) {
 	}
 
 	connectionString := os.Getenv("AZURESQL_MI_CONNECTION_STRING")
+	sl := config.NewSecret([]byte(connectionString))
 
 	server := &SQLServer{
-		Servers:      []string{connectionString},
+		Servers:      []*config.Secret{&sl},
 		IncludeQuery: []string{"AzureSQLMISchedulers"},
 		AuthMethod:   "connection_string",
 		DatabaseType: "AzureSQLManagedInstance",

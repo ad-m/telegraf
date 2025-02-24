@@ -1,6 +1,7 @@
 package snmp
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -9,6 +10,16 @@ import (
 
 	"github.com/gosnmp/gosnmp"
 )
+
+// Connection is an interface which wraps a *gosnmp.GoSNMP object.
+// We interact through an interface so we can mock it out in tests.
+type Connection interface {
+	Host() string
+	// BulkWalkAll(string) ([]gosnmp.SnmpPDU, error)
+	Walk(string, gosnmp.WalkFunc) error
+	Get(oids []string) (*gosnmp.SnmpPacket, error)
+	Reconnect() error
+}
 
 // GosnmpWrapper wraps a *gosnmp.GoSNMP object so we can use it as a snmpConnection.
 type GosnmpWrapper struct {
@@ -22,42 +33,11 @@ func (gs GosnmpWrapper) Host() string {
 
 // Walk wraps GoSNMP.Walk() or GoSNMP.BulkWalk(), depending on whether the
 // connection is using SNMPv1 or newer.
-// Also, if any error is encountered, it will just once reconnect and try again.
 func (gs GosnmpWrapper) Walk(oid string, fn gosnmp.WalkFunc) error {
-	var err error
-	// On error, retry once.
-	// Unfortunately we can't distinguish between an error returned by gosnmp, and one returned by the walk function.
-	for i := 0; i < 2; i++ {
-		if gs.Version == gosnmp.Version1 {
-			err = gs.GoSNMP.Walk(oid, fn)
-		} else {
-			err = gs.GoSNMP.BulkWalk(oid, fn)
-		}
-		if err == nil {
-			return nil
-		}
-		if err := gs.GoSNMP.Connect(); err != nil {
-			return fmt.Errorf("reconnecting: %w", err)
-		}
+	if gs.Version == gosnmp.Version1 {
+		return gs.GoSNMP.Walk(oid, fn)
 	}
-	return err
-}
-
-// Get wraps GoSNMP.GET().
-// If any error is encountered, it will just once reconnect and try again.
-func (gs GosnmpWrapper) Get(oids []string) (*gosnmp.SnmpPacket, error) {
-	var err error
-	var pkt *gosnmp.SnmpPacket
-	for i := 0; i < 2; i++ {
-		pkt, err = gs.GoSNMP.Get(oids)
-		if err == nil {
-			return pkt, nil
-		}
-		if err := gs.GoSNMP.Connect(); err != nil {
-			return nil, fmt.Errorf("reconnecting: %w", err)
-		}
-	}
-	return nil, err
+	return gs.GoSNMP.BulkWalk(oid, fn)
 }
 
 func NewWrapper(s ClientConfig) (GosnmpWrapper, error) {
@@ -67,6 +47,8 @@ func NewWrapper(s ClientConfig) (GosnmpWrapper, error) {
 
 	gs.Retries = s.Retries
 
+	gs.UseUnconnectedUDPSocket = s.UnconnectedUDPSocket
+
 	switch s.Version {
 	case 3:
 		gs.Version = gosnmp.Version3
@@ -75,7 +57,7 @@ func NewWrapper(s ClientConfig) (GosnmpWrapper, error) {
 	case 1:
 		gs.Version = gosnmp.Version1
 	default:
-		return GosnmpWrapper{}, fmt.Errorf("invalid version")
+		return GosnmpWrapper{}, errors.New("invalid version")
 	}
 
 	if s.Version < 3 {
@@ -103,7 +85,7 @@ func NewWrapper(s ClientConfig) (GosnmpWrapper, error) {
 		case "authpriv":
 			gs.MsgFlags = gosnmp.AuthPriv
 		default:
-			return GosnmpWrapper{}, fmt.Errorf("invalid secLevel")
+			return GosnmpWrapper{}, errors.New("invalid secLevel")
 		}
 
 		sp.UserName = s.SecName
@@ -124,10 +106,17 @@ func NewWrapper(s ClientConfig) (GosnmpWrapper, error) {
 		case "":
 			sp.AuthenticationProtocol = gosnmp.NoAuth
 		default:
-			return GosnmpWrapper{}, fmt.Errorf("invalid authProtocol")
+			return GosnmpWrapper{}, errors.New("invalid authProtocol")
 		}
 
-		sp.AuthenticationPassphrase = s.AuthPassword
+		if !s.AuthPassword.Empty() {
+			p, err := s.AuthPassword.Get()
+			if err != nil {
+				return GosnmpWrapper{}, fmt.Errorf("getting authentication password failed: %w", err)
+			}
+			sp.AuthenticationPassphrase = p.String()
+			p.Destroy()
+		}
 
 		switch strings.ToLower(s.PrivProtocol) {
 		case "des":
@@ -145,15 +134,19 @@ func NewWrapper(s ClientConfig) (GosnmpWrapper, error) {
 		case "":
 			sp.PrivacyProtocol = gosnmp.NoPriv
 		default:
-			return GosnmpWrapper{}, fmt.Errorf("invalid privProtocol")
+			return GosnmpWrapper{}, errors.New("invalid privProtocol")
 		}
 
-		sp.PrivacyPassphrase = s.PrivPassword
-
+		if !s.PrivPassword.Empty() {
+			p, err := s.PrivPassword.Get()
+			if err != nil {
+				return GosnmpWrapper{}, fmt.Errorf("getting private password failed: %w", err)
+			}
+			sp.PrivacyPassphrase = p.String()
+			p.Destroy()
+		}
 		sp.AuthoritativeEngineID = s.EngineID
-
 		sp.AuthoritativeEngineBoots = s.EngineBoots
-
 		sp.AuthoritativeEngineTime = s.EngineTime
 	}
 	return gs, nil
@@ -196,5 +189,13 @@ func (gs *GosnmpWrapper) SetAgent(agent string) error {
 		return fmt.Errorf("parsing port: %w", err)
 	}
 	gs.Port = uint16(port)
+	return nil
+}
+
+func (gs GosnmpWrapper) Reconnect() error {
+	if gs.Conn == nil {
+		return gs.Connect()
+	}
+
 	return nil
 }

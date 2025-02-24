@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
+	"github.com/influxdata/telegraf/plugins/serializers"
 )
 
 var defaultTags = map[string]string{
@@ -55,9 +55,9 @@ func TestGraphiteTags(t *testing.T) {
 	tags2 := buildTags(m2.Tags())
 	tags3 := buildTags(m3.Tags())
 
-	assert.Equal(t, "192_168_0_1", tags1)
-	assert.Equal(t, "first.second.192_168_0_1", tags2)
-	assert.Equal(t, "first.second", tags3)
+	require.Equal(t, "192_168_0_1", tags1)
+	require.Equal(t, "first.second.192_168_0_1", tags2)
+	require.Equal(t, "first.second", tags3)
 }
 
 func TestSerializeMetricNoHost(t *testing.T) {
@@ -73,7 +73,9 @@ func TestSerializeMetricNoHost(t *testing.T) {
 	m := metric.New("cpu", tags, fields, now)
 
 	s := GraphiteSerializer{}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
@@ -82,7 +84,7 @@ func TestSerializeMetricNoHost(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeMetricNoHostWithTagSupport(t *testing.T) {
@@ -101,7 +103,9 @@ func TestSerializeMetricNoHostWithTagSupport(t *testing.T) {
 		TagSupport: true,
 		Separator:  ".",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
@@ -110,7 +114,7 @@ func TestSerializeMetricNoHostWithTagSupport(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeMetricHost(t *testing.T) {
@@ -127,7 +131,10 @@ func TestSerializeMetricHost(t *testing.T) {
 	m := metric.New("cpu", tags, fields, now)
 
 	s := GraphiteSerializer{}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
+
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
@@ -136,7 +143,7 @@ func TestSerializeMetricHost(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeMetricHostWithMultipleTemplates(t *testing.T) {
@@ -153,24 +160,23 @@ func TestSerializeMetricHostWithMultipleTemplates(t *testing.T) {
 	m1 := metric.New("cpu", tags, fields, now)
 	m2 := metric.New("new_cpu", tags, fields, now)
 
-	templates, defaultTemplate, err := InitGraphiteTemplates([]string{
-		"cp* tags.measurement.host.field",
-		"new_cpu tags.host.measurement.field",
-	})
-	assert.NoError(t, err)
-	assert.Equal(t, defaultTemplate, "")
-
 	s := GraphiteSerializer{
-		Templates: templates,
+		Templates: []string{
+			"cp* tags.measurement.host.field",
+			"new_cpu tags.host.measurement.field",
+		},
 	}
+	require.NoError(t, s.Init())
+	require.Empty(t, s.Template)
 
-	buf, _ := s.Serialize(m1)
-	buf2, _ := s.Serialize(m2)
+	buf, err := s.Serialize(m1)
+	require.NoError(t, err)
+	buf2, err := s.Serialize(m2)
+	require.NoError(t, err)
 
 	buf = append(buf, buf2...)
 
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
-	assert.NoError(t, err)
 
 	expS := []string{
 		fmt.Sprintf("cpu0.us-west-2.cpu.localhost.usage_idle 91.5 %d", now.Unix()),
@@ -180,7 +186,7 @@ func TestSerializeMetricHostWithMultipleTemplates(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeMetricHostWithMultipleTemplatesWithDefault(t *testing.T) {
@@ -197,25 +203,23 @@ func TestSerializeMetricHostWithMultipleTemplatesWithDefault(t *testing.T) {
 	m1 := metric.New("cpu", tags, fields, now)
 	m2 := metric.New("new_cpu", tags, fields, now)
 
-	templates, defaultTemplate, err := InitGraphiteTemplates([]string{
-		"cp* tags.measurement.host.field",
-		"tags.host.measurement.field",
-	})
-	assert.NoError(t, err)
-	assert.Equal(t, defaultTemplate, "tags.host.measurement.field")
-
 	s := GraphiteSerializer{
-		Templates: templates,
-		Template:  defaultTemplate,
+		Templates: []string{
+			"cp* tags.measurement.host.field",
+			"tags.host.measurement.field",
+		},
 	}
+	require.NoError(t, s.Init())
+	require.Equal(t, "tags.host.measurement.field", s.Template)
 
-	buf, _ := s.Serialize(m1)
-	buf2, _ := s.Serialize(m2)
+	buf, err := s.Serialize(m1)
+	require.NoError(t, err)
+	buf2, err := s.Serialize(m2)
+	require.NoError(t, err)
 
 	buf = append(buf, buf2...)
 
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
-	assert.NoError(t, err)
 
 	expS := []string{
 		fmt.Sprintf("cpu0.us-west-2.cpu.localhost.usage_idle 91.5 %d", now.Unix()),
@@ -225,7 +229,7 @@ func TestSerializeMetricHostWithMultipleTemplatesWithDefault(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeMetricHostWithTagSupport(t *testing.T) {
@@ -245,7 +249,10 @@ func TestSerializeMetricHostWithTagSupport(t *testing.T) {
 		TagSupport: true,
 		Separator:  ".",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
@@ -254,7 +261,7 @@ func TestSerializeMetricHostWithTagSupport(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 // test that a field named "value" gets ignored.
@@ -271,13 +278,16 @@ func TestSerializeValueField(t *testing.T) {
 	m := metric.New("cpu", tags, fields, now)
 
 	s := GraphiteSerializer{}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("localhost.cpu0.us-west-2.cpu 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeValueFieldWithTagSupport(t *testing.T) {
@@ -296,13 +306,16 @@ func TestSerializeValueFieldWithTagSupport(t *testing.T) {
 		TagSupport: true,
 		Separator:  ".",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("cpu;cpu=cpu0;datacenter=us-west-2;host=localhost 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 // test that a field named "value" gets ignored in middle of template.
@@ -321,13 +334,16 @@ func TestSerializeValueField2(t *testing.T) {
 	s := GraphiteSerializer{
 		Template: "host.field.tags.measurement",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("localhost.cpu0.us-west-2.cpu 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeValueString(t *testing.T) {
@@ -345,9 +361,12 @@ func TestSerializeValueString(t *testing.T) {
 	s := GraphiteSerializer{
 		Template: "host.field.tags.measurement",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
-	assert.Equal(t, "", mS[0])
+	require.Equal(t, "", mS[0])
 }
 
 func TestSerializeValueStringWithTagSupport(t *testing.T) {
@@ -366,9 +385,12 @@ func TestSerializeValueStringWithTagSupport(t *testing.T) {
 		TagSupport: true,
 		Separator:  ".",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
-	assert.Equal(t, "", mS[0])
+	require.Equal(t, "", mS[0])
 }
 
 func TestSerializeValueBoolean(t *testing.T) {
@@ -387,7 +409,10 @@ func TestSerializeValueBoolean(t *testing.T) {
 	s := GraphiteSerializer{
 		Template: "host.field.tags.measurement",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
@@ -396,7 +421,7 @@ func TestSerializeValueBoolean(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeValueBooleanWithTagSupport(t *testing.T) {
@@ -416,7 +441,10 @@ func TestSerializeValueBooleanWithTagSupport(t *testing.T) {
 		TagSupport: true,
 		Separator:  ".",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
@@ -425,7 +453,7 @@ func TestSerializeValueBooleanWithTagSupport(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeValueUnsigned(t *testing.T) {
@@ -437,6 +465,8 @@ func TestSerializeValueUnsigned(t *testing.T) {
 	m := metric.New("mem", tags, fields, now)
 
 	s := GraphiteSerializer{}
+	require.NoError(t, s.Init())
+
 	buf, err := s.Serialize(m)
 	require.NoError(t, err)
 
@@ -459,13 +489,16 @@ func TestSerializeFieldWithSpaces(t *testing.T) {
 	s := GraphiteSerializer{
 		Template: "host.tags.measurement.field",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("localhost.cpu0.us-west-2.cpu.field_with_spaces 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeFieldWithSpacesWithTagSupport(t *testing.T) {
@@ -484,13 +517,16 @@ func TestSerializeFieldWithSpacesWithTagSupport(t *testing.T) {
 		TagSupport: true,
 		Separator:  ".",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("cpu.field_with_spaces;cpu=cpu0;datacenter=us-west-2;host=localhost 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 // test that tags with spaces get fixed.
@@ -509,13 +545,16 @@ func TestSerializeTagWithSpaces(t *testing.T) {
 	s := GraphiteSerializer{
 		Template: "host.tags.measurement.field",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("localhost.cpu_0.us-west-2.cpu.field_with_spaces 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeTagWithSpacesWithTagSupport(t *testing.T) {
@@ -534,13 +573,16 @@ func TestSerializeTagWithSpacesWithTagSupport(t *testing.T) {
 		TagSupport: true,
 		Separator:  ".",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("cpu.field_with_spaces;cpu=cpu_0;datacenter=us-west-2;host=localhost 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeTagWithSpacesWithTagSupportCompatibleSanitize(t *testing.T) {
@@ -560,13 +602,16 @@ func TestSerializeTagWithSpacesWithTagSupportCompatibleSanitize(t *testing.T) {
 		TagSanitizeMode: "compatible",
 		Separator:       ".",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("cpu.field_with_spaces;cpu=cpu\\ 0;datacenter=us-west-2;host=localhost 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 // test that a field named "value" gets ignored at beginning of template.
@@ -585,13 +630,16 @@ func TestSerializeValueField3(t *testing.T) {
 	s := GraphiteSerializer{
 		Template: "field.host.tags.measurement",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("localhost.cpu0.us-west-2.cpu 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 // test that a field named "value" gets ignored at beginning of template.
@@ -610,13 +658,16 @@ func TestSerializeValueField5(t *testing.T) {
 	s := GraphiteSerializer{
 		Template: template5,
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
 		fmt.Sprintf("localhost.us-west-2.cpu0.cpu 91.5 %d", now.Unix()),
 	}
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeMetricPrefix(t *testing.T) {
@@ -633,7 +684,10 @@ func TestSerializeMetricPrefix(t *testing.T) {
 	m := metric.New("cpu", tags, fields, now)
 
 	s := GraphiteSerializer{Prefix: "prefix"}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
@@ -642,7 +696,7 @@ func TestSerializeMetricPrefix(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeMetricPrefixWithTagSupport(t *testing.T) {
@@ -663,7 +717,10 @@ func TestSerializeMetricPrefixWithTagSupport(t *testing.T) {
 		TagSupport: true,
 		Separator:  ".",
 	}
-	buf, _ := s.Serialize(m)
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
 	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
 
 	expS := []string{
@@ -672,7 +729,35 @@ func TestSerializeMetricPrefixWithTagSupport(t *testing.T) {
 	}
 	sort.Strings(mS)
 	sort.Strings(expS)
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
+}
+
+// test that a custom regex allowing `|` works
+func TestSerializeCustomRegex(t *testing.T) {
+	now := time.Now()
+	tags := map[string]string{
+		"host":       "localhost",
+		"cpu":        "cpu0",
+		"datacenter": "|us-west-2|",
+	}
+	fields := map[string]interface{}{
+		"value": float64(91.5),
+	}
+	m := metric.New("cpu", tags, fields, now)
+
+	s := GraphiteSerializer{
+		StrictRegex: `[^a-zA-Z0-9-:._=|\p{L}]`,
+	}
+	require.NoError(t, s.Init())
+
+	buf, err := s.Serialize(m)
+	require.NoError(t, err)
+	mS := strings.Split(strings.TrimSpace(string(buf)), "\n")
+
+	expS := []string{
+		fmt.Sprintf("localhost.cpu0.|us-west-2|.cpu 91.5 %d", now.Unix()),
+	}
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeBucketNameNoHost(t *testing.T) {
@@ -689,7 +774,7 @@ func TestSerializeBucketNameNoHost(t *testing.T) {
 	mS := SerializeBucketName(m.Name(), m.Tags(), "", "")
 
 	expS := "cpu0.us-west-2.cpu.FIELDNAME"
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeBucketNameHost(t *testing.T) {
@@ -702,7 +787,7 @@ func TestSerializeBucketNameHost(t *testing.T) {
 	mS := SerializeBucketName(m.Name(), m.Tags(), "", "")
 
 	expS := "localhost.cpu0.us-west-2.cpu.FIELDNAME"
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestSerializeBucketNamePrefix(t *testing.T) {
@@ -715,7 +800,7 @@ func TestSerializeBucketNamePrefix(t *testing.T) {
 	mS := SerializeBucketName(m.Name(), m.Tags(), "", "prefix")
 
 	expS := "prefix.localhost.cpu0.us-west-2.cpu.FIELDNAME"
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestTemplate1(t *testing.T) {
@@ -728,7 +813,7 @@ func TestTemplate1(t *testing.T) {
 	mS := SerializeBucketName(m.Name(), m.Tags(), template1, "")
 
 	expS := "cpu0.us-west-2.localhost.cpu.FIELDNAME"
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestTemplate2(t *testing.T) {
@@ -741,7 +826,7 @@ func TestTemplate2(t *testing.T) {
 	mS := SerializeBucketName(m.Name(), m.Tags(), template2, "")
 
 	expS := "localhost.cpu.FIELDNAME"
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestTemplate3(t *testing.T) {
@@ -754,7 +839,7 @@ func TestTemplate3(t *testing.T) {
 	mS := SerializeBucketName(m.Name(), m.Tags(), template3, "")
 
 	expS := "localhost.cpu0.us-west-2.FIELDNAME"
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestTemplate4(t *testing.T) {
@@ -767,7 +852,7 @@ func TestTemplate4(t *testing.T) {
 	mS := SerializeBucketName(m.Name(), m.Tags(), template4, "")
 
 	expS := "localhost.cpu0.us-west-2.cpu"
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestTemplate6(t *testing.T) {
@@ -780,7 +865,7 @@ func TestTemplate6(t *testing.T) {
 	mS := SerializeBucketName(m.Name(), m.Tags(), template6, "")
 
 	expS := "localhost.cpu0.us-west-2.cpu.FIELDNAME"
-	assert.Equal(t, expS, mS)
+	require.Equal(t, expS, mS)
 }
 
 func TestClean(t *testing.T) {
@@ -864,11 +949,14 @@ func TestClean(t *testing.T) {
 		},
 	}
 
-	s := GraphiteSerializer{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			s := GraphiteSerializer{}
+			require.NoError(t, s.Init())
+
 			m := metric.New(tt.metricName, tt.tags, tt.fields, now)
-			actual, _ := s.Serialize(m)
+			actual, err := s.Serialize(m)
+			require.NoError(t, err)
 			require.Equal(t, tt.expected, string(actual))
 		})
 	}
@@ -955,14 +1043,17 @@ func TestCleanWithTagsSupport(t *testing.T) {
 		},
 	}
 
-	s := GraphiteSerializer{
-		TagSupport: true,
-		Separator:  ".",
-	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			s := GraphiteSerializer{
+				TagSupport: true,
+				Separator:  ".",
+			}
+			require.NoError(t, s.Init())
+
 			m := metric.New(tt.metricName, tt.tags, tt.fields, now)
-			actual, _ := s.Serialize(m)
+			actual, err := s.Serialize(m)
+			require.NoError(t, err)
 			require.Equal(t, tt.expected, string(actual))
 		})
 	}
@@ -1049,15 +1140,18 @@ func TestCleanWithTagsSupportCompatibleSanitize(t *testing.T) {
 		},
 	}
 
-	s := GraphiteSerializer{
-		TagSupport:      true,
-		TagSanitizeMode: "compatible",
-		Separator:       ".",
-	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			s := GraphiteSerializer{
+				TagSupport:      true,
+				TagSanitizeMode: "compatible",
+				Separator:       ".",
+			}
+			require.NoError(t, s.Init())
+
 			m := metric.New(tt.metricName, tt.tags, tt.fields, now)
-			actual, _ := s.Serialize(m)
+			actual, err := s.Serialize(m)
+			require.NoError(t, err)
 			require.Equal(t, tt.expected, string(actual))
 		})
 	}
@@ -1081,11 +1175,14 @@ func TestSerializeBatch(t *testing.T) {
 		},
 	}
 
-	s := GraphiteSerializer{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			s := GraphiteSerializer{}
+			require.NoError(t, s.Init())
+
 			m := metric.New(tt.metricName, tt.tags, tt.fields, now)
-			actual, _ := s.SerializeBatch([]telegraf.Metric{m, m})
+			actual, err := s.SerializeBatch([]telegraf.Metric{m, m})
+			require.NoError(t, err)
 			require.Equal(t, tt.expected, string(actual))
 		})
 	}
@@ -1109,15 +1206,41 @@ func TestSerializeBatchWithTagsSupport(t *testing.T) {
 		},
 	}
 
-	s := GraphiteSerializer{
-		TagSupport: true,
-		Separator:  ".",
-	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			s := GraphiteSerializer{
+				TagSupport: true,
+				Separator:  ".",
+			}
+			require.NoError(t, s.Init())
+
 			m := metric.New(tt.metricName, tt.tags, tt.fields, now)
-			actual, _ := s.SerializeBatch([]telegraf.Metric{m, m})
+			actual, err := s.SerializeBatch([]telegraf.Metric{m, m})
+			require.NoError(t, err)
 			require.Equal(t, tt.expected, string(actual))
 		})
+	}
+}
+
+func BenchmarkSerialize(b *testing.B) {
+	s := &GraphiteSerializer{}
+	require.NoError(b, s.Init())
+	metrics := serializers.BenchmarkMetrics(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := s.Serialize(metrics[i%len(metrics)])
+		require.NoError(b, err)
+	}
+}
+
+func BenchmarkSerializeBatch(b *testing.B) {
+	s := &GraphiteSerializer{}
+	require.NoError(b, s.Init())
+	m := serializers.BenchmarkMetrics(b)
+	metrics := m[:]
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := s.SerializeBatch(metrics)
+		require.NoError(b, err)
 	}
 }

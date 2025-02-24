@@ -4,24 +4,39 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
-	httpconfig "github.com/influxdata/telegraf/plugins/common/http"
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
+	common_http "github.com/influxdata/telegraf/plugins/common/http"
 	"github.com/influxdata/telegraf/plugins/common/oauth"
 	httpplugin "github.com/influxdata/telegraf/plugins/inputs/http"
-	"github.com/influxdata/telegraf/plugins/parsers"
+	"github.com/influxdata/telegraf/plugins/parsers/csv"
+	"github.com/influxdata/telegraf/plugins/parsers/influx"
+	"github.com/influxdata/telegraf/plugins/parsers/json"
+	"github.com/influxdata/telegraf/plugins/parsers/value"
 	"github.com/influxdata/telegraf/testutil"
 )
 
 func TestHTTPWithJSONFormat(t *testing.T) {
 	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/endpoint" {
-			_, _ = w.Write([]byte(simpleJSON))
+			if _, err := w.Write([]byte(simpleJSON)); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+				return
+			}
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -31,14 +46,15 @@ func TestHTTPWithJSONFormat(t *testing.T) {
 	address := fakeServer.URL + "/endpoint"
 	plugin := &httpplugin.HTTP{
 		URLs: []string{address},
+		Log:  testutil.Logger{},
 	}
 	metricName := "metricName"
 
-	p, _ := parsers.NewParser(&parsers.Config{
-		DataFormat: "json",
-		MetricName: "metricName",
+	plugin.SetParserFunc(func() (telegraf.Parser, error) {
+		p := &json.Parser{MetricName: "metricName"}
+		err := p.Init()
+		return p, err
 	})
-	plugin.SetParser(p)
 
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Init())
@@ -50,7 +66,7 @@ func TestHTTPWithJSONFormat(t *testing.T) {
 	var metric = acc.Metrics[0]
 	require.Equal(t, metric.Measurement, metricName)
 	require.Len(t, acc.Metrics[0].Fields, 1)
-	require.Equal(t, acc.Metrics[0].Fields["a"], 1.2)
+	require.InDelta(t, 1.2, acc.Metrics[0].Fields["a"], testutil.DefaultDelta)
 	require.Equal(t, acc.Metrics[0].Tags["url"], address)
 }
 
@@ -60,7 +76,48 @@ func TestHTTPHeaders(t *testing.T) {
 	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/endpoint" {
 			if r.Header.Get(header) == headerValue {
-				_, _ = w.Write([]byte(simpleJSON))
+				if _, err := w.Write([]byte(simpleJSON)); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Error(err)
+					return
+				}
+			} else {
+				w.WriteHeader(http.StatusForbidden)
+			}
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer fakeServer.Close()
+
+	address := fakeServer.URL + "/endpoint"
+	headerSecret := config.NewSecret([]byte(headerValue))
+	plugin := &httpplugin.HTTP{
+		URLs:    []string{address},
+		Headers: map[string]*config.Secret{header: &headerSecret},
+		Log:     testutil.Logger{},
+	}
+
+	plugin.SetParserFunc(func() (telegraf.Parser, error) {
+		p := &json.Parser{MetricName: "metricName"}
+		err := p.Init()
+		return p, err
+	})
+
+	var acc testutil.Accumulator
+	require.NoError(t, plugin.Init())
+	require.NoError(t, acc.GatherError(plugin.Gather))
+}
+
+func TestHTTPContentLengthHeader(t *testing.T) {
+	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/endpoint" {
+			if r.Header.Get("Content-Length") != "" {
+				if _, err := w.Write([]byte(simpleJSON)); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					t.Error(err)
+					return
+				}
 			} else {
 				w.WriteHeader(http.StatusForbidden)
 			}
@@ -73,14 +130,16 @@ func TestHTTPHeaders(t *testing.T) {
 	address := fakeServer.URL + "/endpoint"
 	plugin := &httpplugin.HTTP{
 		URLs:    []string{address},
-		Headers: map[string]string{header: headerValue},
+		Headers: map[string]*config.Secret{},
+		Body:    "{}",
+		Log:     testutil.Logger{},
 	}
 
-	p, _ := parsers.NewParser(&parsers.Config{
-		DataFormat: "json",
-		MetricName: "metricName",
+	plugin.SetParserFunc(func() (telegraf.Parser, error) {
+		p := &json.Parser{MetricName: "metricName"}
+		err := p.Init()
+		return p, err
 	})
-	plugin.SetParser(p)
 
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Init())
@@ -88,7 +147,7 @@ func TestHTTPHeaders(t *testing.T) {
 }
 
 func TestInvalidStatusCode(t *testing.T) {
-	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer fakeServer.Close()
@@ -96,14 +155,14 @@ func TestInvalidStatusCode(t *testing.T) {
 	address := fakeServer.URL + "/endpoint"
 	plugin := &httpplugin.HTTP{
 		URLs: []string{address},
+		Log:  testutil.Logger{},
 	}
 
-	metricName := "metricName"
-	p, _ := parsers.NewParser(&parsers.Config{
-		DataFormat: "json",
-		MetricName: metricName,
+	plugin.SetParserFunc(func() (telegraf.Parser, error) {
+		p := &json.Parser{MetricName: "metricName"}
+		err := p.Init()
+		return p, err
 	})
-	plugin.SetParser(p)
 
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Init())
@@ -111,7 +170,7 @@ func TestInvalidStatusCode(t *testing.T) {
 }
 
 func TestSuccessStatusCodes(t *testing.T) {
-	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer fakeServer.Close()
@@ -120,14 +179,14 @@ func TestSuccessStatusCodes(t *testing.T) {
 	plugin := &httpplugin.HTTP{
 		URLs:               []string{address},
 		SuccessStatusCodes: []int{200, 202},
+		Log:                testutil.Logger{},
 	}
 
-	metricName := "metricName"
-	p, _ := parsers.NewParser(&parsers.Config{
-		DataFormat: "json",
-		MetricName: metricName,
+	plugin.SetParserFunc(func() (telegraf.Parser, error) {
+		p := &json.Parser{MetricName: "metricName"}
+		err := p.Init()
+		return p, err
 	})
-	plugin.SetParser(p)
 
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Init())
@@ -147,13 +206,14 @@ func TestMethod(t *testing.T) {
 	plugin := &httpplugin.HTTP{
 		URLs:   []string{fakeServer.URL},
 		Method: "POST",
+		Log:    testutil.Logger{},
 	}
 
-	p, _ := parsers.NewParser(&parsers.Config{
-		DataFormat: "json",
-		MetricName: "metricName",
+	plugin.SetParserFunc(func() (telegraf.Parser, error) {
+		p := &json.Parser{MetricName: "metricName"}
+		err := p.Init()
+		return p, err
 	})
-	plugin.SetParser(p)
 
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Init())
@@ -165,12 +225,17 @@ const simpleJSON = `
     "a": 1.2
 }
 `
+const simpleCSVWithHeader = `
+# Simple CSV with header(s)
+a,b,c
+1.2,3.1415,ok
+`
 
 func TestBodyAndContentEncoding(t *testing.T) {
 	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
 
-	address := fmt.Sprintf("http://%s", ts.Listener.Addr().String())
+	address := "http://" + ts.Listener.Addr().String()
 
 	tests := []struct {
 		name             string
@@ -182,6 +247,7 @@ func TestBodyAndContentEncoding(t *testing.T) {
 			plugin: &httpplugin.HTTP{
 				Method: "POST",
 				URLs:   []string{address},
+				Log:    testutil.Logger{},
 			},
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 				body, err := io.ReadAll(r.Body)
@@ -196,6 +262,7 @@ func TestBodyAndContentEncoding(t *testing.T) {
 				URLs:   []string{address},
 				Method: "POST",
 				Body:   "test",
+				Log:    testutil.Logger{},
 			},
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 				body, err := io.ReadAll(r.Body)
@@ -210,6 +277,7 @@ func TestBodyAndContentEncoding(t *testing.T) {
 				URLs:   []string{address},
 				Method: "GET",
 				Body:   "test",
+				Log:    testutil.Logger{},
 			},
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 				body, err := io.ReadAll(r.Body)
@@ -225,9 +293,10 @@ func TestBodyAndContentEncoding(t *testing.T) {
 				Method:          "GET",
 				Body:            "test",
 				ContentEncoding: "gzip",
+				Log:             testutil.Logger{},
 			},
 			queryHandlerFunc: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, r.Header.Get("Content-Encoding"), "gzip")
+				require.Equal(t, "gzip", r.Header.Get("Content-Encoding"))
 
 				gr, err := gzip.NewReader(r.Body)
 				require.NoError(t, err)
@@ -244,20 +313,20 @@ func TestBodyAndContentEncoding(t *testing.T) {
 				tt.queryHandlerFunc(t, w, r)
 			})
 
-			parser, err := parsers.NewParser(&parsers.Config{DataFormat: "influx"})
-			require.NoError(t, err)
-
-			tt.plugin.SetParser(parser)
+			tt.plugin.SetParserFunc(func() (telegraf.Parser, error) {
+				parser := &influx.Parser{}
+				err := parser.Init()
+				return parser, err
+			})
 
 			var acc testutil.Accumulator
 			require.NoError(t, tt.plugin.Init())
-			err = tt.plugin.Gather(&acc)
-			require.NoError(t, err)
+			require.NoError(t, tt.plugin.Gather(&acc))
 		})
 	}
 }
 
-type TestHandlerFunc func(t *testing.T, w http.ResponseWriter, r *http.Request)
+type testHandlerFunc func(t *testing.T, w http.ResponseWriter, r *http.Request)
 
 func TestOAuthClientCredentialsGrant(t *testing.T) {
 	ts := httptest.NewServer(http.NotFoundHandler())
@@ -265,22 +334,23 @@ func TestOAuthClientCredentialsGrant(t *testing.T) {
 
 	var token = "2YotnFZFEjr1zCsicMWpAA"
 
-	u, err := url.Parse(fmt.Sprintf("http://%s", ts.Listener.Addr().String()))
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
 	require.NoError(t, err)
 
 	tests := []struct {
 		name         string
 		plugin       *httpplugin.HTTP
-		tokenHandler TestHandlerFunc
-		handler      TestHandlerFunc
+		tokenHandler testHandlerFunc
+		handler      testHandlerFunc
 	}{
 		{
 			name: "no credentials",
 			plugin: &httpplugin.HTTP{
 				URLs: []string{u.String()},
+				Log:  testutil.Logger{},
 			},
 			handler: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				require.Len(t, r.Header["Authorization"], 0)
+				require.Empty(t, r.Header["Authorization"])
 				w.WriteHeader(http.StatusOK)
 			},
 		},
@@ -288,7 +358,7 @@ func TestOAuthClientCredentialsGrant(t *testing.T) {
 			name: "success",
 			plugin: &httpplugin.HTTP{
 				URLs: []string{u.String() + "/write"},
-				HTTPClientConfig: httpconfig.HTTPClientConfig{
+				HTTPClientConfig: common_http.HTTPClientConfig{
 					OAuth2Config: oauth.OAuth2Config{
 						ClientID:     "howdy",
 						ClientSecret: "secret",
@@ -296,8 +366,9 @@ func TestOAuthClientCredentialsGrant(t *testing.T) {
 						Scopes:       []string{"urn:opc:idm:__myscopes__"},
 					},
 				},
+				Log: testutil.Logger{},
 			},
-			tokenHandler: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			tokenHandler: func(t *testing.T, w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 				values := url.Values{}
 				values.Add("access_token", token)
@@ -324,8 +395,15 @@ func TestOAuthClientCredentialsGrant(t *testing.T) {
 				}
 			})
 
-			parser, _ := parsers.NewValueParser("metric", "string", "", nil)
-			tt.plugin.SetParser(parser)
+			tt.plugin.SetParserFunc(func() (telegraf.Parser, error) {
+				p := &value.Parser{
+					MetricName: "metric",
+					DataType:   "string",
+				}
+				err := p.Init()
+				return p, err
+			})
+
 			err = tt.plugin.Init()
 			require.NoError(t, err)
 
@@ -334,4 +412,135 @@ func TestOAuthClientCredentialsGrant(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestHTTPWithCSVFormat(t *testing.T) {
+	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/endpoint" {
+			if _, err := w.Write([]byte(simpleCSVWithHeader)); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+				return
+			}
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer fakeServer.Close()
+
+	address := fakeServer.URL + "/endpoint"
+	plugin := &httpplugin.HTTP{
+		URLs: []string{address},
+		Log:  testutil.Logger{},
+	}
+
+	plugin.SetParserFunc(func() (telegraf.Parser, error) {
+		parser := &csv.Parser{
+			MetricName:  "metricName",
+			SkipRows:    3,
+			ColumnNames: []string{"a", "b", "c"},
+			TagColumns:  []string{"c"},
+		}
+		err := parser.Init()
+		return parser, err
+	})
+
+	expected := []telegraf.Metric{
+		testutil.MustMetric("metricName",
+			map[string]string{
+				"url": address,
+				"c":   "ok",
+			},
+			map[string]interface{}{
+				"a": 1.2,
+				"b": 3.1415,
+			},
+			time.Unix(0, 0),
+		),
+	}
+
+	var acc testutil.Accumulator
+	require.NoError(t, plugin.Init())
+	require.NoError(t, acc.GatherError(plugin.Gather))
+	testutil.RequireMetricsEqual(t, expected, acc.GetTelegrafMetrics(), testutil.IgnoreTime())
+
+	// Run the parser a second time to test for correct stateful handling
+	acc.ClearMetrics()
+	require.NoError(t, acc.GatherError(plugin.Gather))
+	testutil.RequireMetricsEqual(t, expected, acc.GetTelegrafMetrics(), testutil.IgnoreTime())
+}
+
+const (
+	httpOverUnixScheme = "http+unix"
+)
+
+func TestConnectionOverUnixSocket(t *testing.T) {
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/data" {
+			w.Header().Set("Content-Type", "text/csv")
+			if _, err := w.Write([]byte(simpleCSVWithHeader)); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+				return
+			}
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+
+	unixListenAddr := filepath.Join(os.TempDir(), fmt.Sprintf("httptestserver.%d.sock", rand.Intn(1_000_000)))
+	t.Cleanup(func() { os.Remove(unixListenAddr) })
+
+	unixListener, err := net.Listen("unix", unixListenAddr)
+	require.NoError(t, err)
+
+	ts.Listener = unixListener
+	ts.Start()
+	defer ts.Close()
+
+	// NOTE: Remove ":" from windows filepath and replace all "\" with "/".
+	//       This is *required* so that the unix socket path plays well with unixtransport.
+	replacer := strings.NewReplacer(":", "", "\\", "/")
+	sockPath := replacer.Replace(unixListenAddr)
+
+	address := fmt.Sprintf("%s://%s:/data", httpOverUnixScheme, sockPath)
+	plugin := &httpplugin.HTTP{
+		URLs: []string{address},
+		Log:  testutil.Logger{},
+	}
+
+	plugin.SetParserFunc(func() (telegraf.Parser, error) {
+		parser := &csv.Parser{
+			MetricName:  "metricName",
+			SkipRows:    3,
+			ColumnNames: []string{"a", "b", "c"},
+			TagColumns:  []string{"c"},
+		}
+		err := parser.Init()
+		return parser, err
+	})
+
+	expected := []telegraf.Metric{
+		testutil.MustMetric("metricName",
+			map[string]string{
+				"url": address,
+				"c":   "ok",
+			},
+			map[string]interface{}{
+				"a": 1.2,
+				"b": 3.1415,
+			},
+			time.Unix(22000, 0),
+		),
+	}
+
+	var acc testutil.Accumulator
+	require.NoError(t, plugin.Init())
+	require.NoError(t, acc.GatherError(plugin.Gather))
+	testutil.RequireMetricsEqual(t, expected, acc.GetTelegrafMetrics(), testutil.IgnoreTime())
+
+	// Run the parser a second time to test for correct stateful handling
+	acc.ClearMetrics()
+	require.NoError(t, acc.GatherError(plugin.Gather))
+	testutil.RequireMetricsEqual(t, expected, acc.GetTelegrafMetrics(), testutil.IgnoreTime())
 }

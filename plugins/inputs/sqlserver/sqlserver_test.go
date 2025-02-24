@@ -1,6 +1,7 @@
 package sqlserver
 
 import (
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -8,13 +9,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/testutil"
 )
 
 func TestSqlServer_QueriesInclusionExclusion(t *testing.T) {
 	cases := []map[string]interface{}{
 		{
-			"IncludeQuery": []string{},
+			"IncludeQuery": make([]string, 0),
 			"ExcludeQuery": []string{"WaitStatsCategorized", "DatabaseIO", "ServerProperties", "MemoryClerk", "Schedulers", "VolumeSpace", "Cpu"},
 			"queries":      []string{"PerformanceCounters", "SqlRequests"},
 			"queriesTotal": 2,
@@ -32,9 +34,10 @@ func TestSqlServer_QueriesInclusionExclusion(t *testing.T) {
 			QueryVersion: 2,
 			IncludeQuery: test["IncludeQuery"].([]string),
 			ExcludeQuery: test["ExcludeQuery"].([]string),
+			Log:          testutil.Logger{},
 		}
-		require.NoError(t, initQueries(&s))
-		require.Equal(t, len(s.queries), test["queriesTotal"].(int))
+		require.NoError(t, s.initQueries())
+		require.Len(t, s.queries, test["queriesTotal"].(int))
 		for _, query := range test["queries"].([]string) {
 			require.Contains(t, s.queries, query)
 		}
@@ -44,17 +47,17 @@ func TestSqlServer_QueriesInclusionExclusion(t *testing.T) {
 func TestSqlServer_ParseMetrics(t *testing.T) {
 	var acc testutil.Accumulator
 
-	queries := make(MapQuery)
-	queries["PerformanceCounters"] = Query{ScriptName: "PerformanceCounters", Script: mockPerformanceCounters, ResultByRow: true}
-	queries["WaitStatsCategorized"] = Query{ScriptName: "WaitStatsCategorized", Script: mockWaitStatsCategorized, ResultByRow: false}
-	queries["CPUHistory"] = Query{ScriptName: "CPUHistory", Script: mockCPUHistory, ResultByRow: false}
-	queries["DatabaseIO"] = Query{ScriptName: "DatabaseIO", Script: mockDatabaseIO, ResultByRow: false}
-	queries["DatabaseSize"] = Query{ScriptName: "DatabaseSize", Script: mockDatabaseSize, ResultByRow: false}
-	queries["DatabaseStats"] = Query{ScriptName: "DatabaseStats", Script: mockDatabaseStats, ResultByRow: false}
-	queries["DatabaseProperties"] = Query{ScriptName: "DatabaseProperties", Script: mockDatabaseProperties, ResultByRow: false}
-	queries["VolumeSpace"] = Query{ScriptName: "VolumeSpace", Script: mockVolumeSpace, ResultByRow: false}
-	queries["MemoryClerk"] = Query{ScriptName: "MemoryClerk", Script: mockMemoryClerk, ResultByRow: false}
-	queries["PerformanceMetrics"] = Query{ScriptName: "PerformanceMetrics", Script: mockPerformanceMetrics, ResultByRow: false}
+	queries := make(mapQuery)
+	queries["PerformanceCounters"] = query{ScriptName: "PerformanceCounters", Script: mockPerformanceCounters, ResultByRow: true}
+	queries["WaitStatsCategorized"] = query{ScriptName: "WaitStatsCategorized", Script: mockWaitStatsCategorized, ResultByRow: false}
+	queries["CPUHistory"] = query{ScriptName: "CPUHistory", Script: mockCPUHistory, ResultByRow: false}
+	queries["DatabaseIO"] = query{ScriptName: "DatabaseIO", Script: mockDatabaseIO, ResultByRow: false}
+	queries["DatabaseSize"] = query{ScriptName: "DatabaseSize", Script: mockDatabaseSize, ResultByRow: false}
+	queries["DatabaseStats"] = query{ScriptName: "DatabaseStats", Script: mockDatabaseStats, ResultByRow: false}
+	queries["DatabaseProperties"] = query{ScriptName: "DatabaseProperties", Script: mockDatabaseProperties, ResultByRow: false}
+	queries["VolumeSpace"] = query{ScriptName: "VolumeSpace", Script: mockVolumeSpace, ResultByRow: false}
+	queries["MemoryClerk"] = query{ScriptName: "MemoryClerk", Script: mockMemoryClerk, ResultByRow: false}
+	queries["PerformanceMetrics"] = query{ScriptName: "PerformanceMetrics", Script: mockPerformanceMetrics, ResultByRow: false}
 
 	var headers, mock, row []string
 	var tags = make(map[string]string)
@@ -107,19 +110,23 @@ func TestSqlServer_ParseMetrics(t *testing.T) {
 	}
 }
 
-func TestSqlServer_MultipleInstanceIntegration(t *testing.T) {
+func TestSqlServerIntegration_MultipleInstance(t *testing.T) {
 	// Invoke Gather() from two separate configurations and
 	//  confirm they don't interfere with each other
 	t.Skip("Skipping as unable to open tcp connection with host '127.0.0.1:1433")
 
 	testServer := "Server=127.0.0.1;Port=1433;User Id=SA;Password=ABCabc01;app name=telegraf;log=1"
+	sl := config.NewSecret([]byte(testServer))
 	s := &SQLServer{
-		Servers:      []string{testServer},
+		Servers:      []*config.Secret{&sl},
 		ExcludeQuery: []string{"MemoryClerk"},
+		Log:          testutil.Logger{},
 	}
+	sl2 := config.NewSecret([]byte(testServer))
 	s2 := &SQLServer{
-		Servers:      []string{testServer},
+		Servers:      []*config.Secret{&sl2},
 		ExcludeQuery: []string{"DatabaseSize"},
+		Log:          testutil.Logger{},
 	}
 
 	var acc, acc2 testutil.Accumulator
@@ -140,7 +147,7 @@ func TestSqlServer_MultipleInstanceIntegration(t *testing.T) {
 	require.False(t, acc2.HasMeasurement("Log size (bytes)"))
 }
 
-func TestSqlServer_MultipleInstanceWithHealthMetricIntegration(t *testing.T) {
+func TestSqlServerIntegration_MultipleInstanceWithHealthMetric(t *testing.T) {
 	// Invoke Gather() from two separate configurations and
 	// confirm they don't interfere with each other.
 	// This test is intentionally similar to TestSqlServer_MultipleInstanceIntegration.
@@ -148,14 +155,19 @@ func TestSqlServer_MultipleInstanceWithHealthMetricIntegration(t *testing.T) {
 	t.Skip("Skipping as unable to open tcp connection with host '127.0.0.1:1433")
 
 	testServer := "Server=127.0.0.1;Port=1433;User Id=SA;Password=ABCabc01;app name=telegraf;log=1"
+	sl := config.NewSecret([]byte(testServer))
 	s := &SQLServer{
-		Servers:      []string{testServer},
+		Servers:      []*config.Secret{&sl},
 		ExcludeQuery: []string{"MemoryClerk"},
+		Log:          testutil.Logger{},
 	}
+
+	sl2 := config.NewSecret([]byte(testServer))
 	s2 := &SQLServer{
-		Servers:      []string{testServer},
+		Servers:      []*config.Secret{&sl2},
 		ExcludeQuery: []string{"DatabaseSize"},
 		HealthMetric: true,
+		Log:          testutil.Logger{},
 	}
 
 	var acc, acc2 testutil.Accumulator
@@ -187,17 +199,23 @@ func TestSqlServer_HealthMetric(t *testing.T) {
 	fakeServer1 := "localhost\\fakeinstance1;Database=fakedb1;Password=ABCabc01;"
 	fakeServer2 := "localhost\\fakeinstance2;Database=fakedb2;Password=ABCabc01;"
 
+	fs1 := config.NewSecret([]byte(fakeServer1))
+	fs2 := config.NewSecret([]byte(fakeServer2))
+
 	s1 := &SQLServer{
-		Servers:      []string{fakeServer1, fakeServer2},
+		Servers:      []*config.Secret{&fs1, &fs2},
 		IncludeQuery: []string{"DatabaseSize", "MemoryClerk"},
 		HealthMetric: true,
 		AuthMethod:   "connection_string",
+		Log:          testutil.Logger{},
 	}
 
+	sl2 := config.NewSecret([]byte(fakeServer1))
 	s2 := &SQLServer{
-		Servers:      []string{fakeServer1},
+		Servers:      []*config.Secret{&sl2},
 		IncludeQuery: []string{"DatabaseSize"},
 		AuthMethod:   "connection_string",
+		Log:          testutil.Logger{},
 	}
 
 	// acc1 should have the health metric because it is specified in the config
@@ -225,16 +243,17 @@ func TestSqlServer_HealthMetric(t *testing.T) {
 }
 
 func TestSqlServer_MultipleInit(t *testing.T) {
-	s := &SQLServer{}
+	s := &SQLServer{Log: testutil.Logger{}}
 	s2 := &SQLServer{
 		ExcludeQuery: []string{"DatabaseSize"},
+		Log:          testutil.Logger{},
 	}
 
-	require.NoError(t, initQueries(s))
+	require.NoError(t, s.initQueries())
 	_, ok := s.queries["DatabaseSize"]
 	require.True(t, ok)
 
-	require.NoError(t, initQueries(s2))
+	require.NoError(t, s.initQueries())
 	_, ok = s2.queries["DatabaseSize"]
 	require.False(t, ok)
 	s.Stop()
@@ -321,25 +340,33 @@ func TestSqlServer_ConnectionString(t *testing.T) {
 	require.Equal(t, emptyDatabaseName, database)
 }
 
-func TestSqlServer_AGQueriesApplicableForDatabaseTypeSQLServer(t *testing.T) {
+func TestSqlServerIntegration_AGQueriesApplicableForDatabaseTypeSQLServer(t *testing.T) {
 	// This test case checks where Availability Group (AG / HADR) queries return an output when included for processing for DatabaseType = SQLServer
 	// And they should not be processed when DatabaseType = AzureSQLDB
 
-	// Please change the connection string to connect to relevant database when executing the test case
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
 
-	t.Skip("Skipping as unable to open tcp connection with host '127.0.0.1:1433")
+	if os.Getenv("AZURESQL_POOL_CONNECTION_STRING") == "" {
+		t.Skip("Missing environment variable AZURESQL_POOL_CONNECTION_STRING")
+	}
+	testServer := os.Getenv("AZURESQL_POOL_CONNECTION_STRING")
 
-	testServer := "Server=127.0.0.1;Port=1433;Database=testdb1;User Id=SA;Password=ABCabc01;app name=telegraf;log=1"
-
+	sl := config.NewSecret([]byte(testServer))
 	s := &SQLServer{
-		Servers:      []string{testServer},
+		Servers:      []*config.Secret{&sl},
 		DatabaseType: "SQLServer",
 		IncludeQuery: []string{"SQLServerAvailabilityReplicaStates", "SQLServerDatabaseReplicaStates"},
+		Log:          testutil.Logger{},
 	}
+
+	sl2 := config.NewSecret([]byte(testServer))
 	s2 := &SQLServer{
-		Servers:      []string{testServer},
+		Servers:      []*config.Secret{&sl2},
 		DatabaseType: "AzureSQLDB",
 		IncludeQuery: []string{"SQLServerAvailabilityReplicaStates", "SQLServerDatabaseReplicaStates"},
+		Log:          testutil.Logger{},
 	}
 
 	var acc, acc2 testutil.Accumulator
@@ -362,25 +389,38 @@ func TestSqlServer_AGQueriesApplicableForDatabaseTypeSQLServer(t *testing.T) {
 	s2.Stop()
 }
 
-func TestSqlServer_AGQueryFieldsOutputBasedOnSQLServerVersion(t *testing.T) {
-	// This test case checks where Availability Group (AG / HADR) queries return specific fields supported by corresponding SQL Server version database being connected to.
+func TestSqlServerIntegration_AGQueryFieldsOutputBasedOnSQLServerVersion(t *testing.T) {
+	// This test case checks where Availability Group (AG / HADR) queries return specific fields
+	// supported by corresponding SQL Server version database being connected to.
 
-	// Please change the connection strings to connect to relevant database when executing the test case
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
 
-	t.Skip("Skipping as unable to open tcp connection with host '127.0.0.1:1433")
+	if os.Getenv("AZURESQL_POOL_CONNECTION_STRING_2019") == "" {
+		t.Skip("Missing environment variable AZURESQL_POOL_CONNECTION_STRING_2019")
+	}
+	if os.Getenv("AZURESQL_POOL_CONNECTION_STRING_2012") == "" {
+		t.Skip("Missing environment variable AZURESQL_POOL_CONNECTION_STRING_2012")
+	}
 
-	testServer2019 := "Server=127.0.0.10;Port=1433;Database=testdb2019;User Id=SA;Password=ABCabc01;app name=telegraf;log=1"
-	testServer2012 := "Server=127.0.0.20;Port=1433;Database=testdb2012;User Id=SA;Password=ABCabc01;app name=telegraf;log=1"
+	testServer2019 := os.Getenv("AZURESQL_POOL_CONNECTION_STRING_2019")
+	testServer2012 := os.Getenv("AZURESQL_POOL_CONNECTION_STRING_2012")
+
+	sl2019 := config.NewSecret([]byte(testServer2019))
+	sl2012 := config.NewSecret([]byte(testServer2012))
 
 	s2019 := &SQLServer{
-		Servers:      []string{testServer2019},
+		Servers:      []*config.Secret{&sl2019},
 		DatabaseType: "SQLServer",
 		IncludeQuery: []string{"SQLServerAvailabilityReplicaStates", "SQLServerDatabaseReplicaStates"},
+		Log:          testutil.Logger{},
 	}
 	s2012 := &SQLServer{
-		Servers:      []string{testServer2012},
+		Servers:      []*config.Secret{&sl2012},
 		DatabaseType: "SQLServer",
 		IncludeQuery: []string{"SQLServerAvailabilityReplicaStates", "SQLServerDatabaseReplicaStates"},
+		Log:          testutil.Logger{},
 	}
 
 	var acc2019, acc2012 testutil.Accumulator
@@ -411,7 +451,10 @@ func TestSqlServer_AGQueryFieldsOutputBasedOnSQLServerVersion(t *testing.T) {
 	s2012.Stop()
 }
 
-const mockPerformanceMetrics = `measurement;servername;type;Point In Time Recovery;Available physical memory (bytes);Average pending disk IO;Average runnable tasks;Average tasks;Buffer pool rate (bytes/sec);Connection memory per connection (bytes);Memory grant pending;Page File Usage (%);Page lookup per batch request;Page split per batch request;Readahead per page read;Signal wait (%);Sql compilation per batch request;Sql recompilation per batch request;Total target memory ratio
+const mockPerformanceMetrics = `measurement;servername;type;Point In Time Recovery;Available physical memory (bytes);Average pending disk IO;` +
+	`Average runnable tasks;Average tasks;Buffer pool rate (bytes/sec);Connection memory per connection (bytes);Memory grant pending;` +
+	`Page File Usage (%);Page lookup per batch request;Page split per batch request;Readahead per page read;Signal wait (%);` +
+	`Sql compilation per batch request;Sql recompilation per batch request;Total target memory ratio
 Performance metrics;WIN8-DEV;Performance metrics;0;6353158144;0;0;7;2773;415061;0;25;229371;130;10;18;188;52;14`
 
 const mockWaitStatsCategorized = `measurement;servername;type;I/O;Latch;Lock;Network;Service broker;Memory;Buffer;CLR;XEvent;Other;Total

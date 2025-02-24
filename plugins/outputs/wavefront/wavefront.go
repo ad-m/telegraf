@@ -1,161 +1,131 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package wavefront
 
 import (
+	"context"
+	_ "embed"
+	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
+	"time"
+
+	wavefront "github.com/wavefronthq/wavefront-sdk-go/senders"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
+	common_http "github.com/influxdata/telegraf/plugins/common/http"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	wavefront "github.com/wavefronthq/wavefront-sdk-go/senders"
+	serializers_wavefront "github.com/influxdata/telegraf/plugins/serializers/wavefront"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 const maxTagLength = 254
 
+type authCSPClientCredentials struct {
+	AppID     config.Secret `toml:"app_id"`
+	AppSecret config.Secret `toml:"app_secret"`
+	OrgID     *string       `toml:"org_id"`
+}
+
 type Wavefront struct {
-	URL             string                          `toml:"url"`
-	Token           string                          `toml:"token"`
-	Host            string                          `toml:"host"`
-	Port            int                             `toml:"port"`
-	Prefix          string                          `toml:"prefix"`
-	SimpleFields    bool                            `toml:"simple_fields"`
-	MetricSeparator string                          `toml:"metric_separator"`
-	ConvertPaths    bool                            `toml:"convert_paths"`
-	ConvertBool     bool                            `toml:"convert_bool"`
-	UseRegex        bool                            `toml:"use_regex"`
-	UseStrict       bool                            `toml:"use_strict"`
-	TruncateTags    bool                            `toml:"truncate_tags"`
-	ImmediateFlush  bool                            `toml:"immediate_flush"`
-	SourceOverride  []string                        `toml:"source_override"`
-	StringToNumber  map[string][]map[string]float64 `toml:"string_to_number"`
+	URL                      string                          `toml:"url"`
+	Token                    config.Secret                   `toml:"token"`
+	CSPBaseURL               string                          `toml:"auth_csp_base_url"`
+	AuthCSPAPIToken          config.Secret                   `toml:"auth_csp_api_token"`
+	AuthCSPClientCredentials *authCSPClientCredentials       `toml:"auth_csp_client_credentials"`
+	Host                     string                          `toml:"host" deprecated:"1.28.0;1.35.0;use url instead"`
+	Port                     int                             `toml:"port" deprecated:"1.28.0;1.35.0;use url instead"`
+	Prefix                   string                          `toml:"prefix"`
+	SimpleFields             bool                            `toml:"simple_fields"`
+	MetricSeparator          string                          `toml:"metric_separator"`
+	ConvertPaths             bool                            `toml:"convert_paths"`
+	ConvertBool              bool                            `toml:"convert_bool"`
+	HTTPMaximumBatchSize     int                             `toml:"http_maximum_batch_size"`
+	UseRegex                 bool                            `toml:"use_regex"`
+	UseStrict                bool                            `toml:"use_strict"`
+	TruncateTags             bool                            `toml:"truncate_tags"`
+	ImmediateFlush           bool                            `toml:"immediate_flush"`
+	SendInternalMetrics      bool                            `toml:"send_internal_metrics"`
+	SourceOverride           []string                        `toml:"source_override"`
+	StringToNumber           map[string][]map[string]float64 `toml:"string_to_number" deprecated:"1.9.0;1.35.0;use the enum processor instead"`
+
+	common_http.HTTPClientConfig
 
 	sender wavefront.Sender
 	Log    telegraf.Logger `toml:"-"`
 }
 
-// catch many of the invalid chars that could appear in a metric or tag name
-var sanitizedChars = strings.NewReplacer(
-	"!", "-", "@", "-", "#", "-", "$", "-", "%", "-", "^", "-", "&", "-",
-	"*", "-", "(", "-", ")", "-", "+", "-", "`", "-", "'", "-", "\"", "-",
-	"[", "-", "]", "-", "{", "-", "}", "-", ":", "-", ";", "-", "<", "-",
-	">", "-", ",", "-", "?", "-", "/", "-", "\\", "-", "|", "-", " ", "-",
-	"=", "-",
-)
-
-// catch many of the invalid chars that could appear in a metric or tag name
-var strictSanitizedChars = strings.NewReplacer(
-	"!", "-", "@", "-", "#", "-", "$", "-", "%", "-", "^", "-", "&", "-",
-	"*", "-", "(", "-", ")", "-", "+", "-", "`", "-", "'", "-", "\"", "-",
-	"[", "-", "]", "-", "{", "-", "}", "-", ":", "-", ";", "-", "<", "-",
-	">", "-", "?", "-", "\\", "-", "|", "-", " ", "-", "=", "-",
-)
-
-// instead of Replacer which may miss some special characters we can use a regex pattern, but this is significantly slower than Replacer
-var sanitizedRegex = regexp.MustCompile("[^a-zA-Z\\d_.-]")
+// instead of Sanitize which may miss some special characters we can use a regex pattern, but this is significantly slower than Sanitize
+var sanitizedRegex = regexp.MustCompile(`[^a-zA-Z\d_.-]`)
 
 var tagValueReplacer = strings.NewReplacer("*", "-")
 
 var pathReplacer = strings.NewReplacer("_", "_")
 
-var sampleConfig = `
-  ## Url for Wavefront Direct Ingestion or using HTTP with Wavefront Proxy
-  ## If using Wavefront Proxy, also specify port. example: http://proxyserver:2878
-  url = "https://metrics.wavefront.com"
+func (*Wavefront) SampleConfig() string {
+	return sampleConfig
+}
 
-  ## Authentication Token for Wavefront. Only required if using Direct Ingestion
-  #token = "DUMMY_TOKEN"  
-  
-  ## DNS name of the wavefront proxy server. Do not use if url is specified
-  #host = "wavefront.example.com"
+func (w *Wavefront) parseConnectionURL() (string, error) {
+	if w.URL == "" {
+		if w.Host == "" || w.Port <= 0 {
+			return "", errors.New("no URL specified")
+		}
+		generatedURL := fmt.Sprintf("http://%s:%d", w.Host, w.Port)
+		w.Log.Warnf("translating host/port into url: %s\n", generatedURL)
+		return generatedURL, nil
+	}
 
-  ## Port that the Wavefront proxy server listens on. Do not use if url is specified
-  #port = 2878
+	u, err := url.ParseRequestURI(w.URL)
+	if err != nil {
+		return "", fmt.Errorf("could not parse the provided URL: %s", w.URL)
+	}
 
-  ## prefix for metrics keys
-  #prefix = "my.specific.prefix."
+	return u.String(), nil
+}
 
-  ## whether to use "value" for name of simple fields. default is false
-  #simple_fields = false
+func (w *Wavefront) createSender(connectionURL string, flushSeconds int) (wavefront.Sender, error) {
+	client, err := w.CreateClient(context.Background(), w.Log)
+	if err != nil {
+		return nil, err
+	}
+	options := []wavefront.Option{
+		wavefront.BatchSize(w.HTTPMaximumBatchSize),
+		wavefront.FlushIntervalSeconds(flushSeconds),
+		wavefront.HTTPClient(client),
+		wavefront.SendInternalMetrics(w.SendInternalMetrics),
+	}
 
-  ## character to use between metric and field name.  default is . (dot)
-  #metric_separator = "."
+	authOptions, err := w.makeAuthOptions()
+	if err != nil {
+		return nil, err
+	}
+	options = append(options, authOptions...)
 
-  ## Convert metric name paths to use metricSeparator character
-  ## When true will convert all _ (underscore) characters in final metric name. default is true
-  #convert_paths = true
-
-  ## Use Strict rules to sanitize metric and tag names from invalid characters
-  ## When enabled forward slash (/) and comma (,) will be accepted
-  #use_strict = false
-
-  ## Use Regex to sanitize metric and tag names from invalid characters
-  ## Regex is more thorough, but significantly slower. default is false
-  #use_regex = false
-
-  ## point tags to use as the source name for Wavefront (if none found, host will be used)
-  #source_override = ["hostname", "address", "agent_host", "node_host"]
-
-  ## whether to convert boolean values to numeric values, with false -> 0.0 and true -> 1.0. default is true
-  #convert_bool = true
-
-  ## Truncate metric tags to a total of 254 characters for the tag name value. Wavefront will reject any 
-  ## data point exceeding this limit if not truncated. Defaults to 'false' to provide backwards compatibility.
-  #truncate_tags = false
-
-  ## Flush the internal buffers after each batch. This effectively bypasses the background sending of metrics
-  ## normally done by the Wavefront SDK. This can be used if you are experiencing buffer overruns. The sending 
-  ## of metrics will block for a longer time, but this will be handled gracefully by the internal buffering in
-  ## Telegraf.
-  #immediate_flush = true
-
-  ## Define a mapping, namespaced by metric prefix, from string values to numeric values
-  ##   deprecated in 1.9; use the enum processor plugin
-  #[[outputs.wavefront.string_to_number.elasticsearch]]
-  #  green = 1.0
-  #  yellow = 0.5
-  #  red = 0.0
-`
-
-type MetricPoint struct {
-	Metric    string
-	Value     float64
-	Timestamp int64
-	Source    string
-	Tags      map[string]string
+	return wavefront.NewSender(connectionURL, options...)
 }
 
 func (w *Wavefront) Connect() error {
-	if len(w.StringToNumber) > 0 {
-		w.Log.Warn("The string_to_number option is deprecated; please use the enum processor instead")
-	}
-
 	flushSeconds := 5
 	if w.ImmediateFlush {
 		flushSeconds = 86400 // Set a very long flush interval if we're flushing directly
 	}
-	if w.URL != "" {
-		w.Log.Debug("connecting over http/https using Url: %s", w.URL)
-		sender, err := wavefront.NewDirectSender(&wavefront.DirectConfiguration{
-			Server:               w.URL,
-			Token:                w.Token,
-			FlushIntervalSeconds: flushSeconds,
-		})
-		if err != nil {
-			return fmt.Errorf("could not create Wavefront Sender for Url: %s", w.URL)
-		}
-		w.sender = sender
-	} else {
-		w.Log.Debugf("connecting over tcp using Host: %q and Port: %d", w.Host, w.Port)
-		sender, err := wavefront.NewProxySender(&wavefront.ProxyConfiguration{
-			Host:                 w.Host,
-			MetricsPort:          w.Port,
-			FlushIntervalSeconds: flushSeconds,
-		})
-		if err != nil {
-			return fmt.Errorf("could not create Wavefront Sender for Host: %q and Port: %d", w.Host, w.Port)
-		}
-		w.sender = sender
+	connectionURL, err := w.parseConnectionURL()
+	if err != nil {
+		return err
 	}
+
+	sender, err := w.createSender(connectionURL, flushSeconds)
+
+	if err != nil {
+		return errors.New("could not create Wavefront Sender for the provided url")
+	}
+
+	w.sender = sender
 
 	if w.ConvertPaths && w.MetricSeparator == "_" {
 		w.ConvertPaths = false
@@ -172,10 +142,22 @@ func (w *Wavefront) Write(metrics []telegraf.Metric) error {
 			err := w.sender.SendMetric(point.Metric, point.Value, point.Timestamp, point.Source, point.Tags)
 			if err != nil {
 				if isRetryable(err) {
-					return fmt.Errorf("wavefront sending error: %v", err)
+					// The internal buffer in the Wavefront SDK is full. To prevent data loss,
+					// we flush the buffer (which is a blocking operation) and try again.
+					w.Log.Debug("SDK buffer overrun, forcibly flushing the buffer")
+					if err = w.sender.Flush(); err != nil {
+						return fmt.Errorf("wavefront flushing error: %w", err)
+					}
+					// Try again.
+					err = w.sender.SendMetric(point.Metric, point.Value, point.Timestamp, point.Source, point.Tags)
+					if err != nil {
+						if isRetryable(err) {
+							return fmt.Errorf("wavefront sending error: %w", err)
+						}
+					}
 				}
-				w.Log.Errorf("non-retryable error during Wavefront.Write: %v", err)
-				w.Log.Debugf("Non-retryable metric data: Name: %v, Value: %v, Timestamp: %v, Source: %v, PointTags: %v ", point.Metric, point.Value, point.Timestamp, point.Source, point.Tags)
+				w.Log.Errorf("Non-retryable error during Wavefront.Write: %v", err)
+				w.Log.Debugf("Non-retryable metric data: %+v", point)
 			}
 		}
 	}
@@ -186,8 +168,8 @@ func (w *Wavefront) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (w *Wavefront) buildMetrics(m telegraf.Metric) []*MetricPoint {
-	ret := []*MetricPoint{}
+func (w *Wavefront) buildMetrics(m telegraf.Metric) []*serializers_wavefront.MetricPoint {
+	ret := make([]*serializers_wavefront.MetricPoint, 0)
 
 	for fieldName, value := range m.Fields() {
 		var name string
@@ -199,17 +181,15 @@ func (w *Wavefront) buildMetrics(m telegraf.Metric) []*MetricPoint {
 
 		if w.UseRegex {
 			name = sanitizedRegex.ReplaceAllLiteralString(name, "-")
-		} else if w.UseStrict {
-			name = strictSanitizedChars.Replace(name)
 		} else {
-			name = sanitizedChars.Replace(name)
+			name = serializers_wavefront.Sanitize(w.UseStrict, name)
 		}
 
 		if w.ConvertPaths {
 			name = pathReplacer.Replace(name)
 		}
 
-		metric := &MetricPoint{
+		metric := &serializers_wavefront.MetricPoint{
 			Metric:    name,
 			Timestamp: m.Time().Unix(),
 		}
@@ -249,7 +229,10 @@ func (w *Wavefront) buildTags(mTags map[string]string) (string, map[string]strin
 			for k, v := range mTags {
 				if k == s {
 					source = v
-					mTags["telegraf_host"] = mTags["host"]
+					if mTags["host"] != "" {
+						mTags["telegraf_host"] = mTags["host"]
+					}
+
 					sourceTagFound = true
 					delete(mTags, k)
 					break
@@ -275,10 +258,8 @@ func (w *Wavefront) buildTags(mTags map[string]string) (string, map[string]strin
 		var key string
 		if w.UseRegex {
 			key = sanitizedRegex.ReplaceAllLiteralString(k, "-")
-		} else if w.UseStrict {
-			key = strictSanitizedChars.Replace(k)
 		} else {
-			key = sanitizedChars.Replace(k)
+			key = serializers_wavefront.Sanitize(w.UseStrict, k)
 		}
 		val := tagValueReplacer.Replace(v)
 		if w.TruncateTags {
@@ -330,28 +311,79 @@ func buildValue(v interface{}, name string, w *Wavefront) (float64, error) {
 	return 0, fmt.Errorf("unexpected type: %T, with value: %v, for: %s", v, v, name)
 }
 
-func (w *Wavefront) SampleConfig() string {
-	return sampleConfig
-}
-
-func (w *Wavefront) Description() string {
-	return "Configuration for Wavefront server to send metrics to"
-}
-
 func (w *Wavefront) Close() error {
 	w.sender.Close()
 	return nil
 }
 
+func (w *Wavefront) makeAuthOptions() ([]wavefront.Option, error) {
+	if !w.Token.Empty() {
+		tsecret, err := w.Token.Get()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse token value: %w", err)
+		}
+		token := tsecret.String()
+		tsecret.Destroy()
+
+		return []wavefront.Option{
+			wavefront.APIToken(token),
+		}, nil
+	}
+
+	if !w.AuthCSPAPIToken.Empty() {
+		tsecret, err := w.AuthCSPAPIToken.Get()
+		if err != nil {
+			return nil, fmt.Errorf("failed to CSP API token value: %w", err)
+		}
+		apiToken := tsecret.String()
+		tsecret.Destroy()
+		return []wavefront.Option{
+			wavefront.CSPAPIToken(apiToken, wavefront.CSPBaseURL(w.CSPBaseURL)),
+		}, nil
+	}
+
+	if w.AuthCSPClientCredentials != nil {
+		appIDSecret, err := w.AuthCSPClientCredentials.AppID.Get()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse Client Credentials App ID value: %w", err)
+		}
+		appID := appIDSecret.String()
+		appIDSecret.Destroy()
+
+		appSecret, err := w.AuthCSPClientCredentials.AppSecret.Get()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse Client Credentials App Secret value: %w", err)
+		}
+		cspAppSecret := appSecret.String()
+		appSecret.Destroy()
+
+		options := []wavefront.CSPOption{
+			wavefront.CSPBaseURL(w.CSPBaseURL),
+		}
+
+		if w.AuthCSPClientCredentials.OrgID != nil {
+			options = append(options, wavefront.CSPOrgID(*w.AuthCSPClientCredentials.OrgID))
+		}
+		return []wavefront.Option{
+			wavefront.CSPClientCredentials(appID, cspAppSecret, options...),
+		}, nil
+	}
+
+	return nil, nil
+}
+
 func init() {
 	outputs.Add("wavefront", func() telegraf.Output {
 		return &Wavefront{
-			Token:           "DUMMY_TOKEN",
-			MetricSeparator: ".",
-			ConvertPaths:    true,
-			ConvertBool:     true,
-			TruncateTags:    false,
-			ImmediateFlush:  true,
+			MetricSeparator:      ".",
+			ConvertPaths:         true,
+			ConvertBool:          true,
+			TruncateTags:         false,
+			ImmediateFlush:       true,
+			SendInternalMetrics:  true,
+			HTTPMaximumBatchSize: 10000,
+			HTTPClientConfig:     common_http.HTTPClientConfig{Timeout: config.Duration(10 * time.Second)},
+			CSPBaseURL:           "https://console.cloud.vmware.com",
 		}
 	})
 }

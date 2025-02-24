@@ -2,7 +2,7 @@ package logrus
 
 import (
 	"io"
-	"log"
+	"log" //nolint:depguard // Allow exceptional but valid use of log here.
 	"strings"
 	"sync"
 
@@ -14,7 +14,7 @@ var once sync.Once
 type LogHook struct {
 }
 
-// Install a logging hook into the logrus standard logger, diverting all logs
+// InstallHook installs a logging hook into the logrus standard logger, diverting all logs
 // through the Telegraf logger at debug level.  This is useful for libraries
 // that directly log to the logrus system without providing an override method.
 func InstallHook() {
@@ -24,12 +24,12 @@ func InstallHook() {
 	})
 }
 
-func (h *LogHook) Fire(entry *logrus.Entry) error {
+func (*LogHook) Fire(entry *logrus.Entry) error {
 	msg := strings.ReplaceAll(entry.Message, "\n", " ")
 	log.Print("D! [logrus] ", msg)
 	return nil
 }
 
-func (h *LogHook) Levels() []logrus.Level {
+func (*LogHook) Levels() []logrus.Level {
 	return logrus.AllLevels
 }

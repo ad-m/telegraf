@@ -2,27 +2,33 @@ package instrumental
 
 import (
 	"bufio"
+	"errors"
+	"io"
 	"net"
 	"net/textproto"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/metric"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestWrite(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
-	TCPServer(t, &wg)
+	port := TCPServer(t, &wg)
 
 	i := Instrumental{
 		Host:     "127.0.0.1",
-		APIToken: "abc123token",
+		Port:     port,
+		APIToken: config.NewSecret([]byte("abc123token")),
 		Prefix:   "my.prefix",
 	}
+	require.NoError(t, i.Init())
 
 	// Default to gauge
 	m1 := metric.New(
@@ -39,7 +45,8 @@ func TestWrite(t *testing.T) {
 	)
 
 	metrics := []telegraf.Metric{m1, m2}
-	i.Write(metrics)
+	err := i.Write(metrics)
+	require.NoError(t, err)
 
 	// Counter and Histogram are increments
 	m3 := metric.New(
@@ -70,54 +77,167 @@ func TestWrite(t *testing.T) {
 	)
 
 	metrics = []telegraf.Metric{m3, m4, m5, m6}
-	i.Write(metrics)
+	err = i.Write(metrics)
+	require.NoError(t, err)
 
 	wg.Wait()
 }
 
-func TCPServer(t *testing.T, wg *sync.WaitGroup) {
-	tcpServer, _ := net.Listen("tcp", "127.0.0.1:8000")
+func TCPServer(t *testing.T, wg *sync.WaitGroup) int {
+	tcpServer, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
 	go func() {
 		defer wg.Done()
-		conn, _ := tcpServer.Accept()
-		conn.SetDeadline(time.Now().Add(1 * time.Second))
+		defer tcpServer.Close()
+
+		conn, err := tcpServer.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() {
+			if err := conn.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+
+		err = conn.SetDeadline(time.Now().Add(1 * time.Second))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
 		reader := bufio.NewReader(conn)
 		tp := textproto.NewReader(reader)
 
-		hello, _ := tp.ReadLine()
-		assert.Equal(t, "hello version go/telegraf/1.1", hello)
-		auth, _ := tp.ReadLine()
-		assert.Equal(t, "authenticate abc123token", auth)
-		conn.Write([]byte("ok\nok\n"))
+		helloExpected := "hello version go/telegraf/1.1"
+		hello, err := tp.ReadLine()
+		if err != nil {
+			t.Error(err)
+			return
+		} else if hello != helloExpected {
+			t.Errorf("expected %q, got %q", helloExpected, hello)
+			return
+		}
 
-		data1, _ := tp.ReadLine()
-		assert.Equal(t, "gauge my.prefix.192_168_0_1.mymeasurement.myfield 3.14 1289430000", data1)
-		data2, _ := tp.ReadLine()
-		assert.Equal(t, "gauge my.prefix.192_168_0_1.mymeasurement 3.14 1289430000", data2)
+		authExpected := "authenticate abc123token"
+		auth, err := tp.ReadLine()
+		if err != nil {
+			t.Error(err)
+			return
+		} else if auth != authExpected {
+			t.Errorf("expected %q, got %q", authExpected, auth)
+			return
+		}
 
-		conn, _ = tcpServer.Accept()
-		conn.SetDeadline(time.Now().Add(1 * time.Second))
+		_, err = conn.Write([]byte("ok\nok\n"))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		data1Expected := "gauge my.prefix.192_168_0_1.mymeasurement.myfield 3.14 1289430000"
+		data1, err := tp.ReadLine()
+		if err != nil {
+			t.Error(err)
+			return
+		} else if data1 != data1Expected {
+			t.Errorf("expected %q, got %q", data1Expected, data1)
+			return
+		}
+
+		data2Expected := "gauge my.prefix.192_168_0_1.mymeasurement 3.14 1289430000"
+		data2, err := tp.ReadLine()
+		if err != nil {
+			t.Error(err)
+			return
+		} else if data2 != data2Expected {
+			t.Errorf("expected %q, got %q", data2Expected, data2)
+			return
+		}
+
+		conn, err = tcpServer.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		err = conn.SetDeadline(time.Now().Add(1 * time.Second))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
 		reader = bufio.NewReader(conn)
 		tp = textproto.NewReader(reader)
 
-		hello, _ = tp.ReadLine()
-		assert.Equal(t, "hello version go/telegraf/1.1", hello)
-		auth, _ = tp.ReadLine()
-		assert.Equal(t, "authenticate abc123token", auth)
-		conn.Write([]byte("ok\nok\n"))
+		helloExpected = "hello version go/telegraf/1.1"
+		hello, err = tp.ReadLine()
+		if err != nil {
+			t.Error(err)
+			return
+		} else if hello != helloExpected {
+			t.Errorf("expected %q, got %q", helloExpected, hello)
+			return
+		}
 
-		data3, _ := tp.ReadLine()
-		assert.Equal(t, "increment my.prefix.192_168_0_1.my_histogram 3.14 1289430000", data3)
+		authExpected = "authenticate abc123token"
+		auth, err = tp.ReadLine()
+		if err != nil {
+			t.Error(err)
+			return
+		} else if auth != authExpected {
+			t.Errorf("expected %q, got %q", authExpected, auth)
+			return
+		}
 
-		data4, _ := tp.ReadLine()
-		assert.Equal(t, "increment my.prefix.192_168_0_1_8888_123.bad_metric_name 1 1289430000", data4)
+		_, err = conn.Write([]byte("ok\nok\n"))
+		if err != nil {
+			t.Error(err)
+			return
+		}
 
-		data5, _ := tp.ReadLine()
-		assert.Equal(t, "increment my.prefix.192_168_0_1.my_counter 3.14 1289430000", data5)
+		data3Expected := "increment my.prefix.192_168_0_1.my_histogram 3.14 1289430000"
+		data3, err := tp.ReadLine()
+		if err != nil {
+			t.Error(err)
+			return
+		} else if data3 != data3Expected {
+			t.Errorf("expected %q, got %q", data3Expected, data3)
+			return
+		}
 
-		data6, _ := tp.ReadLine()
-		assert.Equal(t, "", data6)
+		data4Expected := "increment my.prefix.192_168_0_1_8888_123.bad_metric_name 1 1289430000"
+		data4, err := tp.ReadLine()
+		if err != nil {
+			t.Error(err)
+			return
+		} else if data4 != data4Expected {
+			t.Errorf("expected %q, got %q", data4Expected, data4)
+			return
+		}
 
-		conn.Close()
+		data5Expected := "increment my.prefix.192_168_0_1.my_counter 3.14 1289430000"
+		data5, err := tp.ReadLine()
+		if err != nil {
+			t.Error(err)
+			return
+		} else if data5 != data5Expected {
+			t.Errorf("expected %q, got %q", data5Expected, data5)
+			return
+		}
+
+		data6Expected := ""
+		data6, err := tp.ReadLine()
+		if !errors.Is(err, io.EOF) {
+			t.Error(err)
+			return
+		} else if data6 != data6Expected {
+			t.Errorf("expected %q, got %q", data6Expected, data6)
+			return
+		}
 	}()
+
+	return tcpServer.Addr().(*net.TCPAddr).Port
 }

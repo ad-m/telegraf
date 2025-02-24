@@ -1,14 +1,16 @@
 package strings
 
 import (
+	"strconv"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func newM1() telegraf.Metric {
@@ -35,7 +37,7 @@ func newM2() telegraf.Metric {
 		map[string]interface{}{
 			"Request":      "/mixed/CASE/paTH/?from=-1D&to=now",
 			"req/sec":      5,
-			" whitespace ": "  whitespace\t",
+			" whitespace ": "  whitespace\t", //nolint:gocritic // additional whitespace on purpose for testing
 		},
 		time.Now(),
 	)
@@ -318,6 +320,7 @@ func TestFieldKeyConversions(t *testing.T) {
 			check: func(t *testing.T, actual telegraf.Metric) {
 				fv, ok := actual.GetField("Request")
 				require.False(t, ok)
+				require.Nil(t, fv)
 
 				fv, ok = actual.GetField("REQUEST")
 				require.True(t, ok)
@@ -686,7 +689,7 @@ func TestTagKeyConversions(t *testing.T) {
 				require.True(t, ok)
 				require.Equal(t, "GET", tv)
 
-				tv, ok = actual.GetTag("S-ComputerName")
+				_, ok = actual.GetTag("S-ComputerName")
 				require.False(t, ok)
 
 				tv, ok = actual.GetTag("s-computername")
@@ -708,7 +711,7 @@ func TestTagKeyConversions(t *testing.T) {
 				require.True(t, ok)
 				require.Equal(t, "GET", tv)
 
-				tv, ok = actual.GetTag("S-ComputerName")
+				_, ok = actual.GetTag("S-ComputerName")
 				require.False(t, ok)
 
 				tv, ok = actual.GetTag("S-COMPUTERNAME")
@@ -831,8 +834,8 @@ func TestMultipleConversions(t *testing.T) {
 		"bar":            "y",
 	}
 
-	assert.Equal(t, expectedFields, processed[0].Fields())
-	assert.Equal(t, expectedTags, processed[0].Tags())
+	require.Equal(t, expectedFields, processed[0].Fields())
+	require.Equal(t, expectedTags, processed[0].Tags())
 }
 
 func TestReadmeExample(t *testing.T) {
@@ -888,8 +891,8 @@ func TestReadmeExample(t *testing.T) {
 		"resp_bytes":         int64(270),
 	}
 
-	assert.Equal(t, expectedFields, processed[0].Fields())
-	assert.Equal(t, expectedTags, processed[0].Tags())
+	require.Equal(t, expectedFields, processed[0].Fields())
+	require.Equal(t, expectedTags, processed[0].Tags())
 }
 
 func newMetric(name string) telegraf.Metric {
@@ -915,9 +918,9 @@ func TestMeasurementReplace(t *testing.T) {
 		newMetric("average_cpu_usage"),
 	}
 	results := plugin.Apply(metrics...)
-	assert.Equal(t, "foo:some-value:bar", results[0].Name(), "`_` was not changed to `-`")
-	assert.Equal(t, "average:cpu:usage", results[1].Name(), "Input name should have been unchanged")
-	assert.Equal(t, "average-cpu-usage", results[2].Name(), "All instances of `_` should have been changed to `-`")
+	require.Equal(t, "foo:some-value:bar", results[0].Name(), "`_` was not changed to `-`")
+	require.Equal(t, "average:cpu:usage", results[1].Name(), "Input name should have been unchanged")
+	require.Equal(t, "average-cpu-usage", results[2].Name(), "All instances of `_` should have been changed to `-`")
 }
 
 func TestMeasurementCharDeletion(t *testing.T) {
@@ -936,9 +939,9 @@ func TestMeasurementCharDeletion(t *testing.T) {
 		newMetric("barbarbar"),
 	}
 	results := plugin.Apply(metrics...)
-	assert.Equal(t, ":bar:baz", results[0].Name(), "Should have deleted the initial `foo`")
-	assert.Equal(t, "foofoofoo", results[1].Name(), "Should have refused to delete the whole string")
-	assert.Equal(t, "barbarbar", results[2].Name(), "Should not have changed the input")
+	require.Equal(t, ":bar:baz", results[0].Name(), "Should have deleted the initial `foo`")
+	require.Equal(t, "foofoofoo", results[1].Name(), "Should have refused to delete the whole string")
+	require.Equal(t, "barbarbar", results[2].Name(), "Should not have changed the input")
 }
 
 func TestBase64Decode(t *testing.T) {
@@ -1156,4 +1159,43 @@ func TestValidUTF8(t *testing.T) {
 			testutil.RequireMetricsEqual(t, tt.expected, actual)
 		})
 	}
+}
+
+func TestTrackedMetricNotLost(t *testing.T) {
+	var mu sync.Mutex
+	delivered := make([]telegraf.DeliveryInfo, 0, 3)
+	notify := func(di telegraf.DeliveryInfo) {
+		mu.Lock()
+		defer mu.Unlock()
+		delivered = append(delivered, di)
+	}
+	input := make([]telegraf.Metric, 0, 3)
+	expected := make([]telegraf.Metric, 0, 6)
+	for i := 0; i < 3; i++ {
+		strI := strconv.Itoa(i)
+
+		m := metric.New("m"+strI, map[string]string{}, map[string]interface{}{"message": "test" + string([]byte{0xff}) + strI}, time.Unix(0, 0))
+		tm, _ := metric.WithTracking(m, notify)
+		input = append(input, tm)
+
+		m = metric.New("m"+strI, map[string]string{}, map[string]interface{}{"message": "test" + strI}, time.Unix(0, 0))
+		expected = append(expected, m)
+	}
+
+	// Process expected metrics and compare with resulting metrics
+	plugin := &Strings{ValidUTF8: []converter{{Field: "message", Replacement: ""}}}
+	actual := plugin.Apply(input...)
+	testutil.RequireMetricsEqual(t, expected, actual)
+
+	// Simulate output acknowledging delivery
+	for _, m := range actual {
+		m.Accept()
+	}
+
+	// Check delivery
+	require.Eventuallyf(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(input) == len(delivered)
+	}, time.Second, 100*time.Millisecond, "%d delivered but %d expected", len(delivered), len(expected))
 }

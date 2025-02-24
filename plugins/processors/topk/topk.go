@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package topk
 
 import (
+	_ "embed"
 	"fmt"
 	"math"
 	"sort"
@@ -12,6 +14,9 @@ import (
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/plugins/processors"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 type TopK struct {
 	Period             config.Duration `toml:"period"`
@@ -43,63 +48,12 @@ func New() *TopK {
 	topk.Aggregation = "mean"
 	topk.GroupBy = []string{"*"}
 	topk.AddGroupByTag = ""
-	topk.AddRankFields = []string{}
-	topk.AddAggregateFields = []string{}
 
 	// Initialize cache
 	topk.Reset()
 
 	return &topk
 }
-
-var sampleConfig = `
-  ## How many seconds between aggregations
-  # period = 10
-
-  ## How many top metrics to return
-  # k = 10
-
-  ## Over which tags should the aggregation be done. Globs can be specified, in
-  ## which case any tag matching the glob will aggregated over. If set to an
-  ## empty list is no aggregation over tags is done
-  # group_by = ['*']
-
-  ## Over which fields are the top k are calculated
-  # fields = ["value"]
-
-  ## What aggregation to use. Options: sum, mean, min, max
-  # aggregation = "mean"
-
-  ## Instead of the top k largest metrics, return the bottom k lowest metrics
-  # bottomk = false
-
-  ## The plugin assigns each metric a GroupBy tag generated from its name and
-  ## tags. If this setting is different than "" the plugin will add a
-  ## tag (which name will be the value of this setting) to each metric with
-  ## the value of the calculated GroupBy tag. Useful for debugging
-  # add_groupby_tag = ""
-
-  ## These settings provide a way to know the position of each metric in
-  ## the top k. The 'add_rank_field' setting allows to specify for which
-  ## fields the position is required. If the list is non empty, then a field
-  ## will be added to each and every metric for each string present in this
-  ## setting. This field will contain the ranking of the group that
-  ## the metric belonged to when aggregated over that field.
-  ## The name of the field will be set to the name of the aggregation field,
-  ## suffixed with the string '_topk_rank'
-  # add_rank_fields = []
-
-  ## These settings provide a way to know what values the plugin is generating
-  ## when aggregating metrics. The 'add_aggregate_field' setting allows to
-  ## specify for which fields the final aggregation value is required. If the
-  ## list is non empty, then a field will be added to each every metric for
-  ## each field present in this setting. This field will contain
-  ## the computed aggregation for the group that the metric belonged to when
-  ## aggregated over that field.
-  ## The name of the field will be set to the name of the aggregation field,
-  ## suffixed with the string '_topk_aggregate'
-  # add_aggregate_fields = []
-`
 
 type MetricAggregation struct {
 	groupbykey string
@@ -120,7 +74,7 @@ func sortMetrics(metrics []MetricAggregation, field string, reverse bool) {
 	}
 }
 
-func (t *TopK) SampleConfig() string {
+func (*TopK) SampleConfig() string {
 	return sampleConfig
 }
 
@@ -129,17 +83,13 @@ func (t *TopK) Reset() {
 	t.lastAggregation = time.Now()
 }
 
-func (t *TopK) Description() string {
-	return "Print all metrics that pass through this filter."
-}
-
 func (t *TopK) generateGroupByKey(m telegraf.Metric) (string, error) {
 	// Create the filter.Filter objects if they have not been created
 	if t.tagsGlobs == nil && len(t.GroupBy) > 0 {
 		var err error
 		t.tagsGlobs, err = filter.Compile(t.GroupBy)
 		if err != nil {
-			return "", fmt.Errorf("could not compile pattern: %v %v", t.GroupBy, err)
+			return "", fmt.Errorf("could not compile pattern: %v %w", t.GroupBy, err)
 		}
 	}
 
@@ -211,7 +161,7 @@ func (t *TopK) Apply(in ...telegraf.Metric) []telegraf.Metric {
 		// holding undelivered metrics while the input waits for metrics to be
 		// delivered.  Instead, treat all handled metrics as delivered and
 		// produced metrics as untracked in a similar way to aggregators.
-		m.Drop()
+		m.Accept()
 
 		// Check if the metric has any of the fields over which we are aggregating
 		hasField := false
@@ -235,14 +185,7 @@ func (t *TopK) Apply(in ...telegraf.Metric) []telegraf.Metric {
 		return t.push()
 	}
 
-	return []telegraf.Metric{}
-}
-
-func min(a, b int) int {
-	if a > b {
-		return b
-	}
-	return a
+	return nil
 }
 
 func convert(in interface{}) (float64, bool) {
@@ -266,7 +209,7 @@ func (t *TopK) push() []telegraf.Metric {
 		// If we could not generate the aggregation
 		// function, fail hard by dropping all metrics
 		t.Log.Errorf("%v", err)
-		return []telegraf.Metric{}
+		return nil
 	}
 	for k, ms := range t.cache {
 		aggregations = append(aggregations, MetricAggregation{groupbykey: k, values: aggregator(ms, t.Fields)})
@@ -333,7 +276,7 @@ func (t *TopK) getAggregationFunction(aggOperation string) (func([]telegraf.Metr
 				}
 				val, ok := convert(fieldVal)
 				if !ok {
-					t.Log.Infof("Cannot convert value '%s' from metric '%s' with tags '%s'",
+					t.Log.Infof("Cannot convert value %q from metric %q with tags %q",
 						m.Fields()[field], m.Name(), m.Tags())
 					continue
 				}
@@ -354,7 +297,7 @@ func (t *TopK) getAggregationFunction(aggOperation string) (func([]telegraf.Metr
 
 	case "min":
 		return func(ms []telegraf.Metric, fields []string) map[string]float64 {
-			min := func(agg map[string]float64, val float64, field string) {
+			vmin := func(agg map[string]float64, val float64, field string) {
 				// If this field has not been set, set it to the maximum float64
 				_, ok := agg[field]
 				if !ok {
@@ -366,12 +309,12 @@ func (t *TopK) getAggregationFunction(aggOperation string) (func([]telegraf.Metr
 					agg[field] = val
 				}
 			}
-			return aggregator(ms, fields, min)
+			return aggregator(ms, fields, vmin)
 		}, nil
 
 	case "max":
 		return func(ms []telegraf.Metric, fields []string) map[string]float64 {
-			max := func(agg map[string]float64, val float64, field string) {
+			vmax := func(agg map[string]float64, val float64, field string) {
 				// If this field has not been set, set it to the minimum float64
 				_, ok := agg[field]
 				if !ok {
@@ -383,7 +326,7 @@ func (t *TopK) getAggregationFunction(aggOperation string) (func([]telegraf.Metr
 					agg[field] = val
 				}
 			}
-			return aggregator(ms, fields, max)
+			return aggregator(ms, fields, vmax)
 		}, nil
 
 	case "mean":
@@ -399,7 +342,7 @@ func (t *TopK) getAggregationFunction(aggOperation string) (func([]telegraf.Metr
 					}
 					val, ok := convert(fieldVal)
 					if !ok {
-						t.Log.Infof("Cannot convert value '%s' from metric '%s' with tags '%s'",
+						t.Log.Infof("Cannot convert value %q from metric %q with tags %q",
 							m.Fields()[field], m.Name(), m.Tags())
 						continue
 					}
@@ -425,7 +368,7 @@ func (t *TopK) getAggregationFunction(aggOperation string) (func([]telegraf.Metr
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("unknown aggregation function '%s', no metrics will be processed", t.Aggregation)
+		return nil, fmt.Errorf("unknown aggregation function %q, no metrics will be processed", t.Aggregation)
 	}
 }
 

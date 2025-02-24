@@ -23,7 +23,7 @@ func parseSimpleResult(acc telegraf.Accumulator, measurement string, searchResul
 }
 
 func parseAggregationResult(acc telegraf.Accumulator, aggregationQueryList []aggregationQueryData, searchResult *elastic5.SearchResult) error {
-	measurements := map[string]map[string]string{}
+	measurements := make(map[string]map[string]string, len(aggregationQueryList))
 
 	// organize the aggregation query data by measurement
 	for _, aggregationQuery := range aggregationQueryList {
@@ -67,12 +67,12 @@ func recurseResponse(acc telegraf.Accumulator, aggNameFunction map[string]string
 	for _, aggName := range aggNames {
 		aggFunction, found := aggNameFunction[aggName]
 		if !found {
-			return m, fmt.Errorf("child aggregation function '%s' not found %v", aggName, aggNameFunction)
+			return m, fmt.Errorf("child aggregation function %q not found %v", aggName, aggNameFunction)
 		}
 
 		resp := getResponseAggregation(aggFunction, aggName, bucketResponse)
 		if resp == nil {
-			return m, fmt.Errorf("child aggregation '%s' not found", aggName)
+			return m, fmt.Errorf("child aggregation %q not found", aggName)
 		}
 
 		switch resp := resp.(type) {
@@ -124,7 +124,7 @@ func recurseResponse(acc telegraf.Accumulator, aggNameFunction map[string]string
 	return m, nil
 }
 
-func getResponseAggregation(function string, aggName string, aggs elastic5.Aggregations) (agg interface{}) {
+func getResponseAggregation(function, aggName string, aggs elastic5.Aggregations) (agg interface{}) {
 	switch function {
 	case "avg":
 		agg, _ = aggs.Avg(aggName)
