@@ -1,9 +1,14 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package diskio
 
 import (
+	_ "embed"
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
+
+	"github.com/shirou/gopsutil/v4/disk"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/filter"
@@ -11,107 +16,78 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs/system"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 var (
 	varRegex = regexp.MustCompile(`\$(?:\w+|\{\w+\})`)
 )
 
 type DiskIO struct {
-	ps system.PS
+	Devices          []string        `toml:"devices"`
+	DeviceTags       []string        `toml:"device_tags"`
+	NameTemplates    []string        `toml:"name_templates"`
+	SkipSerialNumber bool            `toml:"skip_serial_number"`
+	Log              telegraf.Logger `toml:"-"`
 
-	Devices          []string
-	DeviceTags       []string
-	NameTemplates    []string
-	SkipSerialNumber bool
-
-	Log telegraf.Logger
-
-	infoCache    map[string]diskInfoCache
-	deviceFilter filter.Filter
-	initialized  bool
+	ps                system.PS
+	infoCache         map[string]diskInfoCache
+	deviceFilter      filter.Filter
+	warnDiskName      map[string]bool
+	warnDiskTags      map[string]bool
+	lastIOCounterStat map[string]disk.IOCountersStat
+	lastCollectTime   time.Time
 }
 
-func (d *DiskIO) Description() string {
-	return "Read metrics about disk IO by device"
+func (*DiskIO) SampleConfig() string {
+	return sampleConfig
 }
 
-var diskIOsampleConfig = `
-  ## By default, telegraf will gather stats for all devices including
-  ## disk partitions.
-  ## Setting devices will restrict the stats to the specified devices.
-  # devices = ["sda", "sdb", "vd*"]
-  ## Uncomment the following line if you need disk serial numbers.
-  # skip_serial_number = false
-  #
-  ## On systems which support it, device metadata can be added in the form of
-  ## tags.
-  ## Currently only Linux is supported via udev properties. You can view
-  ## available properties for a device by running:
-  ## 'udevadm info -q property -n /dev/sda'
-  ## Note: Most, but not all, udev properties can be accessed this way. Properties
-  ## that are currently inaccessible include DEVTYPE, DEVNAME, and DEVPATH.
-  # device_tags = ["ID_FS_TYPE", "ID_FS_USAGE"]
-  #
-  ## Using the same metadata source as device_tags, you can also customize the
-  ## name of the device via templates.
-  ## The 'name_templates' parameter is a list of templates to try and apply to
-  ## the device. The template may contain variables in the form of '$PROPERTY' or
-  ## '${PROPERTY}'. The first template which does not contain any variables not
-  ## present for the device is used as the device name tag.
-  ## The typical use case is for LVM volumes, to get the VG/LV name instead of
-  ## the near-meaningless DM-0 name.
-  # name_templates = ["$ID_FS_LABEL","$DM_VG_NAME/$DM_LV_NAME"]
-`
-
-func (d *DiskIO) SampleConfig() string {
-	return diskIOsampleConfig
-}
-
-// hasMeta reports whether s contains any special glob characters.
-func hasMeta(s string) bool {
-	return strings.ContainsAny(s, "*?[")
-}
-
-func (d *DiskIO) init() error {
+func (d *DiskIO) Init() error {
 	for _, device := range d.Devices {
 		if hasMeta(device) {
 			deviceFilter, err := filter.Compile(d.Devices)
 			if err != nil {
-				return fmt.Errorf("error compiling device pattern: %s", err.Error())
+				return fmt.Errorf("error compiling device pattern: %w", err)
 			}
 			d.deviceFilter = deviceFilter
 		}
 	}
-	d.initialized = true
+
+	d.infoCache = make(map[string]diskInfoCache)
+	d.warnDiskName = make(map[string]bool)
+	d.warnDiskTags = make(map[string]bool)
+	d.lastIOCounterStat = make(map[string]disk.IOCountersStat)
+
 	return nil
 }
 
 func (d *DiskIO) Gather(acc telegraf.Accumulator) error {
-	if !d.initialized {
-		err := d.init()
-		if err != nil {
-			return err
-		}
-	}
-
-	devices := []string{}
+	var devices []string
 	if d.deviceFilter == nil {
-		devices = d.Devices
+		for _, dev := range d.Devices {
+			devices = append(devices, resolveName(dev))
+		}
 	}
 
 	diskio, err := d.ps.DiskIO(devices)
 	if err != nil {
-		return fmt.Errorf("error getting disk io info: %s", err.Error())
+		return fmt.Errorf("error getting disk io info: %w", err)
 	}
-
-	for _, io := range diskio {
+	collectTime := time.Now()
+	for k, io := range diskio {
 		match := false
 		if d.deviceFilter != nil && d.deviceFilter.Match(io.Name) {
 			match = true
 		}
 
-		tags := map[string]string{}
+		tags := make(map[string]string)
 		var devLinks []string
 		tags["name"], devLinks = d.diskName(io.Name)
+
+		if wwid := getDeviceWWID(io.Name); wwid != "" {
+			tags["wwid"] = wwid
+		}
 
 		if d.deviceFilter != nil && !match {
 			for _, devLink := range devLinks {
@@ -150,10 +126,29 @@ func (d *DiskIO) Gather(acc telegraf.Accumulator) error {
 			"merged_reads":     io.MergedReadCount,
 			"merged_writes":    io.MergedWriteCount,
 		}
+		if lastValue, exists := d.lastIOCounterStat[k]; exists {
+			deltaRWCount := float64(io.ReadCount + io.WriteCount - lastValue.ReadCount - lastValue.WriteCount)
+			deltaRWTime := float64(io.ReadTime + io.WriteTime - lastValue.ReadTime - lastValue.WriteTime)
+			deltaIOTime := float64(io.IoTime - lastValue.IoTime)
+			if deltaRWCount > 0 {
+				fields["io_await"] = deltaRWTime / deltaRWCount
+				fields["io_svctm"] = deltaIOTime / deltaRWCount
+			}
+			itv := float64(collectTime.Sub(d.lastCollectTime).Milliseconds())
+			if itv > 0 {
+				fields["io_util"] = 100 * deltaIOTime / itv
+			}
+		}
 		acc.AddCounter("diskio", fields, tags)
 	}
-
+	d.lastCollectTime = collectTime
+	d.lastIOCounterStat = diskio
 	return nil
+}
+
+// hasMeta reports whether s contains any special glob characters.
+func hasMeta(s string) bool {
+	return strings.ContainsAny(s, "*?[")
 }
 
 func (d *DiskIO) diskName(devName string) (string, []string) {
@@ -162,13 +157,17 @@ func (d *DiskIO) diskName(devName string) (string, []string) {
 	for i, devLink := range devLinks {
 		devLinks[i] = strings.TrimPrefix(devLink, "/dev/")
 	}
-
-	if len(d.NameTemplates) == 0 {
+	// Return error after attempting to process some of the devlinks.
+	// These could exist if we got further along the diskInfo call.
+	if err != nil {
+		if ok := d.warnDiskName[devName]; !ok {
+			d.warnDiskName[devName] = true
+			d.Log.Warnf("Unable to gather disk name for %q: %s", devName, err)
+		}
 		return devName, devLinks
 	}
 
-	if err != nil {
-		d.Log.Warnf("Error gathering disk info: %s", err)
+	if len(d.NameTemplates) == 0 {
 		return devName, devLinks
 	}
 
@@ -201,11 +200,14 @@ func (d *DiskIO) diskTags(devName string) map[string]string {
 
 	di, err := d.diskInfo(devName)
 	if err != nil {
-		d.Log.Warnf("Error gathering disk info: %s", err)
+		if ok := d.warnDiskTags[devName]; !ok {
+			d.warnDiskTags[devName] = true
+			d.Log.Warnf("Unable to gather disk tags for %q: %s", devName, err)
+		}
 		return nil
 	}
 
-	tags := map[string]string{}
+	tags := make(map[string]string, len(d.DeviceTags))
 	for _, dt := range d.DeviceTags {
 		if v, ok := di[dt]; ok {
 			tags[dt] = v

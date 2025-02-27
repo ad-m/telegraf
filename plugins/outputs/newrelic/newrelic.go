@@ -1,19 +1,25 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package newrelic
 
-// newrelic.go
 import (
 	"context"
+	_ "embed"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"time"
 
+	"github.com/newrelic/newrelic-telemetry-sdk-go/cumulative"
+	"github.com/newrelic/newrelic-telemetry-sdk-go/telemetry"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	"github.com/newrelic/newrelic-telemetry-sdk-go/cumulative"
-	"github.com/newrelic/newrelic-telemetry-sdk-go/telemetry"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 // NewRelic nr structure
 type NewRelic struct {
@@ -27,40 +33,17 @@ type NewRelic struct {
 	dc          *cumulative.DeltaCalculator
 	savedErrors map[int]interface{}
 	errorCount  int
-	client      http.Client `toml:"-"`
+	client      http.Client
 }
 
-// Description returns a one-sentence description on the Output
-func (nr *NewRelic) Description() string {
-	return "Send metrics to New Relic metrics endpoint"
-}
-
-// SampleConfig : return  default configuration of the Output
-func (nr *NewRelic) SampleConfig() string {
-	return `
-  ## New Relic Insights API key
-  insights_key = "insights api key"
-
-  ## Prefix to add to add to metric name for easy identification.
-  # metric_prefix = ""
-
-  ## Timeout for writes to the New Relic API.
-  # timeout = "15s"
-
-  ## HTTP Proxy override. If unset use values from the standard
-  ## proxy environment variables to determine proxy, if any.
-  # http_proxy = "http://corporate.proxy:3128"
-
-  ## Metric URL override to enable geographic location endpoints.
-  # If not set use values from the standard 
-  # metric_url = "https://metric-api.newrelic.com/metric/v1"
-`
+func (*NewRelic) SampleConfig() string {
+	return sampleConfig
 }
 
 // Connect to the Output
 func (nr *NewRelic) Connect() error {
 	if nr.InsightsKey == "" {
-		return fmt.Errorf("InsightKey is a required for newrelic")
+		return errors.New("'insights_key' is a required for newrelic")
 	}
 	err := nr.initClient()
 	if err != nil {
@@ -87,7 +70,7 @@ func (nr *NewRelic) Connect() error {
 			}
 		})
 	if err != nil {
-		return fmt.Errorf("unable to connect to newrelic %v", err)
+		return fmt.Errorf("unable to connect to newrelic: %w", err)
 	}
 
 	nr.dc = cumulative.NewDeltaCalculator()
@@ -159,7 +142,7 @@ func (nr *NewRelic) Write(metrics []telegraf.Metric) error {
 	// using HarvestNow.
 	nr.harvestor.HarvestNow(context.Background())
 
-	//Check if we encountered errors
+	// Check if we encountered errors
 	if nr.errorCount != 0 {
 		return fmt.Errorf("unable to harvest metrics  %s ", nr.savedErrors[nr.errorCount])
 	}

@@ -1,3 +1,4 @@
+//go:generate ../../../tools/readme_config_includer/generator
 // The MIT License (MIT)
 //
 // Copyright (c) 2015 Jeff Nickoloff (jeff@allingeek.com)
@@ -23,6 +24,7 @@
 package nsq
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,45 +39,22 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-// Might add Lookupd endpoints for cluster discovery
-type NSQ struct {
-	Endpoints []string
-	tls.ClientConfig
-	httpClient *http.Client
-}
-
-var sampleConfig = `
-  ## An array of NSQD HTTP API endpoints
-  endpoints  = ["http://localhost:4151"]
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-`
+//go:embed sample.conf
+var sampleConfig string
 
 const (
 	requestPattern = `%s/stats?format=json`
 )
 
-func init() {
-	inputs.Add("nsq", func() telegraf.Input {
-		return New()
-	})
+type NSQ struct {
+	Endpoints []string `toml:"endpoints"`
+
+	tls.ClientConfig
+	httpClient *http.Client
 }
 
-func New() *NSQ {
-	return &NSQ{}
-}
-
-func (n *NSQ) SampleConfig() string {
+func (*NSQ) SampleConfig() string {
 	return sampleConfig
-}
-
-func (n *NSQ) Description() string {
-	return "Read NSQ topic and channel statistics."
 }
 
 func (n *NSQ) Gather(acc telegraf.Accumulator) error {
@@ -123,7 +102,7 @@ func (n *NSQ) gatherEndpoint(e string, acc telegraf.Accumulator) error {
 	}
 	r, err := n.httpClient.Get(u.String())
 	if err != nil {
-		return fmt.Errorf("error while polling %s: %s", u.String(), err)
+		return fmt.Errorf("error while polling %s: %w", u.String(), err)
 	}
 	defer r.Body.Close()
 
@@ -133,20 +112,20 @@ func (n *NSQ) gatherEndpoint(e string, acc telegraf.Accumulator) error {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		return fmt.Errorf(`error reading body: %s`, err)
+		return fmt.Errorf(`error reading body: %w`, err)
 	}
 
-	data := &NSQStatsData{}
+	data := &nsqStatsData{}
 	err = json.Unmarshal(body, data)
 	if err != nil {
-		return fmt.Errorf(`error parsing response: %s`, err)
+		return fmt.Errorf(`error parsing response: %w`, err)
 	}
 	// Data was not parsed correctly attempt to use old format.
 	if len(data.Version) < 1 {
-		wrapper := &NSQStats{}
+		wrapper := &nsqStats{}
 		err = json.Unmarshal(body, wrapper)
 		if err != nil {
-			return fmt.Errorf(`error parsing response: %s`, err)
+			return fmt.Errorf(`error parsing response: %w`, err)
 		}
 		data = &wrapper.Data
 	}
@@ -166,7 +145,7 @@ func (n *NSQ) gatherEndpoint(e string, acc telegraf.Accumulator) error {
 
 	acc.AddFields("nsq_server", fields, tags)
 	for _, t := range data.Topics {
-		topicStats(t, acc, u.Host, data.Version)
+		gatherTopicStats(t, acc, u.Host, data.Version)
 	}
 
 	return nil
@@ -176,12 +155,12 @@ func buildURL(e string) (*url.URL, error) {
 	u := fmt.Sprintf(requestPattern, e)
 	addr, err := url.Parse(u)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse address '%s': %s", u, err)
+		return nil, fmt.Errorf("unable to parse address %q: %w", u, err)
 	}
 	return addr, nil
 }
 
-func topicStats(t TopicStats, acc telegraf.Accumulator, host, version string) {
+func gatherTopicStats(t topicStats, acc telegraf.Accumulator, host, version string) {
 	// per topic overall (tag: name, paused, channel count)
 	tags := map[string]string{
 		"server_host":    host,
@@ -198,11 +177,11 @@ func topicStats(t TopicStats, acc telegraf.Accumulator, host, version string) {
 	acc.AddFields("nsq_topic", fields, tags)
 
 	for _, c := range t.Channels {
-		channelStats(c, acc, host, version, t.Name)
+		gatherChannelStats(c, acc, host, version, t.Name)
 	}
 }
 
-func channelStats(c ChannelStats, acc telegraf.Accumulator, host, version, topic string) {
+func gatherChannelStats(c channelStats, acc telegraf.Accumulator, host, version, topic string) {
 	tags := map[string]string{
 		"server_host":    host,
 		"server_version": version,
@@ -223,11 +202,11 @@ func channelStats(c ChannelStats, acc telegraf.Accumulator, host, version, topic
 
 	acc.AddFields("nsq_channel", fields, tags)
 	for _, cl := range c.Clients {
-		clientStats(cl, acc, host, version, topic, c.Name)
+		gatherClientStats(cl, acc, host, version, topic, c.Name)
 	}
 }
 
-func clientStats(c ClientStats, acc telegraf.Accumulator, host, version, topic, channel string) {
+func gatherClientStats(c clientStats, acc telegraf.Accumulator, host, version, topic, channel string) {
 	tags := map[string]string{
 		"server_host":       host,
 		"server_version":    version,
@@ -256,31 +235,31 @@ func clientStats(c ClientStats, acc telegraf.Accumulator, host, version, topic, 
 	acc.AddFields("nsq_client", fields, tags)
 }
 
-type NSQStats struct {
+type nsqStats struct {
 	Code int64        `json:"status_code"`
 	Txt  string       `json:"status_txt"`
-	Data NSQStatsData `json:"data"`
+	Data nsqStatsData `json:"data"`
 }
 
-type NSQStatsData struct {
+type nsqStatsData struct {
 	Version   string       `json:"version"`
 	Health    string       `json:"health"`
 	StartTime int64        `json:"start_time"`
-	Topics    []TopicStats `json:"topics"`
+	Topics    []topicStats `json:"topics"`
 }
 
 // e2e_processing_latency is not modeled
-type TopicStats struct {
+type topicStats struct {
 	Name         string         `json:"topic_name"`
 	Depth        int64          `json:"depth"`
 	BackendDepth int64          `json:"backend_depth"`
 	MessageCount int64          `json:"message_count"`
 	Paused       bool           `json:"paused"`
-	Channels     []ChannelStats `json:"channels"`
+	Channels     []channelStats `json:"channels"`
 }
 
 // e2e_processing_latency is not modeled
-type ChannelStats struct {
+type channelStats struct {
 	Name          string        `json:"channel_name"`
 	Depth         int64         `json:"depth"`
 	BackendDepth  int64         `json:"backend_depth"`
@@ -290,10 +269,10 @@ type ChannelStats struct {
 	RequeueCount  int64         `json:"requeue_count"`
 	TimeoutCount  int64         `json:"timeout_count"`
 	Paused        bool          `json:"paused"`
-	Clients       []ClientStats `json:"clients"`
+	Clients       []clientStats `json:"clients"`
 }
 
-type ClientStats struct {
+type clientStats struct {
 	Name                          string `json:"name"` // DEPRECATED 1.x+, still here as the structs are currently being shared for parsing v3.x and 1.x
 	ID                            string `json:"client_id"`
 	Hostname                      string `json:"hostname"`
@@ -315,4 +294,14 @@ type ClientStats struct {
 	TLSVersion                    string `json:"tls_version"`
 	TLSNegotiatedProtocol         string `json:"tls_negotiated_protocol"`
 	TLSNegotiatedProtocolIsMutual bool   `json:"tls_negotiated_protocol_is_mutual"`
+}
+
+func newNSQ() *NSQ {
+	return &NSQ{}
+}
+
+func init() {
+	inputs.Add("nsq", func() telegraf.Input {
+		return newNSQ()
+	})
 }

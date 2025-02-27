@@ -5,9 +5,19 @@ IPs in them.
 
 Telegraf minimum version: Telegraf 1.15.0
 
-### Configuration:
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
 
-```toml
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Configuration
+
+```toml @sample.conf
+# ReverseDNS does a reverse lookup on IP addresses to retrieve the DNS name
 [[processors.reverse_dns]]
   ## For optimal performance, you may want to limit which metrics are passed to this
   ## processor. eg:
@@ -18,7 +28,7 @@ Telegraf minimum version: Telegraf 1.15.0
   ## you'll want to consider memory use.
   cache_ttl = "24h"
 
-  ## lookup_timeout is how long should you wait for a single dns request to repsond.
+  ## lookup_timeout is how long should you wait for a single dns request to respond.
   ## this is also the maximum acceptable latency for a metric travelling through
   ## the reverse_dns processor. After lookup_timeout is exceeded, a metric will
   ## be passed on unaltered.
@@ -55,9 +65,7 @@ Telegraf minimum version: Telegraf 1.15.0
     ## processors.converter after this one, specifying the order attribute.
 ```
 
-
-
-### Example processing:
+## Example
 
 example config:
 

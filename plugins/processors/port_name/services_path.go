@@ -1,7 +1,6 @@
 //go:build windows
-// +build windows
 
-package portname
+package port_name
 
 import (
 	"os"
@@ -9,5 +8,5 @@ import (
 )
 
 func servicesPath() string {
-	return filepath.Join(os.Getenv("WINDIR"), `system32\drivers\etc\services`)
+	return filepath.Join(os.Getenv("WINDIR"), "system32", "drivers", "etc", "services")
 }

@@ -58,12 +58,10 @@ func addJSONCounter(acc telegraf.Accumulator, commonTags map[string]string, stat
 			tags[k] = v
 		}
 
-		if err := grouper.Add("bind_counter", tags, ts, name, value); err != nil {
-			acc.AddError(fmt.Errorf("adding field %q to group failed: %v", name, err))
-		}
+		grouper.Add("bind_counter", tags, ts, name, value)
 	}
 
-	//Add grouped metrics
+	// Add grouped metrics
 	for _, groupedMetric := range grouper.Metrics() {
 		acc.AddMetric(groupedMetric)
 	}
@@ -74,7 +72,10 @@ func (b *Bind) addStatsJSON(stats jsonStats, acc telegraf.Accumulator, urlTag st
 	grouper := metric.NewSeriesGrouper()
 	ts := time.Now()
 	tags := map[string]string{"url": urlTag}
-	host, port, _ := net.SplitHostPort(urlTag)
+	host, port, err := net.SplitHostPort(urlTag)
+	if err != nil {
+		acc.AddError(err)
+	}
 	tags["source"] = host
 	tags["port"] = port
 
@@ -135,15 +136,13 @@ func (b *Bind) addStatsJSON(stats jsonStats, acc telegraf.Accumulator, urlTag st
 						"type":   cntrType,
 					}
 
-					if err := grouper.Add("bind_counter", tags, ts, cntrName, value); err != nil {
-						acc.AddError(fmt.Errorf("adding tags %q to group failed: %v", tags, err))
-					}
+					grouper.Add("bind_counter", tags, ts, cntrName, value)
 				}
 			}
 		}
 	}
 
-	//Add grouped metrics
+	// Add grouped metrics
 	for _, groupedMetric := range grouper.Metrics() {
 		acc.AddMetric(groupedMetric)
 	}
@@ -172,7 +171,7 @@ func (b *Bind) readStatsJSON(addr *url.URL, acc telegraf.Accumulator) error {
 			}
 
 			if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-				return fmt.Errorf("unable to decode JSON blob: %s", err)
+				return fmt.Errorf("unable to decode JSON blob: %w", err)
 			}
 
 			return nil

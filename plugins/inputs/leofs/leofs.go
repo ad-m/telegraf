@@ -1,7 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package leofs
 
 import (
 	"bufio"
+	_ "embed"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -14,26 +17,30 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-const oid = ".1.3.6.1.4.1.35450"
-
-// For Manager Master
-const defaultEndpoint = "127.0.0.1:4020"
-
-type ServerType int
+//go:embed sample.conf
+var sampleConfig string
 
 const (
-	ServerTypeManagerMaster ServerType = iota
-	ServerTypeManagerSlave
-	ServerTypeStorage
-	ServerTypeGateway
+	oid = ".1.3.6.1.4.1.35450"
+	// For Manager Master
+	defaultEndpoint = "127.0.0.1:4020"
+)
+
+type serverType int
+
+const (
+	serverTypeManagerMaster serverType = iota
+	serverTypeManagerSlave
+	serverTypeStorage
+	serverTypeGateway
 )
 
 type LeoFS struct {
-	Servers []string
+	Servers []string `toml:"servers"`
 }
 
-var KeyMapping = map[ServerType][]string{
-	ServerTypeManagerMaster: {
+var keyMapping = map[serverType][]string{
+	serverTypeManagerMaster: {
 		"num_of_processes",
 		"total_memory_usage",
 		"system_memory_usage",
@@ -49,7 +56,7 @@ var KeyMapping = map[ServerType][]string{
 		"used_allocated_memory_5min",
 		"allocated_memory_5min",
 	},
-	ServerTypeManagerSlave: {
+	serverTypeManagerSlave: {
 		"num_of_processes",
 		"total_memory_usage",
 		"system_memory_usage",
@@ -65,7 +72,7 @@ var KeyMapping = map[ServerType][]string{
 		"used_allocated_memory_5min",
 		"allocated_memory_5min",
 	},
-	ServerTypeStorage: {
+	serverTypeStorage: {
 		"num_of_processes",
 		"total_memory_usage",
 		"system_memory_usage",
@@ -107,7 +114,7 @@ var KeyMapping = map[ServerType][]string{
 		"comp_num_of_ongoing_targets",
 		"comp_num_of_out_of_targets",
 	},
-	ServerTypeGateway: {
+	serverTypeGateway: {
 		"num_of_processes",
 		"total_memory_usage",
 		"system_memory_usage",
@@ -135,34 +142,24 @@ var KeyMapping = map[ServerType][]string{
 	},
 }
 
-var serverTypeMapping = map[string]ServerType{
-	"4020": ServerTypeManagerMaster,
-	"4021": ServerTypeManagerSlave,
-	"4010": ServerTypeStorage,
-	"4011": ServerTypeStorage,
-	"4012": ServerTypeStorage,
-	"4013": ServerTypeStorage,
-	"4000": ServerTypeGateway,
-	"4001": ServerTypeGateway,
+var serverTypeMapping = map[string]serverType{
+	"4020": serverTypeManagerMaster,
+	"4021": serverTypeManagerSlave,
+	"4010": serverTypeStorage,
+	"4011": serverTypeStorage,
+	"4012": serverTypeStorage,
+	"4013": serverTypeStorage,
+	"4000": serverTypeGateway,
+	"4001": serverTypeGateway,
 }
 
-var sampleConfig = `
-  ## An array of URLs of the form:
-  ##   host [ ":" port]
-  servers = ["127.0.0.1:4020"]
-`
-
-func (l *LeoFS) SampleConfig() string {
+func (*LeoFS) SampleConfig() string {
 	return sampleConfig
-}
-
-func (l *LeoFS) Description() string {
-	return "Read metrics from a LeoFS Server via SNMP"
 }
 
 func (l *LeoFS) Gather(acc telegraf.Accumulator) error {
 	if len(l.Servers) == 0 {
-		return l.gatherServer(defaultEndpoint, ServerTypeManagerMaster, acc)
+		return gatherServer(defaultEndpoint, serverTypeManagerMaster, acc)
 	}
 	var wg sync.WaitGroup
 	for _, endpoint := range l.Servers {
@@ -170,36 +167,32 @@ func (l *LeoFS) Gather(acc telegraf.Accumulator) error {
 
 		port := "4020"
 		if len(results) > 2 {
-			acc.AddError(fmt.Errorf("Unable to parse address %q", endpoint))
+			acc.AddError(fmt.Errorf("unable to parse address %q", endpoint))
 			continue
 		} else if len(results) == 2 {
-			if _, err := strconv.Atoi(results[1]); err == nil {
-				port = results[1]
-			} else {
-				acc.AddError(fmt.Errorf("Unable to parse port from %q", endpoint))
+			_, err := strconv.Atoi(results[1])
+			if err != nil {
+				acc.AddError(fmt.Errorf("unable to parse port from %q", endpoint))
 				continue
 			}
+			port = results[1]
 		}
 
 		st, ok := serverTypeMapping[port]
 		if !ok {
-			st = ServerTypeStorage
+			st = serverTypeStorage
 		}
 		wg.Add(1)
-		go func(endpoint string, st ServerType) {
+		go func(endpoint string, st serverType) {
 			defer wg.Done()
-			acc.AddError(l.gatherServer(endpoint, st, acc))
+			acc.AddError(gatherServer(endpoint, st, acc))
 		}(endpoint, st)
 	}
 	wg.Wait()
 	return nil
 }
 
-func (l *LeoFS) gatherServer(
-	endpoint string,
-	serverType ServerType,
-	acc telegraf.Accumulator,
-) error {
+func gatherServer(endpoint string, serverType serverType, acc telegraf.Accumulator) error {
 	cmd := exec.Command("snmpwalk", "-v2c", "-cpublic", "-On", endpoint, oid)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -208,12 +201,10 @@ func (l *LeoFS) gatherServer(
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	// Ignore the returned error as we cannot do anything about it anyway
-	//nolint:errcheck,revive
-	defer internal.WaitTimeout(cmd, time.Second*5)
+	defer internal.WaitTimeout(cmd, time.Second*5) //nolint:errcheck // ignore the returned error as we cannot do anything about it anyway
 	scanner := bufio.NewScanner(stdout)
 	if !scanner.Scan() {
-		return fmt.Errorf("Unable to retrieve the node name")
+		return errors.New("unable to retrieve the node name")
 	}
 	nodeName, err := retrieveTokenAfterColon(scanner.Text())
 	if err != nil {
@@ -227,14 +218,14 @@ func (l *LeoFS) gatherServer(
 
 	fields := make(map[string]interface{})
 	for scanner.Scan() {
-		key := KeyMapping[serverType][i]
+		key := keyMapping[serverType][i]
 		val, err := retrieveTokenAfterColon(scanner.Text())
 		if err != nil {
 			return err
 		}
 		fVal, err := strconv.ParseFloat(val, 64)
 		if err != nil {
-			return fmt.Errorf("Unable to parse the value:%s, err:%s", val, err)
+			return fmt.Errorf("unable to parse the value %q: %w", val, err)
 		}
 		fields[key] = fVal
 		i++

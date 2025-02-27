@@ -7,40 +7,42 @@ import (
 	"testing"
 	"time"
 
+	"github.com/signalfx/golib/v3/datapoint"
+	"github.com/signalfx/golib/v3/event"
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/plugins/outputs"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/signalfx/golib/v3/datapoint"
-	"github.com/signalfx/golib/v3/event"
-	"github.com/stretchr/testify/require"
 )
 
 type sink struct {
-	dps []*datapoint.Datapoint
-	evs []*event.Event
+	datapoints []*datapoint.Datapoint
+	events     []*event.Event
 }
 
 func (s *sink) AddDatapoints(_ context.Context, points []*datapoint.Datapoint) error {
-	s.dps = append(s.dps, points...)
+	s.datapoints = append(s.datapoints, points...)
 	return nil
 }
 func (s *sink) AddEvents(_ context.Context, events []*event.Event) error {
-	s.evs = append(s.evs, events...)
+	s.events = append(s.events, events...)
 	return nil
 }
 
 type errorsink struct {
-	dps []*datapoint.Datapoint
-	evs []*event.Event
+	datapoints []*datapoint.Datapoint
+	events     []*event.Event
 }
 
-func (e *errorsink) AddDatapoints(_ context.Context, _ []*datapoint.Datapoint) error {
+func (*errorsink) AddDatapoints(context.Context, []*datapoint.Datapoint) error {
 	return errors.New("not sending datapoints")
 }
-func (e *errorsink) AddEvents(_ context.Context, _ []*event.Event) error {
+func (*errorsink) AddEvents(context.Context, []*event.Event) error {
 	return errors.New("not sending events")
 }
+
 func TestSignalFx_SignalFx(t *testing.T) {
 	type measurement struct {
 		name   string
@@ -52,15 +54,11 @@ func TestSignalFx_SignalFx(t *testing.T) {
 	type fields struct {
 		IncludedEvents []string
 	}
-	type want struct {
-		datapoints []*datapoint.Datapoint
-		events     []*event.Event
-	}
 	tests := []struct {
 		name         string
 		fields       fields
 		measurements []*measurement
-		want         want
+		want         errorsink
 	}{
 		{
 			name:   "add datapoints of all types",
@@ -120,7 +118,7 @@ func TestSignalFx_SignalFx(t *testing.T) {
 					time:   time.Date(2010, time.November, 10, 23, 0, 0, 0, time.UTC),
 				},
 			},
-			want: want{
+			want: errorsink{
 				datapoints: []*datapoint.Datapoint{
 					datapoint.New(
 						"datapoint.mymeasurement",
@@ -187,7 +185,7 @@ func TestSignalFx_SignalFx(t *testing.T) {
 						datapoint.Gauge,
 						time.Date(2010, time.November, 10, 23, 0, 0, 0, time.UTC)),
 				},
-				events: []*event.Event{},
+				events: make([]*event.Event, 0),
 			},
 		},
 		{
@@ -238,8 +236,8 @@ func TestSignalFx_SignalFx(t *testing.T) {
 					time:   time.Date(2010, time.November, 10, 23, 0, 0, 0, time.UTC),
 				},
 			},
-			want: want{
-				datapoints: []*datapoint.Datapoint{},
+			want: errorsink{
+				datapoints: make([]*datapoint.Datapoint, 0),
 				events: []*event.Event{
 					event.NewWithProperties(
 						"event.mymeasurement",
@@ -316,9 +314,9 @@ func TestSignalFx_SignalFx(t *testing.T) {
 					tp:     telegraf.Gauge,
 				},
 			},
-			want: want{
-				datapoints: []*datapoint.Datapoint{},
-				events:     []*event.Event{},
+			want: errorsink{
+				datapoints: make([]*datapoint.Datapoint, 0),
+				events:     make([]*event.Event, 0),
 			},
 		},
 		{
@@ -333,7 +331,7 @@ func TestSignalFx_SignalFx(t *testing.T) {
 					tp:     telegraf.Gauge,
 				},
 			},
-			want: want{
+			want: errorsink{
 				datapoints: []*datapoint.Datapoint{
 					datapoint.New(
 						"datapoint",
@@ -344,7 +342,7 @@ func TestSignalFx_SignalFx(t *testing.T) {
 						datapoint.Gauge,
 						time.Date(2010, time.November, 10, 23, 0, 0, 0, time.UTC)),
 				},
-				events: []*event.Event{},
+				events: make([]*event.Event, 0),
 			},
 		},
 		{
@@ -361,8 +359,8 @@ func TestSignalFx_SignalFx(t *testing.T) {
 					tp:     telegraf.Untyped,
 				},
 			},
-			want: want{
-				datapoints: []*datapoint.Datapoint{},
+			want: errorsink{
+				datapoints: make([]*datapoint.Datapoint, 0),
 				events: []*event.Event{
 					event.NewWithProperties(
 						"event.mymeasurement",
@@ -389,9 +387,9 @@ func TestSignalFx_SignalFx(t *testing.T) {
 					tp:     telegraf.Gauge,
 				},
 			},
-			want: want{
-				datapoints: []*datapoint.Datapoint{},
-				events:     []*event.Event{},
+			want: errorsink{
+				datapoints: make([]*datapoint.Datapoint, 0),
+				events:     make([]*event.Event, 0),
 			},
 		},
 		{
@@ -406,9 +404,9 @@ func TestSignalFx_SignalFx(t *testing.T) {
 					tp:     telegraf.Gauge,
 				},
 			},
-			want: want{
-				datapoints: []*datapoint.Datapoint{},
-				events:     []*event.Event{},
+			want: errorsink{
+				datapoints: make([]*datapoint.Datapoint, 0),
+				events:     make([]*event.Event, 0),
 			},
 		},
 	}
@@ -419,32 +417,28 @@ func TestSignalFx_SignalFx(t *testing.T) {
 			s.SignalFxRealm = "test"
 			s.Log = testutil.Logger{}
 
-			require.Nil(t, s.Connect())
+			require.NoError(t, s.Connect())
 
 			s.client = &sink{
-				dps: []*datapoint.Datapoint{},
-				evs: []*event.Event{},
+				datapoints: make([]*datapoint.Datapoint, 0),
+				events:     make([]*event.Event, 0),
 			}
 
-			measurements := []telegraf.Metric{}
-
+			measurements := make([]telegraf.Metric, 0, len(tt.measurements))
 			for _, measurement := range tt.measurements {
-				m := metric.New(
-					measurement.name, measurement.tags, measurement.fields, measurement.time, measurement.tp,
-				)
-
-				measurements = append(measurements, m)
+				measurements = append(measurements, metric.New(measurement.name, measurement.tags, measurement.fields, measurement.time, measurement.tp))
 			}
 
-			s.Write(measurements)
-			require.Eventually(t, func() bool { return len(s.client.(*sink).dps) == len(tt.want.datapoints) }, 5*time.Second, 100*time.Millisecond)
-			require.Eventually(t, func() bool { return len(s.client.(*sink).evs) == len(tt.want.events) }, 5*time.Second, 100*time.Millisecond)
+			err := s.Write(measurements)
+			require.NoError(t, err)
+			require.Eventually(t, func() bool { return len(s.client.(*sink).datapoints) == len(tt.want.datapoints) }, 5*time.Second, 10*time.Millisecond)
+			require.Eventually(t, func() bool { return len(s.client.(*sink).events) == len(tt.want.events) }, 5*time.Second, 10*time.Millisecond)
 
-			if !reflect.DeepEqual(s.client.(*sink).dps, tt.want.datapoints) {
-				t.Errorf("Collected datapoints do not match desired.  Collected: %v Desired: %v", s.client.(*sink).dps, tt.want.datapoints)
+			if !reflect.DeepEqual(s.client.(*sink).datapoints, tt.want.datapoints) {
+				t.Errorf("Collected datapoints do not match desired.  Collected: %v Desired: %v", s.client.(*sink).datapoints, tt.want.datapoints)
 			}
-			if !reflect.DeepEqual(s.client.(*sink).evs, tt.want.events) {
-				t.Errorf("Collected events do not match desired.  Collected: %v Desired: %v", s.client.(*sink).evs, tt.want.events)
+			if !reflect.DeepEqual(s.client.(*sink).events, tt.want.events) {
+				t.Errorf("Collected events do not match desired.  Collected: %v Desired: %v", s.client.(*sink).events, tt.want.events)
 			}
 		})
 	}
@@ -518,8 +512,8 @@ func TestSignalFx_Errors(t *testing.T) {
 				},
 			},
 			want: want{
-				datapoints: []*datapoint.Datapoint{},
-				events:     []*event.Event{},
+				datapoints: make([]*datapoint.Datapoint, 0),
+				events:     make([]*event.Event, 0),
 			},
 		},
 		{
@@ -571,8 +565,8 @@ func TestSignalFx_Errors(t *testing.T) {
 				},
 			},
 			want: want{
-				datapoints: []*datapoint.Datapoint{},
-				events:     []*event.Event{},
+				datapoints: make([]*datapoint.Datapoint, 0),
+				events:     make([]*event.Event, 0),
 			},
 		},
 	}
@@ -584,11 +578,11 @@ func TestSignalFx_Errors(t *testing.T) {
 			s.SignalFxRealm = "test"
 			s.Log = testutil.Logger{}
 
-			require.Nil(t, s.Connect())
+			require.NoError(t, s.Connect())
 
 			s.client = &errorsink{
-				dps: []*datapoint.Datapoint{},
-				evs: []*event.Event{},
+				datapoints: make([]*datapoint.Datapoint, 0),
+				events:     make([]*event.Event, 0),
 			}
 
 			for _, measurement := range tt.measurements {
@@ -596,58 +590,17 @@ func TestSignalFx_Errors(t *testing.T) {
 					measurement.name, measurement.tags, measurement.fields, measurement.time, measurement.tp,
 				)
 
-				s.Write([]telegraf.Metric{m})
+				err := s.Write([]telegraf.Metric{m})
+				require.Error(t, err)
 			}
-			for !(len(s.client.(*errorsink).dps) == len(tt.want.datapoints) && len(s.client.(*errorsink).evs) == len(tt.want.events)) {
+			for !(len(s.client.(*errorsink).datapoints) == len(tt.want.datapoints) && len(s.client.(*errorsink).events) == len(tt.want.events)) {
 				time.Sleep(1 * time.Second)
 			}
-			if !reflect.DeepEqual(s.client.(*errorsink).dps, tt.want.datapoints) {
-				t.Errorf("Collected datapoints do not match desired.  Collected: %v Desired: %v", s.client.(*errorsink).dps, tt.want.datapoints)
+			if !reflect.DeepEqual(s.client.(*errorsink).datapoints, tt.want.datapoints) {
+				t.Errorf("Collected datapoints do not match desired.  Collected: %v Desired: %v", s.client.(*errorsink).datapoints, tt.want.datapoints)
 			}
-			if !reflect.DeepEqual(s.client.(*errorsink).evs, tt.want.events) {
-				t.Errorf("Collected events do not match desired.  Collected: %v Desired: %v", s.client.(*errorsink).evs, tt.want.events)
-			}
-		})
-	}
-}
-
-// this is really just for complete code coverage
-func TestSignalFx_Description(t *testing.T) {
-	tests := []struct {
-		name string
-		want string
-	}{
-		{
-			name: "verify description is correct",
-			want: "Send metrics and events to SignalFx",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := &SignalFx{}
-			if got := s.Description(); got != tt.want {
-				t.Errorf("SignalFx.Description() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-// this is also just for complete code coverage
-func TestSignalFx_SampleConfig(t *testing.T) {
-	tests := []struct {
-		name string
-		want string
-	}{
-		{
-			name: "verify sample config is returned",
-			want: sampleConfig,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := &SignalFx{}
-			if got := s.SampleConfig(); got != tt.want {
-				t.Errorf("SignalFx.SampleConfig() = %v, want %v", got, tt.want)
+			if !reflect.DeepEqual(s.client.(*errorsink).events, tt.want.events) {
+				t.Errorf("Collected events do not match desired.  Collected: %v Desired: %v", s.client.(*errorsink).events, tt.want.events)
 			}
 		})
 	}

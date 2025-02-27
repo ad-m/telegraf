@@ -1,99 +1,89 @@
 package starlark
 
 import (
+	"bytes"
+	"encoding/gob"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/config"
-	"github.com/influxdata/telegraf/plugins/parsers"
-	"github.com/influxdata/telegraf/testutil"
 	"github.com/stretchr/testify/require"
 	starlarktime "go.starlark.net/lib/time"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
+
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/metric"
+	common "github.com/influxdata/telegraf/plugins/common/starlark"
+	"github.com/influxdata/telegraf/plugins/parsers/influx"
+	"github.com/influxdata/telegraf/testutil"
 )
 
 // Tests for runtime errors in the processors Init function.
 func TestInitError(t *testing.T) {
 	tests := []struct {
-		name   string
-		plugin *Starlark
+		name      string
+		constants map[string]interface{}
+		plugin    *Starlark
 	}{
 		{
-			name: "source must define apply",
-			plugin: &Starlark{
-				Source:           "",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "source must define apply",
+			plugin: newStarlarkFromSource(""),
 		},
 		{
 			name: "apply must be a function",
-			plugin: &Starlark{
-				Source: `
+			plugin: newStarlarkFromSource(`
 apply = 42
-`,
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+`),
 		},
 		{
 			name: "apply function must take one arg",
-			plugin: &Starlark{
-				Source: `
+			plugin: newStarlarkFromSource(`
 def apply():
 	pass
-`,
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+`),
 		},
 		{
 			name: "package scope must have valid syntax",
-			plugin: &Starlark{
-				Source: `
+			plugin: newStarlarkFromSource(`
 for
-`,
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+`),
 		},
 		{
-			name: "no source no script",
-			plugin: &Starlark{
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "no source no script",
+			plugin: newStarlarkNoScript(),
 		},
 		{
 			name: "source and script",
-			plugin: &Starlark{
-				Source: `
+			plugin: newStarlarkFromSource(`
 def apply():
 	pass
-`,
-				Script:           "testdata/ratio.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+`),
 		},
 		{
-			name: "script file not found",
-			plugin: &Starlark{
-				Script:           "testdata/file_not_found.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
+			name:   "script file not found",
+			plugin: newStarlarkFromScript("testdata/file_not_found.star"),
+		},
+		{
+			name: "source and script",
+			plugin: newStarlarkFromSource(`
+def apply(metric):
+	metric.fields["p1"] = unsupported_type
+	return metric
+`),
+			constants: map[string]interface{}{
+				"unsupported_type": time.Now(),
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			tt.plugin.Constants = tt.constants
 			err := tt.plugin.Init()
 			require.Error(t, err)
 		})
@@ -122,7 +112,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected: []telegraf.Metric{},
 		},
 		{
 			name: "passthrough",
@@ -194,7 +183,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "append: cannot append to frozen list",
 		},
 		{
@@ -227,11 +215,7 @@ def apply(metric):
 
 	for _, tt := range applyTests {
 		t.Run(tt.name, func(t *testing.T) {
-			plugin := &Starlark{
-				Source:           tt.source,
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			}
+			plugin := newStarlarkFromSource(tt.source)
 			err := plugin.Init()
 			require.NoError(t, err)
 
@@ -249,9 +233,7 @@ def apply(metric):
 				}
 			}
 
-			err = plugin.Stop()
-			require.NoError(t, err)
-
+			plugin.Stop()
 			testutil.RequireMetricsEqual(t, tt.expected, acc.GetTelegrafMetrics())
 		})
 	}
@@ -363,7 +345,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "type error",
 		},
 		{
@@ -432,7 +413,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "cannot set tags",
 		},
 		{
@@ -561,7 +541,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: `key "foo" not in Tags`,
 		},
 		{
@@ -676,7 +655,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "tag value must be of type 'str'",
 		},
 		{
@@ -788,7 +766,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "popitem(): tag dictionary is empty",
 		},
 		{
@@ -1253,7 +1230,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "pop: cannot delete during iteration",
 		},
 		{
@@ -1276,7 +1252,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "cannot delete during iteration",
 		},
 		{
@@ -1299,7 +1274,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "cannot delete during iteration",
 		},
 		{
@@ -1322,7 +1296,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "cannot insert during iteration",
 		},
 		{
@@ -1393,7 +1366,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "cannot set fields",
 		},
 		{
@@ -1600,7 +1572,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: `key "foo" not in Fields`,
 		},
 		{
@@ -1786,7 +1757,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "invalid starlark type",
 		},
 		{
@@ -1902,7 +1872,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "popitem(): field dictionary is empty",
 		},
 		{
@@ -2324,7 +2293,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "pop: cannot delete during iteration",
 		},
 		{
@@ -2342,7 +2310,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "cannot delete during iteration",
 		},
 		{
@@ -2360,7 +2327,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "cannot delete during iteration",
 		},
 		{
@@ -2378,7 +2344,6 @@ def apply(metric):
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "cannot insert during iteration",
 		},
 		{
@@ -2450,7 +2415,6 @@ def apply(metric):
 					time.Unix(0, 0).UTC(),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "type error",
 		},
 		{
@@ -2545,7 +2509,6 @@ def apply(metric):
 					2:   "two",
 					"3": "three",
 				},
-				"unsupported_type": time.Now(),
 			},
 			input: []telegraf.Metric{
 				testutil.MustMetric("cpu",
@@ -2575,12 +2538,8 @@ def apply(metric):
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			plugin := &Starlark{
-				Source:           tt.source,
-				Log:              testutil.Logger{},
-				Constants:        tt.constants,
-				starlarkLoadFunc: testLoadFunc,
-			}
+			plugin := newStarlarkFromSource(tt.source)
+			plugin.Constants = tt.constants
 			err := plugin.Init()
 			require.NoError(t, err)
 
@@ -2592,15 +2551,13 @@ def apply(metric):
 			for _, m := range tt.input {
 				err = plugin.Add(m, &acc)
 				if tt.expectedErrorStr != "" {
-					require.EqualError(t, err, tt.expectedErrorStr)
+					require.ErrorContains(t, err, tt.expectedErrorStr)
 				} else {
 					require.NoError(t, err)
 				}
 			}
 
-			err = plugin.Stop()
-			require.NoError(t, err)
-
+			plugin.Stop()
 			testutil.RequireMetricsEqual(t, tt.expected, acc.GetTelegrafMetrics())
 		})
 	}
@@ -2637,7 +2594,6 @@ def apply(metric):
 	debug_mode = true
 	supported_values = ["2", "3"]
 	supported_entries = { "2" = "two", "3" = "three" }
-	unsupported_type = 2009-06-12
            `,
 			input: []telegraf.Metric{
 				testutil.MustMetric("cpu",
@@ -2682,9 +2638,7 @@ def apply(metric):
 				require.NoError(t, err)
 			}
 
-			err = plugin.Stop()
-			require.NoError(t, err)
-
+			plugin.Stop()
 			testutil.RequireMetricsEqual(t, tt.expected, acc.GetTelegrafMetrics())
 		})
 	}
@@ -2693,16 +2647,16 @@ def apply(metric):
 // Build a Starlark plugin from the provided configuration.
 func buildPlugin(configContent string) (*Starlark, error) {
 	c := config.NewConfig()
-	err := c.LoadConfigData([]byte(configContent))
+	err := c.LoadConfigData([]byte(configContent), config.EmptySourcePath)
 	if err != nil {
 		return nil, err
 	}
 	if len(c.Processors) != 1 {
-		return nil, errors.New("Only one processor was expected")
+		return nil, errors.New("only one processor was expected")
 	}
 	plugin, ok := (c.Processors[0].Processor).(*Starlark)
 	if !ok {
-		return nil, errors.New("Only a Starlark processor was expected")
+		return nil, errors.New("only a Starlark processor was expected")
 	}
 	plugin.Log = testutil.Logger{}
 	return plugin, nil
@@ -2717,12 +2671,8 @@ func TestScript(t *testing.T) {
 		expectedErrorStr string
 	}{
 		{
-			name: "rename",
-			plugin: &Starlark{
-				Script:           "testdata/rename.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "rename",
+			plugin: newStarlarkFromScript("testdata/rename.star"),
 			input: []telegraf.Metric{
 				testutil.MustMetric("cpu",
 					map[string]string{
@@ -2745,12 +2695,8 @@ func TestScript(t *testing.T) {
 			},
 		},
 		{
-			name: "drop fields by type",
-			plugin: &Starlark{
-				Script:           "testdata/drop_string_fields.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "drop fields by type",
+			plugin: newStarlarkFromScript("testdata/drop_string_fields.star"),
 			input: []telegraf.Metric{
 				testutil.MustMetric("device",
 					map[string]string{},
@@ -2777,12 +2723,8 @@ func TestScript(t *testing.T) {
 			},
 		},
 		{
-			name: "drop fields with unexpected type",
-			plugin: &Starlark{
-				Script:           "testdata/drop_fields_with_unexpected_type.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "drop fields with unexpected type",
+			plugin: newStarlarkFromScript("testdata/drop_fields_with_unexpected_type.star"),
 			input: []telegraf.Metric{
 				testutil.MustMetric("device",
 					map[string]string{},
@@ -2812,12 +2754,8 @@ func TestScript(t *testing.T) {
 			},
 		},
 		{
-			name: "scale",
-			plugin: &Starlark{
-				Script:           "testdata/scale.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "scale",
+			plugin: newStarlarkFromScript("testdata/scale.star"),
 			input: []telegraf.Metric{
 				testutil.MustMetric("cpu",
 					map[string]string{},
@@ -2834,12 +2772,8 @@ func TestScript(t *testing.T) {
 			},
 		},
 		{
-			name: "ratio",
-			plugin: &Starlark{
-				Script:           "testdata/ratio.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "ratio",
+			plugin: newStarlarkFromScript("testdata/ratio.star"),
 			input: []telegraf.Metric{
 				testutil.MustMetric("mem",
 					map[string]string{},
@@ -2863,12 +2797,8 @@ func TestScript(t *testing.T) {
 			},
 		},
 		{
-			name: "logging",
-			plugin: &Starlark{
-				Script:           "testdata/logging.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "logging",
+			plugin: newStarlarkFromScript("testdata/logging.star"),
 			input: []telegraf.Metric{
 				testutil.MustMetric("log",
 					map[string]string{},
@@ -2889,12 +2819,8 @@ func TestScript(t *testing.T) {
 			},
 		},
 		{
-			name: "multiple_metrics",
-			plugin: &Starlark{
-				Script:           "testdata/multiple_metrics.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "multiple_metrics",
+			plugin: newStarlarkFromScript("testdata/multiple_metrics.star"),
 			input: []telegraf.Metric{
 				testutil.MustMetric("mm",
 					map[string]string{},
@@ -2922,12 +2848,8 @@ func TestScript(t *testing.T) {
 			},
 		},
 		{
-			name: "multiple_metrics_with_json",
-			plugin: &Starlark{
-				Script:           "testdata/multiple_metrics_with_json.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "multiple_metrics_with_json",
+			plugin: newStarlarkFromScript("testdata/multiple_metrics_with_json.star"),
 			input: []telegraf.Metric{
 				testutil.MustMetric("json",
 					map[string]string{},
@@ -2955,12 +2877,8 @@ func TestScript(t *testing.T) {
 			},
 		},
 		{
-			name: "fail",
-			plugin: &Starlark{
-				Script:           "testdata/fail.star",
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			},
+			name:   "fail",
+			plugin: newStarlarkFromScript("testdata/fail.star"),
 			input: []telegraf.Metric{
 				testutil.MustMetric("fail",
 					map[string]string{},
@@ -2970,7 +2888,6 @@ func TestScript(t *testing.T) {
 					time.Unix(0, 0),
 				),
 			},
-			expected:         []telegraf.Metric{},
 			expectedErrorStr: "fail: The field value should be greater than 1",
 		},
 	}
@@ -2994,9 +2911,7 @@ func TestScript(t *testing.T) {
 				}
 			}
 
-			err = tt.plugin.Stop()
-			require.NoError(t, err)
-
+			tt.plugin.Stop()
 			testutil.RequireMetricsEqual(t, tt.expected, acc.GetTelegrafMetrics())
 		})
 	}
@@ -3242,15 +3157,96 @@ def apply(metric):
 				),
 			},
 		},
+		{
+			name: "concatenate 2 tags",
+			source: `
+def apply(metric):
+	metric.tags["result"] = '_'.join(metric.tags.values())
+	return metric
+`,
+			input: []telegraf.Metric{
+				testutil.MustMetric("cpu",
+					map[string]string{
+						"tag_1": "a",
+						"tag_2": "b",
+					},
+					map[string]interface{}{"value": 42},
+					time.Unix(0, 0),
+				),
+			},
+		},
+		{
+			name: "concatenate 4 tags",
+			source: `
+def apply(metric):
+	metric.tags["result"] = '_'.join(metric.tags.values())
+	return metric
+`,
+			input: []telegraf.Metric{
+				testutil.MustMetric("cpu",
+					map[string]string{
+						"tag_1": "a",
+						"tag_2": "b",
+						"tag_3": "c",
+						"tag_4": "d",
+					},
+					map[string]interface{}{"value": 42},
+					time.Unix(0, 0),
+				),
+			},
+		},
+		{
+			name: "concatenate 8 tags",
+			source: `
+def apply(metric):
+	metric.tags["result"] = '_'.join(metric.tags.values())
+	return metric
+`,
+			input: []telegraf.Metric{
+				testutil.MustMetric("cpu",
+					map[string]string{
+						"tag_1": "a",
+						"tag_2": "b",
+						"tag_3": "c",
+						"tag_4": "d",
+						"tag_5": "e",
+						"tag_6": "f",
+						"tag_7": "g",
+						"tag_8": "h",
+					},
+					map[string]interface{}{"value": 42},
+					time.Unix(0, 0),
+				),
+			},
+		},
+		{
+			name: "filter by field value",
+			source: `
+def apply(metric):
+	match = metric.tags.get("bar") == "yeah" or metric.tags.get("tag_1") == "foo"
+	match = match and metric.fields.get("value_1") > 5 and metric.fields.get("value_2") < 3.5
+	if match:
+		return metric
+	return None
+`,
+			input: []telegraf.Metric{
+				testutil.MustMetric("cpu",
+					map[string]string{
+						"tag_1": "foo",
+					},
+					map[string]interface{}{
+						"value_1": 42,
+						"value_2": 3.1415,
+					},
+					time.Unix(0, 0),
+				),
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
-			plugin := &Starlark{
-				Source:           tt.source,
-				Log:              testutil.Logger{},
-				starlarkLoadFunc: testLoadFunc,
-			}
+			plugin := newStarlarkFromSource(tt.source)
 
 			err := plugin.Init()
 			require.NoError(b, err)
@@ -3263,12 +3259,12 @@ def apply(metric):
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
 				for _, m := range tt.input {
-					plugin.Add(m, &acc)
+					err = plugin.Add(m, &acc)
+					require.NoError(b, err)
 				}
 			}
 
-			err = plugin.Stop()
-			require.NoError(b, err)
+			plugin.Stop()
 		})
 	}
 }
@@ -3277,7 +3273,7 @@ func TestAllScriptTestData(t *testing.T) {
 	// can be run from multiple folders
 	paths := []string{"testdata", "plugins/processors/starlark/testdata"}
 	for _, testdataPath := range paths {
-		filepath.Walk(testdataPath, func(path string, info os.FileInfo, err error) error {
+		err := filepath.Walk(testdataPath, func(path string, info os.FileInfo, _ error) error {
 			if info == nil || info.IsDir() {
 				return nil
 			}
@@ -3288,15 +3284,11 @@ func TestAllScriptTestData(t *testing.T) {
 				lines := strings.Split(string(b), "\n")
 				inputMetrics := parseMetricsFrom(t, lines, "Example Input:")
 				expectedErrorStr := parseErrorMessage(t, lines, "Example Output Error:")
-				outputMetrics := []telegraf.Metric{}
+				var outputMetrics []telegraf.Metric
 				if expectedErrorStr == "" {
 					outputMetrics = parseMetricsFrom(t, lines, "Example Output:")
 				}
-				plugin := &Starlark{
-					Script:           fn,
-					Log:              testutil.Logger{},
-					starlarkLoadFunc: testLoadFunc,
-				}
+				plugin := newStarlarkFromScript(fn)
 				require.NoError(t, plugin.Init())
 
 				acc := &testutil.Accumulator{}
@@ -3313,21 +3305,435 @@ func TestAllScriptTestData(t *testing.T) {
 					}
 				}
 
-				err = plugin.Stop()
-				require.NoError(t, err)
-
+				plugin.Stop()
 				testutil.RequireMetricsEqual(t, outputMetrics, acc.GetTelegrafMetrics(), testutil.SortMetrics())
 			})
 			return nil
 		})
+		require.NoError(t, err)
 	}
 }
 
-var parser, _ = parsers.NewInfluxParser() // literally never returns errors.
+func TestTracking(t *testing.T) {
+	var testCases = []struct {
+		name       string
+		source     string
+		numMetrics int
+	}{
+		{
+			name:       "return none",
+			numMetrics: 0,
+			source: `
+def apply(metric):
+	return None
+`,
+		},
+		{
+			name:       "return empty list of metrics",
+			numMetrics: 0,
+			source: `
+def apply(metric):
+	return []
+`,
+		},
+		{
+			name:       "return original metric",
+			numMetrics: 1,
+			source: `
+def apply(metric):
+	return metric
+`,
+		},
+		{
+			name:       "return original metric in a list",
+			numMetrics: 1,
+			source: `
+def apply(metric):
+	return [metric]
+`,
+		},
+		{
+			name:       "return new metric",
+			numMetrics: 1,
+			source: `
+def apply(metric):
+	newmetric = Metric("new_metric")
+	newmetric.fields["value"] = 42
+	return newmetric
+`,
+		},
+		{
+			name:       "return new metric in a list",
+			numMetrics: 1,
+			source: `
+def apply(metric):
+	newmetric = Metric("new_metric")
+	newmetric.fields["value"] = 42
+	return [newmetric]
+`,
+		},
+		{
+			name:       "return original and new metric in a list",
+			numMetrics: 2,
+			source: `
+def apply(metric):
+	newmetric = Metric("new_metric")
+	newmetric.fields["value"] = 42
+	return [metric, newmetric]
+`,
+		},
+		{
+			name:       "return original and deep-copy",
+			numMetrics: 2,
+			source: `
+def apply(metric):
+    return [metric, deepcopy(metric, track=True)]
+`,
+		},
+		{
+			name:       "deep-copy but do not return",
+			numMetrics: 1,
+			source: `
+def apply(metric):
+    x = deepcopy(metric)
+    return [metric]
+`,
+		},
+		{
+			name:       "deep-copy but do not return original metric",
+			numMetrics: 1,
+			source: `
+def apply(metric):
+    x = deepcopy(metric, track=True)
+    return [x]
+`,
+		},
+		{
+			name:       "issue #14484",
+			numMetrics: 1,
+			source: `
+def apply(metric):
+    metric.tags.pop("tag1")
+    return [metric]
+`,
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a tracking metric and tap the delivery information
+			var mu sync.Mutex
+			delivered := make([]telegraf.DeliveryInfo, 0, 1)
+			notify := func(di telegraf.DeliveryInfo) {
+				mu.Lock()
+				defer mu.Unlock()
+				delivered = append(delivered, di)
+			}
+
+			// Configure the plugin
+			plugin := newStarlarkFromSource(tt.source)
+			require.NoError(t, plugin.Init())
+			acc := &testutil.Accumulator{}
+			require.NoError(t, plugin.Start(acc))
+
+			// Process expected metrics and compare with resulting metrics
+			input, _ := metric.WithTracking(testutil.TestMetric(1.23), notify)
+			require.NoError(t, plugin.Add(input, acc))
+			plugin.Stop()
+
+			// Ensure we get back the correct number of metrics
+			actual := acc.GetTelegrafMetrics()
+			require.Lenf(t, actual, tt.numMetrics, "expected %d metrics but got %d", tt.numMetrics, len(actual))
+			for _, m := range actual {
+				m.Accept()
+			}
+
+			// Simulate output acknowledging delivery of metrics and check delivery
+			require.Eventuallyf(t, func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(delivered) == 1
+			}, 1*time.Second, 100*time.Millisecond, "original metric not delivered")
+		})
+	}
+}
+
+func TestTrackingStateful(t *testing.T) {
+	var testCases = []struct {
+		name     string
+		source   string
+		results  int
+		loops    int
+		delivery int
+	}{
+		{
+			name:     "delayed release",
+			loops:    4,
+			results:  3,
+			delivery: 4,
+			source: `
+state = {"last": None}
+
+def apply(metric):
+  previous = state["last"]
+  state["last"] = deepcopy(metric)
+  return previous
+`,
+		},
+		{
+			name:     "delayed release with tracking",
+			loops:    4,
+			results:  3,
+			delivery: 3,
+			source: `
+state = {"last": None}
+
+def apply(metric):
+  previous = state["last"]
+  state["last"] = deepcopy(metric, track=True)
+  return previous
+`,
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a tracking metric and tap the delivery information
+			var mu sync.Mutex
+			delivered := make([]telegraf.TrackingID, 0, tt.delivery)
+			notify := func(di telegraf.DeliveryInfo) {
+				mu.Lock()
+				defer mu.Unlock()
+				delivered = append(delivered, di.ID())
+			}
+
+			// Configure the plugin
+			plugin := newStarlarkFromSource(tt.source)
+			require.NoError(t, plugin.Init())
+			acc := &testutil.Accumulator{}
+			require.NoError(t, plugin.Start(acc))
+
+			// Do the requested number of loops
+			expected := make([]telegraf.TrackingID, 0, tt.loops)
+			for i := 0; i < tt.loops; i++ {
+				// Process expected metrics and compare with resulting metrics
+				input, tid := metric.WithTracking(testutil.TestMetric(i), notify)
+				expected = append(expected, tid)
+				require.NoError(t, plugin.Add(input, acc))
+			}
+			plugin.Stop()
+			expected = expected[:tt.delivery]
+
+			// Simulate output acknowledging delivery of metrics and check delivery
+			actual := acc.GetTelegrafMetrics()
+			// Ensure we get back the correct number of metrics
+			require.Lenf(t, actual, tt.results, "expected %d metrics but got %d", tt.results, len(actual))
+			for _, m := range actual {
+				m.Accept()
+			}
+
+			require.Eventuallyf(t, func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(delivered) >= tt.delivery
+			}, 1*time.Second, 100*time.Millisecond, "original metric(s) not delivered")
+
+			mu.Lock()
+			defer mu.Unlock()
+			require.ElementsMatch(t, expected, delivered, "mismatch in delivered metrics")
+		})
+	}
+}
+
+func TestGlobalState(t *testing.T) {
+	source := `
+def apply(metric):
+  count = state.get("count", 0)
+  count += 1
+  state["count"] = count
+
+  metric.fields["count"] = count
+
+  return metric
+`
+	// Define the metrics
+	input := []telegraf.Metric{
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": 42},
+			time.Unix(1713188113, 10),
+		),
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": 42},
+			time.Unix(1713188113, 20),
+		),
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": 42},
+			time.Unix(1713188113, 30),
+		)}
+	expected := []telegraf.Metric{
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": 42, "count": 1},
+			time.Unix(1713188113, 10),
+		),
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": 42, "count": 2},
+			time.Unix(1713188113, 20),
+		),
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": 42, "count": 3},
+			time.Unix(1713188113, 30),
+		),
+	}
+
+	// Configure the plugin
+	plugin := &Starlark{
+		Common: common.Common{
+			StarlarkLoadFunc: testLoadFunc,
+			Source:           source,
+			Log:              testutil.Logger{},
+		},
+	}
+	require.NoError(t, plugin.Init())
+
+	var acc testutil.Accumulator
+	require.NoError(t, plugin.Start(&acc))
+
+	// Do the processing
+	for _, m := range input {
+		require.NoError(t, plugin.Add(m, &acc))
+	}
+	plugin.Stop()
+
+	// Check
+	actual := acc.GetTelegrafMetrics()
+	testutil.RequireMetricsEqual(t, expected, actual)
+}
+
+func TestStatePersistence(t *testing.T) {
+	source := `
+def apply(metric):
+  count = state.get("count", 0)
+  count += 1
+  state["count"] = count
+
+  metric.fields["count"] = count
+  metric.tags["instance"] = state.get("instance", "unknown")
+
+  return metric
+`
+	// Define the metrics
+	input := []telegraf.Metric{
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": 42},
+			time.Unix(1713188113, 10),
+		),
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": 42},
+			time.Unix(1713188113, 20),
+		),
+		metric.New(
+			"test",
+			map[string]string{},
+			map[string]interface{}{"value": 42},
+			time.Unix(1713188113, 30),
+		)}
+	expected := []telegraf.Metric{
+		metric.New(
+			"test",
+			map[string]string{"instance": "myhost"},
+			map[string]interface{}{"value": 42, "count": 1},
+			time.Unix(1713188113, 10),
+		),
+		metric.New(
+			"test",
+			map[string]string{"instance": "myhost"},
+			map[string]interface{}{"value": 42, "count": 2},
+			time.Unix(1713188113, 20),
+		),
+		metric.New(
+			"test",
+			map[string]string{"instance": "myhost"},
+			map[string]interface{}{"value": 42, "count": 3},
+			time.Unix(1713188113, 30),
+		),
+	}
+
+	// Configure the plugin
+	plugin := &Starlark{
+		Common: common.Common{
+			StarlarkLoadFunc: testLoadFunc,
+			Source:           source,
+			Log:              testutil.Logger{},
+		},
+	}
+	require.NoError(t, plugin.Init())
+
+	// Setup the "persisted" state
+	var pi telegraf.StatefulPlugin = plugin
+	var buf bytes.Buffer
+	require.NoError(t, gob.NewEncoder(&buf).Encode(map[string]interface{}{"instance": "myhost"}))
+	require.NoError(t, pi.SetState(buf.Bytes()))
+
+	var acc testutil.Accumulator
+	require.NoError(t, plugin.Start(&acc))
+
+	// Do the processing
+	for _, m := range input {
+		require.NoError(t, plugin.Add(m, &acc))
+	}
+	plugin.Stop()
+
+	// Check
+	actual := acc.GetTelegrafMetrics()
+	testutil.RequireMetricsEqual(t, expected, actual)
+
+	// Check getting the persisted state
+	expectedState := map[string]interface{}{"instance": "myhost", "count": int64(3)}
+
+	var actualState map[string]interface{}
+	stateData, ok := pi.GetState().([]byte)
+	require.True(t, ok, "state is not a bytes array")
+	require.NoError(t, gob.NewDecoder(bytes.NewBuffer(stateData)).Decode(&actualState))
+	require.EqualValues(t, expectedState, actualState, "mismatch in state")
+}
+
+func TestUsePredefinedStateName(t *testing.T) {
+	source := `
+def apply(metric):
+  return metric
+`
+	// Configure the plugin
+	plugin := &Starlark{
+		Common: common.Common{
+			StarlarkLoadFunc: testLoadFunc,
+			Source:           source,
+			Constants:        map[string]interface{}{"state": "invalid"},
+			Log:              testutil.Logger{},
+		},
+	}
+	require.ErrorContains(t, plugin.Init(), "'state' constant uses reserved name")
+}
 
 // parses metric lines out of line protocol following a header, with a trailing blank line
 func parseMetricsFrom(t *testing.T, lines []string, header string) (metrics []telegraf.Metric) {
-	require.NotZero(t, len(lines), "Expected some lines to parse from .star file, found none")
+	parser := &influx.Parser{}
+	require.NoError(t, parser.Init())
+
+	require.NotEmpty(t, lines, "Expected some lines to parse from .star file, found none")
 	startIdx := -1
 	endIdx := len(lines)
 	for i := range lines {
@@ -3336,7 +3742,7 @@ func parseMetricsFrom(t *testing.T, lines []string, header string) (metrics []te
 			break
 		}
 	}
-	require.NotEqual(t, -1, startIdx, fmt.Sprintf("Header %q must exist in file", header))
+	require.NotEqualf(t, -1, startIdx, "Header %q must exist in file", header)
 	for i := startIdx; i < len(lines); i++ {
 		line := strings.TrimLeft(lines[i], "# ")
 		if line == "" || line == "'''" {
@@ -3346,7 +3752,7 @@ func parseMetricsFrom(t *testing.T, lines []string, header string) (metrics []te
 	}
 	for i := startIdx; i < endIdx; i++ {
 		m, err := parser.ParseLine(strings.TrimLeft(lines[i], "# "))
-		require.NoError(t, err, fmt.Sprintf("Expected to be able to parse %q metric, but found error", header))
+		require.NoErrorf(t, err, "Expected to be able to parse %q metric, but found error", header)
 		metrics = append(metrics, m)
 	}
 	return metrics
@@ -3354,7 +3760,7 @@ func parseMetricsFrom(t *testing.T, lines []string, header string) (metrics []te
 
 // parses error message out of line protocol following a header
 func parseErrorMessage(t *testing.T, lines []string, header string) string {
-	require.NotZero(t, len(lines), "Expected some lines to parse from .star file, found none")
+	require.NotEmpty(t, lines, "Expected some lines to parse from .star file, found none")
 	startIdx := -1
 	for i := range lines {
 		if strings.TrimLeft(lines[i], "# ") == header {
@@ -3365,12 +3771,12 @@ func parseErrorMessage(t *testing.T, lines []string, header string) string {
 	if startIdx == -1 {
 		return ""
 	}
-	require.True(t, startIdx < len(lines), fmt.Sprintf("Expected to find the error message after %q, but found none", header))
+	require.Lessf(t, startIdx, len(lines), "Expected to find the error message after %q, but found none", header)
 	return strings.TrimLeft(lines[startIdx], "# ")
 }
 
 func testLoadFunc(module string, logger telegraf.Logger) (starlark.StringDict, error) {
-	result, err := loadFunc(module, logger)
+	result, err := common.LoadFunc(module, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -3384,6 +3790,35 @@ func testLoadFunc(module string, logger telegraf.Logger) (starlark.StringDict, e
 	return result, nil
 }
 
-func testNow(thread *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func testNow(_ *starlark.Thread, _ *starlark.Builtin, _ starlark.Tuple, _ []starlark.Tuple) (starlark.Value, error) {
 	return starlarktime.Time(time.Date(2021, 4, 15, 12, 0, 0, 999, time.UTC)), nil
+}
+
+func newStarlarkFromSource(source string) *Starlark {
+	return &Starlark{
+		Common: common.Common{
+			StarlarkLoadFunc: testLoadFunc,
+			Log:              testutil.Logger{},
+			Source:           source,
+		},
+	}
+}
+
+func newStarlarkFromScript(script string) *Starlark {
+	return &Starlark{
+		Common: common.Common{
+			StarlarkLoadFunc: testLoadFunc,
+			Log:              testutil.Logger{},
+			Script:           script,
+		},
+	}
+}
+
+func newStarlarkNoScript() *Starlark {
+	return &Starlark{
+		Common: common.Common{
+			StarlarkLoadFunc: testLoadFunc,
+			Log:              testutil.Logger{},
+		},
+	}
 }

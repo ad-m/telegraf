@@ -1,129 +1,172 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package graphite
 
 import (
 	"crypto/tls"
+	_ "embed"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/influxdata/telegraf"
-	tlsint "github.com/influxdata/telegraf/plugins/common/tls"
+	"github.com/influxdata/telegraf/config"
+	common_tls "github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	"github.com/influxdata/telegraf/plugins/serializers"
+	"github.com/influxdata/telegraf/plugins/serializers/graphite"
 )
+
+//go:embed sample.conf
+var sampleConfig string
+
+var ErrNotConnected = errors.New("could not write to any server in cluster")
+
+type connection struct {
+	name      string
+	conn      net.Conn
+	connected bool
+}
 
 type Graphite struct {
 	GraphiteTagSupport      bool   `toml:"graphite_tag_support"`
 	GraphiteTagSanitizeMode string `toml:"graphite_tag_sanitize_mode"`
 	GraphiteSeparator       string `toml:"graphite_separator"`
+	GraphiteStrictRegex     string `toml:"graphite_strict_sanitize_regex"`
 	// URL is only for backwards compatibility
 	Servers   []string        `toml:"servers"`
+	LocalAddr string          `toml:"local_address"`
 	Prefix    string          `toml:"prefix"`
 	Template  string          `toml:"template"`
 	Templates []string        `toml:"templates"`
-	Timeout   int             `toml:"timeout"`
+	Timeout   config.Duration `toml:"timeout"`
 	Log       telegraf.Logger `toml:"-"`
+	common_tls.ClientConfig
 
-	conns []net.Conn
-	tlsint.ClientConfig
+	connections []connection
+	serializer  *graphite.GraphiteSerializer
 }
 
-var sampleConfig = `
-  ## TCP endpoint for your graphite instance.
-  ## If multiple endpoints are configured, output will be load balanced.
-  ## Only one of the endpoints will be written to with each iteration.
-  servers = ["localhost:2003"]
-  ## Prefix metrics name
-  prefix = ""
-  ## Graphite output template
-  ## see https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_OUTPUT.md
-  template = "host.tags.measurement.field"
+func (*Graphite) SampleConfig() string {
+	return sampleConfig
+}
 
-  ## Enable Graphite tags support
-  # graphite_tag_support = false
-
-  ## Define how metric names and tags are sanitized; options are "strict", or "compatible"
-  ## strict - Default method, and backwards compatible with previous versionf of Telegraf
-  ## compatible - More relaxed sanitizing when using tags, and compatible with the graphite spec
-  # graphite_tag_sanitize_mode = "strict"
-
-  ## Character for separating metric name and field for Graphite tags
-  # graphite_separator = "."
-
-  ## Graphite templates patterns
-  ## 1. Template for cpu
-  ## 2. Template for disk*
-  ## 3. Default template
-  # templates = [
-  #  "cpu tags.measurement.host.field",
-  #  "disk* measurement.field",
-  #  "host.measurement.tags.field"
-  #]
-
-  ## timeout in seconds for the write connection to graphite
-  timeout = 2
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-`
-
-func (g *Graphite) Connect() error {
-	// Set default values
-	if g.Timeout <= 0 {
-		g.Timeout = 2
+func (g *Graphite) Init() error {
+	s := &graphite.GraphiteSerializer{
+		Prefix:          g.Prefix,
+		Template:        g.Template,
+		StrictRegex:     g.GraphiteStrictRegex,
+		TagSupport:      g.GraphiteTagSupport,
+		TagSanitizeMode: g.GraphiteTagSanitizeMode,
+		Separator:       g.GraphiteSeparator,
+		Templates:       g.Templates,
 	}
+	if err := s.Init(); err != nil {
+		return err
+	}
+	g.serializer = s
+
+	// Set default values
 	if len(g.Servers) == 0 {
 		g.Servers = append(g.Servers, "localhost:2003")
 	}
 
+	// Fill in the connections from the server
+	g.connections = make([]connection, 0, len(g.Servers))
+	for _, server := range g.Servers {
+		g.connections = append(g.connections, connection{
+			name:      server,
+			connected: false,
+		})
+	}
+
+	return nil
+}
+
+func (g *Graphite) Connect() error {
 	// Set tls config
 	tlsConfig, err := g.ClientConfig.TLSConfig()
 	if err != nil {
 		return err
 	}
 
-	// Get Connections
-	var conns []net.Conn
-	for _, server := range g.Servers {
+	// Find all non-connected servers and try to reconnect
+	var newConnection bool
+	var connectedServers int
+	var failedServers []string
+	for i, server := range g.connections {
+		if server.connected {
+			connectedServers++
+			continue
+		}
+		newConnection = true
+
 		// Dialer with timeout
-		d := net.Dialer{Timeout: time.Duration(g.Timeout) * time.Second}
+		d := net.Dialer{Timeout: time.Duration(g.Timeout)}
+		if g.LocalAddr != "" {
+			// Resolve the local address into IP address and the given port if any
+			addr, sPort, err := net.SplitHostPort(g.LocalAddr)
+			if err != nil {
+				if !strings.Contains(err.Error(), "missing port") {
+					return fmt.Errorf("invalid local address: %w", err)
+				}
+				addr = g.LocalAddr
+			}
+			local, err := net.ResolveIPAddr("ip", addr)
+			if err != nil {
+				return fmt.Errorf("cannot resolve local address: %w", err)
+			}
+
+			var port int
+			if sPort != "" {
+				p, err := strconv.ParseUint(sPort, 10, 16)
+				if err != nil {
+					return fmt.Errorf("invalid port: %w", err)
+				}
+				port = int(p)
+			}
+
+			d.LocalAddr = &net.TCPAddr{IP: local.IP, Port: port, Zone: local.Zone}
+		}
 
 		// Get secure connection if tls config is set
 		var conn net.Conn
 		if tlsConfig != nil {
-			conn, err = tls.DialWithDialer(&d, "tcp", server, tlsConfig)
+			conn, err = tls.DialWithDialer(&d, "tcp", server.name, tlsConfig)
 		} else {
-			conn, err = d.Dial("tcp", server)
+			conn, err = d.Dial("tcp", server.name)
 		}
 
 		if err == nil {
-			conns = append(conns, conn)
+			g.connections[i].conn = conn
+			g.connections[i].connected = true
+			connectedServers++
+		} else {
+			g.Log.Debugf("Failed to establish connection: %v", err)
+			failedServers = append(failedServers, server.name)
 		}
 	}
-	g.conns = conns
+
+	if newConnection {
+		g.Log.Debugf("Successful connections: %d of %d", connectedServers, len(g.connections))
+	}
+	if len(failedServers) > 0 {
+		g.Log.Debugf("Failed servers: %d", len(failedServers))
+	}
+
 	return nil
 }
 
 func (g *Graphite) Close() error {
 	// Closing all connections
-	for _, conn := range g.conns {
-		conn.Close()
+	for _, c := range g.connections {
+		_ = c.conn.Close()
+		c.connected = false
 	}
 	return nil
-}
-
-func (g *Graphite) SampleConfig() string {
-	return sampleConfig
-}
-
-func (g *Graphite) Description() string {
-	return "Configuration for Graphite server to send metrics to"
 }
 
 // We need check eof as we can write to nothing without noticing anything is wrong
@@ -131,24 +174,40 @@ func (g *Graphite) Description() string {
 // We can detect that by finding an eof
 // if not for this, we can happily write and flush without getting errors (in Go) but getting RST tcp packets back (!)
 // props to Tv via the authors of carbon-relay-ng` for this trick.
-func (g *Graphite) checkEOF(conn net.Conn) {
+func (g *Graphite) checkEOF(conn net.Conn) error {
 	b := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+		g.Log.Debugf(
+			"Couldn't set read deadline for connection due to error %v with remote address %s. closing conn explicitly",
+			err,
+			conn.RemoteAddr().String(),
+		)
+		err = conn.Close()
+		g.Log.Debugf("Failed to close the connection: %v", err)
+		return err
+	}
 	num, err := conn.Read(b)
-	if err == io.EOF {
-		g.Log.Errorf("Conn %s is closed. closing conn explicitly", conn)
-		conn.Close()
-		return
+	if errors.Is(err, io.EOF) {
+		g.Log.Debugf("Conn %s is closed. closing conn explicitly", conn.RemoteAddr().String())
+		err = conn.Close()
+		g.Log.Debugf("Failed to close the connection: %v", err)
+		return err
 	}
 	// just in case i misunderstand something or the remote behaves badly
 	if num != 0 {
 		g.Log.Infof("conn %s .conn.Read data? did not expect that. data: %s", conn, b[:num])
 	}
-	// Log non-timeout errors or close.
-	if e, ok := err.(net.Error); !(ok && e.Timeout()) {
-		g.Log.Errorf("conn %s checkEOF .conn.Read returned err != EOF, which is unexpected.  closing conn. error: %s", conn, err)
-		conn.Close()
+	// Log non-timeout errors and close.
+	var netErr net.Error
+	if !(errors.As(err, &netErr) && netErr.Timeout()) {
+		g.Log.Debugf("conn %s checkEOF .conn.Read returned err != EOF, which is unexpected.  closing conn. error: %s", conn, err)
+		err = conn.Close()
+		g.Log.Debugf("Failed to close the connection: %v", err)
+		return err
 	}
+
+	return nil
 }
 
 // Choose a random server in the cluster to write to until a successful write
@@ -156,59 +215,92 @@ func (g *Graphite) checkEOF(conn net.Conn) {
 func (g *Graphite) Write(metrics []telegraf.Metric) error {
 	// Prepare data
 	var batch []byte
-	s, err := serializers.NewGraphiteSerializer(g.Prefix, g.Template, g.GraphiteTagSupport, g.GraphiteTagSanitizeMode, g.GraphiteSeparator, g.Templates)
-	if err != nil {
-		return err
-	}
-
 	for _, metric := range metrics {
-		buf, err := s.Serialize(metric)
+		buf, err := g.serializer.Serialize(metric)
 		if err != nil {
 			g.Log.Errorf("Error serializing some metrics to graphite: %s", err.Error())
 		}
 		batch = append(batch, buf...)
 	}
 
-	err = g.send(batch)
-
-	// try to reconnect and retry to send
-	if err != nil {
-		g.Log.Error("Graphite: Reconnecting and retrying...")
-		g.Connect()
-		err = g.send(batch)
+	// Try to connect to all servers not yet connected if any
+	if err := g.Connect(); err != nil {
+		return fmt.Errorf("failed to reconnect: %w", err)
 	}
 
-	return err
+	// Return on success of if we encounter a non-retryable error
+	if err := g.send(batch); err == nil || !errors.Is(err, ErrNotConnected) {
+		return err
+	}
+
+	// Try to reconnect and resend
+	failedServers := make([]string, 0, len(g.connections))
+	for _, c := range g.connections {
+		if !c.connected {
+			failedServers = append(failedServers, c.name)
+		}
+	}
+	if len(failedServers) > 0 {
+		g.Log.Debugf("Reconnecting and retrying for the following servers: %s", strings.Join(failedServers, ","))
+		if err := g.Connect(); err != nil {
+			return fmt.Errorf("failed to reconnect: %w", err)
+		}
+	}
+
+	return g.send(batch)
 }
 
 func (g *Graphite) send(batch []byte) error {
-	// This will get set to nil if a successful write occurs
-	err := errors.New("could not write to any Graphite server in cluster")
+	// Try sending the data to a server. Try them in random order
+	p := rand.Perm(len(g.connections))
+	for i, n := range p {
+		server := g.connections[n]
 
-	// Send data to a random server
-	p := rand.Perm(len(g.conns))
-	for _, n := range p {
+		// Skip unconnected servers
+		if !server.connected {
+			continue
+		}
+
 		if g.Timeout > 0 {
-			g.conns[n].SetWriteDeadline(time.Now().Add(time.Duration(g.Timeout) * time.Second))
+			deadline := time.Now().Add(time.Duration(g.Timeout))
+			if err := server.conn.SetWriteDeadline(deadline); err != nil {
+				g.Log.Warnf("failed to set write deadline for %q: %v", server.name, err)
+				g.connections[n].connected = false
+				continue
+			}
 		}
-		g.checkEOF(g.conns[n])
-		if _, e := g.conns[n].Write(batch); e != nil {
-			// Error
-			g.Log.Errorf("Graphite Error: " + e.Error())
-			// Close explicitly and let's try the next one
-			g.conns[n].Close()
-		} else {
-			// Success
-			err = nil
-			break
+
+		// Check the connection state
+		if err := g.checkEOF(server.conn); err != nil {
+			// Mark server as failed so a new connection will be made
+			g.connections[n].connected = false
+			continue
 		}
+		_, err := server.conn.Write(batch)
+		if err == nil {
+			// Sending the data was successfully
+			return nil
+		}
+
+		g.Log.Errorf("Writing to %q failed: %v", server.name, err)
+		if i < len(p)-1 {
+			g.Log.Info("Trying next server...")
+		}
+		// Mark server as failed so a new connection will be made
+		if server.conn != nil {
+			if err := server.conn.Close(); err != nil {
+				g.Log.Debugf("Failed to close connection to %q: %v", server.name, err)
+			}
+		}
+		g.connections[n].connected = false
 	}
 
-	return err
+	// If we end here, none of the writes were successful
+	return ErrNotConnected
 }
 
 func init() {
 	outputs.Add("graphite", func() telegraf.Output {
-		return &Graphite{}
+		return &Graphite{Timeout: config.Duration(2 * time.Second)}
 	})
 }

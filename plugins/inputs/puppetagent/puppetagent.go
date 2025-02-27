@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package puppetagent
 
 import (
+	_ "embed"
 	"fmt"
 	"os"
 	"reflect"
@@ -12,17 +14,14 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-// PuppetAgent is a PuppetAgent plugin
+//go:embed sample.conf
+var sampleConfig string
+
 type PuppetAgent struct {
-	Location string
+	Location string `toml:"location"`
 }
 
-var sampleConfig = `
-  ## Location of puppet last run summary file
-  location = "/var/lib/puppet/state/last_run_summary.yaml"
-`
-
-type State struct {
+type state struct {
 	Events    event
 	Resources resource
 	Changes   change
@@ -82,14 +81,8 @@ type version struct {
 	Puppet       string `yaml:"puppet"`
 }
 
-// SampleConfig returns sample configuration message
-func (pa *PuppetAgent) SampleConfig() string {
+func (*PuppetAgent) SampleConfig() string {
 	return sampleConfig
-}
-
-// Description returns description of PuppetAgent plugin
-func (pa *PuppetAgent) Description() string {
-	return `Reads last_run_summary.yaml file and converts to measurements`
 }
 
 // Gather reads stats from all configured servers accumulates stats
@@ -99,19 +92,19 @@ func (pa *PuppetAgent) Gather(acc telegraf.Accumulator) error {
 	}
 
 	if _, err := os.Stat(pa.Location); err != nil {
-		return fmt.Errorf("%s", err)
+		return err
 	}
 
 	fh, err := os.ReadFile(pa.Location)
 	if err != nil {
-		return fmt.Errorf("%s", err)
+		return err
 	}
 
-	var puppetState State
+	var puppetState state
 
 	err = yaml.Unmarshal(fh, &puppetState)
 	if err != nil {
-		return fmt.Errorf("%s", err)
+		return err
 	}
 
 	tags := map[string]string{"location": pa.Location}
@@ -120,7 +113,7 @@ func (pa *PuppetAgent) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func structPrinter(s *State, acc telegraf.Accumulator, tags map[string]string) {
+func structPrinter(s *state, acc telegraf.Accumulator, tags map[string]string) {
 	e := reflect.ValueOf(s).Elem()
 
 	fields := make(map[string]interface{})

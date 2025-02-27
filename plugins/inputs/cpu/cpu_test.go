@@ -4,19 +4,27 @@ import (
 	"fmt"
 	"testing"
 
-	cpuUtil "github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf/plugins/inputs/system"
 	"github.com/influxdata/telegraf/testutil"
 )
 
+func newCPUStats(ps system.PS) *CPUStats {
+	return &CPUStats{
+		ps:             ps,
+		CollectCPUTime: true,
+		ReportActive:   true,
+	}
+}
+
 func TestCPUStats(t *testing.T) {
 	var mps system.MockPS
 	defer mps.AssertExpectations(t)
 	var acc testutil.Accumulator
 
-	cts := cpuUtil.TimesStat{
+	cts := cpu.TimesStat{
 		CPU:       "cpu0",
 		User:      8.8,
 		System:    8.2,
@@ -30,7 +38,7 @@ func TestCPUStats(t *testing.T) {
 		GuestNice: 0.324,
 	}
 
-	cts2 := cpuUtil.TimesStat{
+	cts2 := cpu.TimesStat{
 		CPU:       "cpu0",
 		User:      24.9,     // increased by 16.1
 		System:    10.9,     // increased by 2.7
@@ -44,9 +52,9 @@ func TestCPUStats(t *testing.T) {
 		GuestNice: 2.524,    // increased by 2.2
 	}
 
-	mps.On("CPUTimes").Return([]cpuUtil.TimesStat{cts}, nil)
+	mps.On("CPUTimes").Return([]cpu.TimesStat{cts}, nil)
 
-	cs := NewCPUStats(&mps)
+	cs := newCPUStats(&mps)
 
 	err := cs.Gather(&acc)
 	require.NoError(t, err)
@@ -66,7 +74,7 @@ func TestCPUStats(t *testing.T) {
 	assertContainsTaggedFloat(t, &acc, "time_guest_nice", 0.324, 0)
 
 	mps2 := system.MockPS{}
-	mps2.On("CPUTimes").Return([]cpuUtil.TimesStat{cts2}, nil)
+	mps2.On("CPUTimes").Return([]cpu.TimesStat{cts2}, nil)
 	cs.ps = &mps2
 
 	// Should have added cpu percentages too
@@ -103,20 +111,20 @@ func TestCPUStats(t *testing.T) {
 // if the measurement is of the wrong type, or if no matching measurements are found
 //
 // Parameters:
-//     t *testing.T            : Testing object to use
-//     acc testutil.Accumulator: Accumulator to examine
-//     field string            : Name of field to examine
-//     expectedValue float64   : Value to search for within the measurement
-//     delta float64           : Maximum acceptable distance of an accumulated value
-//                               from the expectedValue parameter. Useful when
-//                               floating-point arithmetic imprecision makes looking
-//                               for an exact match impractical
+//
+//	t *testing.T            : Testing object to use
+//	acc testutil.Accumulator: Accumulator to examine
+//	field string            : Name of field to examine
+//	expectedValue float64   : Value to search for within the measurement
+//	delta float64           : Maximum acceptable distance of an accumulated value
+//	                          from the expectedValue parameter. Useful when
+//	                          floating-point arithmetic imprecision makes looking
+//	                          for an exact match impractical
 func assertContainsTaggedFloat(
 	t *testing.T,
 	acc *testutil.Accumulator,
 	field string,
-	expectedValue float64,
-	delta float64,
+	expectedValue, delta float64,
 ) {
 	var actualValue float64
 	measurement := "cpu" // always cpu
@@ -131,14 +139,14 @@ func assertContainsTaggedFloat(
 							return
 						}
 					} else {
-						require.Fail(t, fmt.Sprintf("Measurement \"%s\" does not have type float64", measurement))
+						require.Fail(t, fmt.Sprintf("Measurement %q does not have type float64", measurement))
 					}
 				}
 			}
 		}
 	}
 	msg := fmt.Sprintf(
-		"Could not find measurement \"%s\" with requested tags within %f of %f, Actual: %f",
+		"Could not find measurement %q with requested tags within %f of %f, Actual: %f",
 		measurement, delta, expectedValue, actualValue)
 	require.Fail(t, msg)
 }
@@ -151,10 +159,10 @@ func TestCPUCountIncrease(t *testing.T) {
 	var acc testutil.Accumulator
 	var err error
 
-	cs := NewCPUStats(&mps)
+	cs := newCPUStats(&mps)
 
 	mps.On("CPUTimes").Return(
-		[]cpuUtil.TimesStat{
+		[]cpu.TimesStat{
 			{
 				CPU: "cpu0",
 			},
@@ -164,7 +172,7 @@ func TestCPUCountIncrease(t *testing.T) {
 	require.NoError(t, err)
 
 	mps2.On("CPUTimes").Return(
-		[]cpuUtil.TimesStat{
+		[]cpu.TimesStat{
 			{
 				CPU: "cpu0",
 			},
@@ -185,30 +193,30 @@ func TestCPUTimesDecrease(t *testing.T) {
 	defer mps.AssertExpectations(t)
 	var acc testutil.Accumulator
 
-	cts := cpuUtil.TimesStat{
+	cts := cpu.TimesStat{
 		CPU:    "cpu0",
 		User:   18,
 		Idle:   80,
 		Iowait: 2,
 	}
 
-	cts2 := cpuUtil.TimesStat{
+	cts2 := cpu.TimesStat{
 		CPU:    "cpu0",
 		User:   38, // increased by 20
 		Idle:   40, // decreased by 40
 		Iowait: 1,  // decreased by 1
 	}
 
-	cts3 := cpuUtil.TimesStat{
+	cts3 := cpu.TimesStat{
 		CPU:    "cpu0",
 		User:   56,  // increased by 18
 		Idle:   120, // increased by 80
 		Iowait: 3,   // increased by 2
 	}
 
-	mps.On("CPUTimes").Return([]cpuUtil.TimesStat{cts}, nil)
+	mps.On("CPUTimes").Return([]cpu.TimesStat{cts}, nil)
 
-	cs := NewCPUStats(&mps)
+	cs := newCPUStats(&mps)
 
 	err := cs.Gather(&acc)
 	require.NoError(t, err)
@@ -220,7 +228,7 @@ func TestCPUTimesDecrease(t *testing.T) {
 	assertContainsTaggedFloat(t, &acc, "time_iowait", 2, 0)
 
 	mps2 := system.MockPS{}
-	mps2.On("CPUTimes").Return([]cpuUtil.TimesStat{cts2}, nil)
+	mps2.On("CPUTimes").Return([]cpu.TimesStat{cts2}, nil)
 	cs.ps = &mps2
 
 	// CPU times decreased. An error should be raised
@@ -228,7 +236,7 @@ func TestCPUTimesDecrease(t *testing.T) {
 	require.Error(t, err)
 
 	mps3 := system.MockPS{}
-	mps3.On("CPUTimes").Return([]cpuUtil.TimesStat{cts3}, nil)
+	mps3.On("CPUTimes").Return([]cpu.TimesStat{cts3}, nil)
 	cs.ps = &mps3
 
 	err = cs.Gather(&acc)

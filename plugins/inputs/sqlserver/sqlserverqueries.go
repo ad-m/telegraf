@@ -1,7 +1,8 @@
+//nolint:lll // conditionally long lines allowed
 package sqlserver
 
 import (
-	_ "github.com/denisenkom/go-mssqldb" // go-mssqldb initialization
+	_ "github.com/microsoft/go-mssqldb" // go-mssqldb initialization
 )
 
 // The SQL scripts assemble the correct query based the version of SQL Server
@@ -14,11 +15,14 @@ import (
 //   - 1300 --> SQL Server 2016
 //   - 1400 --> SQL Server 2017
 //   - 1500 --> SQL Server 2019
+//   - 1600 --> SQL Server 2022
 
 // Thanks Bob Ward (http://aka.ms/bobwardms)
-// and the folks at Stack Overflow (https://github.com/opserver/Opserver/blob/9c89c7e9936b58ad237b30e6f4cc6cd59c406889/Opserver.Core/Data/SQL/SQLInstance.Memory.cs)
+// and the folks at Stack Overflow
+// (https://github.com/opserver/Opserver/blob/9c89c7e9936b58ad237b30e6f4cc6cd59c406889/Opserver.Core/Data/SQL/SQLInstance.Memory.cs)
 // for putting most of the memory clerk definitions online!
 const sqlServerMemoryClerks = `
+SET DEADLOCK_PRIORITY -10;
 IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
 	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
 	RAISERROR (@ErrorMessage,11,1)
@@ -151,7 +155,7 @@ DECLARE
 	,@Columns AS nvarchar(max) = ''
 	,@Tables AS nvarchar(max) = ''
 
-IF @MajorMinorVersion >= 1050 BEGIN
+IF CAST(SERVERPROPERTY('ProductVersion') AS varchar(50)) >= '10.50.2500.0' BEGIN
 	/*in [volume_mount_point] any trailing "\" char will be automatically removed by telegraf */
 	SET @Columns += N'
 	,[volume_mount_point]'
@@ -170,7 +174,7 @@ SELECT
 	,REPLACE(@@SERVERNAME,''\'','':'') AS [sql_instance]
 	,DB_NAME(vfs.[database_id]) AS [database_name]
 	,COALESCE(mf.[physical_name],''RBPEX'') AS [physical_filename]	--RPBEX = Resilient Buffer Pool Extension
-	,COALESCE(mf.[name],''RBPEX'') AS [logical_filename]	--RPBEX = Resilient Buffer Pool Extension	
+	,COALESCE(mf.[name],''RBPEX'') AS [logical_filename]	--RPBEX = Resilient Buffer Pool Extension
 	,mf.[type_desc] AS [file_type]
 	,vfs.[io_stall_read_ms] AS [read_latency_ms]
 	,vfs.[num_of_reads] AS [reads]
@@ -188,6 +192,7 @@ EXEC sp_executesql @SqlStatement
 `
 
 const sqlServerProperties = `
+SET DEADLOCK_PRIORITY -10;
 IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
 	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
 	RAISERROR (@ErrorMessage,11,1)
@@ -199,7 +204,7 @@ DECLARE
 	,@MajorMinorVersion AS int = CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar),4) AS int)*100 + CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar),3) AS int)
 	,@Columns AS nvarchar(MAX) = ''
 
-IF @MajorMinorVersion >= 1050
+IF CAST(SERVERPROPERTY('ProductVersion') AS varchar(50)) >= '10.50.2500.0'
 	SET @Columns = N'
 	,CASE [virtual_machine_type_desc]
 		WHEN ''NONE'' THEN ''PHYSICAL Machine''
@@ -207,16 +212,45 @@ IF @MajorMinorVersion >= 1050
 	END AS [hardware_type]'
 
 SET @SqlStatement = '
+DECLARE @ForceEncryption INT
+DECLARE @DynamicportNo NVARCHAR(50);
+DECLARE @StaticportNo NVARCHAR(50);
+
+EXEC [xp_instance_regread]
+	 @rootkey = ''HKEY_LOCAL_MACHINE''
+	,@key = ''SOFTWARE\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib''
+	,@value_name = ''ForceEncryption''
+	,@value = @ForceEncryption OUTPUT;
+
+EXEC [xp_instance_regread]
+	 @rootkey = ''HKEY_LOCAL_MACHINE''
+	,@key = ''Software\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib\Tcp\IpAll''
+	,@value_name = ''TcpDynamicPorts''
+	,@value = @DynamicportNo OUTPUT
+
+EXEC [xp_instance_regread]
+	  @rootkey = ''HKEY_LOCAL_MACHINE''
+     ,@key = ''Software\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib\Tcp\IpAll''
+     ,@value_name = ''TcpPort''
+     ,@value = @StaticportNo OUTPUT
+
 SELECT
 	 ''sqlserver_server_properties'' AS [measurement]
 	,REPLACE(@@SERVERNAME,''\'','':'') AS [sql_instance]
+	,@@SERVICENAME AS [service_name]
 	,si.[cpu_count]
 	,(SELECT [total_physical_memory_kb] FROM sys.[dm_os_sys_memory]) AS [server_memory]
+	,(SELECT [available_physical_memory_kb] FROM sys.[dm_os_sys_memory]) AS [available_server_memory]
 	,SERVERPROPERTY(''Edition'') AS [sku]
 	,CAST(SERVERPROPERTY(''EngineEdition'') AS int) AS [engine_edition]
 	,DATEDIFF(MINUTE,si.[sqlserver_start_time],GETDATE()) AS [uptime]
 	,SERVERPROPERTY(''ProductVersion'') AS [sql_version]
+	,SERVERPROPERTY(''IsClustered'') AS [instance_type]
+	,SERVERPROPERTY(''IsHadrEnabled'') AS [is_hadr_enabled]
 	,LEFT(@@VERSION,CHARINDEX('' - '',@@VERSION)) AS [sql_version_desc]
+	,@ForceEncryption AS [ForceEncryption]
+	,COALESCE(@DynamicportNo,@StaticportNo) AS [Port]
+	,IIF(@DynamicportNo IS NULL, ''Static'', ''Dynamic'') AS [PortType]
 	,dbs.[db_online]
 	,dbs.[db_restoring]
 	,dbs.[db_recovering]
@@ -227,12 +261,12 @@ SELECT
 	FROM sys.[dm_os_sys_info] AS si
 	CROSS APPLY (
 		SELECT
-			 SUM(CASE WHEN state = 0 THEN 1 ELSE 0 END) AS [db_online]
-			,SUM(CASE WHEN state = 1 THEN 1 ELSE 0 END) AS [db_restoring]
-			,SUM(CASE WHEN state = 2 THEN 1 ELSE 0 END) AS [db_recovering]
-			,SUM(CASE WHEN state = 3 THEN 1 ELSE 0 END) AS [db_recoveryPending]
-			,SUM(CASE WHEN state = 4 THEN 1 ELSE 0 END) AS [db_suspect]
-			,SUM(CASE WHEN state IN(6, 10) THEN 1 ELSE 0 END) AS [db_offline]
+			 SUM(CASE WHEN [state] = 0 THEN 1 ELSE 0 END) AS [db_online]
+			,SUM(CASE WHEN [state] = 1 THEN 1 ELSE 0 END) AS [db_restoring]
+			,SUM(CASE WHEN [state] = 2 THEN 1 ELSE 0 END) AS [db_recovering]
+			,SUM(CASE WHEN [state] = 3 THEN 1 ELSE 0 END) AS [db_recoveryPending]
+			,SUM(CASE WHEN [state] = 4 THEN 1 ELSE 0 END) AS [db_suspect]
+			,SUM(CASE WHEN [state] IN (6,10) THEN 1 ELSE 0 END) AS [db_offline]
 		FROM sys.databases
 	) AS dbs
 '
@@ -241,6 +275,7 @@ EXEC sp_executesql @SqlStatement
 `
 
 const sqlServerSchedulers string = `
+SET DEADLOCK_PRIORITY -10;
 IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
 	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
 	RAISERROR (@ErrorMessage,11,1)
@@ -284,8 +319,11 @@ EXEC sp_executesql @SqlStatement
 
 /*
 This string defines a SQL statements to retrieve Performance Counters as documented here -
+
 	SQL Server Performance Objects - https://docs.microsoft.com/en-us/sql/relational-databases/performance-monitor/use-sql-server-objects?view=sql-server-ver15#SQLServerPOs
+
 Some of the specific objects used are -
+
 	MSSQL$*:Access Methods - https://docs.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-access-methods-object?view=sql-server-ver15
 	MSSQL$*:Buffer Manager - https://docs.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-buffer-manager-object?view=sql-server-ver15
 	MSSQL$*:Databases - https://docs.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-databases-object?view=sql-server-ver15
@@ -333,6 +371,7 @@ SELECT DISTINCT
 			,'Logins/sec'
 			,'Processes blocked'
 			,'Latch Waits/sec'
+			,'Average Latch Wait Time (ms)'
 			,'Full Scans/sec'
 			,'Index Searches/sec'
 			,'Page Splits/sec'
@@ -362,9 +401,13 @@ SELECT DISTINCT
 			,'Free list stalls/sec'
 			,'Buffer cache hit ratio'
 			,'Buffer cache hit ratio base'
+			,'Database Pages'
 			,'Backup/Restore Throughput/sec'
 			,'Total Server Memory (KB)'
 			,'Target Server Memory (KB)'
+			,'Stolen Server Memory (KB)'
+			,'Database Cache Memory (KB)'
+			,'Free Memory (KB)'
 			,'Log Flushes/sec'
 			,'Log Flush Wait Time'
 			,'Memory broker clerk size'
@@ -414,6 +457,9 @@ SELECT DISTINCT
 			,'Distributed Query'
 			,'DTC calls'
 			,'Query Store CPU usage'
+			,'Query Store physical reads'
+			,'Query Store logical reads'
+			,'Query Store logical writes'
 		) OR (
 			spi.[object_name] LIKE '%User Settable%'
 			OR spi.[object_name] LIKE '%SQL Errors%'
@@ -455,6 +501,7 @@ OPTION(RECOMPILE)
 `
 
 const sqlServerWaitStatsCategorized string = `
+SET DEADLOCK_PRIORITY -10;
 IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
 	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
 	RAISERROR (@ErrorMessage,11,1)
@@ -1021,6 +1068,7 @@ WHERE
 `
 
 const sqlServerRequests string = `
+SET DEADLOCK_PRIORITY -10;
 IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
 	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
 	RAISERROR (@ErrorMessage,11,1)
@@ -1044,72 +1092,98 @@ ELSE BEGIN
 END
 
 SET @SqlStatement = N'
-SELECT [blocking_session_id] into #blockingSessions FROM sys.dm_exec_requests WHERE [blocking_session_id] != 0
-CREATE INDEX ix_blockingSessions_1 ON #blockingSessions ([blocking_session_id])
-
 SELECT
-	 ''sqlserver_requests'' AS [measurement]
-	,REPLACE(@@SERVERNAME,''\'','':'') AS [sql_instance]
-	,s.session_id
-	,ISNULL(r.[request_id], 0) AS [request_id]
-	,COALESCE(r.[status], s.[status]) AS [status]
-	,COALESCE(r.[cpu_time], s.[cpu_time]) AS [cpu_time_ms]
-	,COALESCE(r.[total_elapsed_time], s.total_elapsed_time) AS [total_elapsed_time_ms]
-	,COALESCE(r.[logical_reads], s.[logical_reads]) AS [logical_reads]
-	,COALESCE(r.[writes], s.[writes]) AS [writes]
-	,r.[command]
-	,r.[wait_time] AS [wait_time_ms]
-	,r.[wait_type]
-	,r.[wait_resource]
-	,r.[blocking_session_id]
-	,s.[program_name]
-	,s.[host_name]
-	,s.[nt_user_name]
-	,s.[login_name]
-	,LEFT (CASE COALESCE(r.[transaction_isolation_level], s.[transaction_isolation_level])
-		WHEN 0 THEN ''0-Read Committed''
-		WHEN 1 THEN ''1-Read Uncommitted (NOLOCK)''
-		WHEN 2 THEN ''2-Read Committed''
-		WHEN 3 THEN ''3-Repeatable Read''
-		WHEN 4 THEN ''4-Serializable''
-		WHEN 5 THEN ''5-Snapshot''
-		ELSE CONVERT (varchar(30), r.[transaction_isolation_level]) + ''-UNKNOWN''
-	END, 30) AS [transaction_isolation_level]
-	,r.[granted_query_memory] AS [granted_query_memory_pages]
-	,r.[percent_complete]
-	,SUBSTRING(
-		qt.[text],
-		r.[statement_start_offset] / 2 + 1,
-		(CASE WHEN r.[statement_end_offset] = -1
-			  THEN DATALENGTH(qt.[text])
-			  ELSE r.[statement_end_offset]
-		 END - r.[statement_start_offset]) / 2 + 1
-	) AS [statement_text]
-	,qt.[objectid]
-	,QUOTENAME(OBJECT_SCHEMA_NAME(qt.[objectid], qt.[dbid])) + ''.'' +  QUOTENAME(OBJECT_NAME(qt.[objectid], qt.[dbid])) AS [stmt_object_name]
-	,DB_NAME(qt.dbid) AS [stmt_db_name]
-	,CONVERT(varchar(20),[query_hash],1) AS [query_hash]
-	,CONVERT(varchar(20),[query_plan_hash],1) AS [query_plan_hash]'
-	+ @Columns + N'
-FROM sys.dm_exec_sessions AS s
-LEFT OUTER JOIN sys.dm_exec_requests AS r
-	ON s.[session_id] = r.[session_id]
-OUTER APPLY sys.dm_exec_sql_text(r.[sql_handle]) AS qt
+	 [measurement],[sql_instance],[session_id]
+	,ISNULL([request_id],0) AS [request_id]
+	,[blocking_session_id],[status],[cpu_time_ms]
+	,[total_elapsed_time_ms],[logical_reads],[writes]
+	,[command],[wait_time_ms],[wait_type]
+	,[wait_resource],[program_name]
+	,[host_name],[nt_user_name],[login_name]
+	,[transaction_isolation_level],[granted_query_memory_pages],[percent_complete]
+	,[statement_text],[objectid],[stmt_object_name]
+	,[stmt_db_name],[query_hash],[query_plan_hash]
+	,[session_db_name],[open_transaction]
+FROM (
+	SELECT
+		 ''sqlserver_requests'' AS [measurement]
+		,REPLACE(@@SERVERNAME,''\'','':'') AS [sql_instance]
+		,s.[session_id]
+		,r.[request_id]
+		,COALESCE(r.[status], s.[status]) AS [status]
+		,COALESCE(r.[cpu_time], s.[cpu_time]) AS [cpu_time_ms]
+		,COALESCE(r.[total_elapsed_time], s.total_elapsed_time) AS [total_elapsed_time_ms]
+		,COALESCE(r.[logical_reads], s.[logical_reads]) AS [logical_reads]
+		,COALESCE(r.[writes], s.[writes]) AS [writes]
+		,r.[command]
+		,r.[wait_time] AS [wait_time_ms]
+		,r.[wait_type]
+		,r.[wait_resource]
+		,NULLIF(r.[blocking_session_id],0) AS [blocking_session_id]
+		,s.[program_name]
+		,s.[host_name]
+		,s.[nt_user_name]
+		,s.[login_name]
+		,LEFT (CASE COALESCE(r.[transaction_isolation_level], s.[transaction_isolation_level])
+			WHEN 0 THEN ''0-Read Committed''
+			WHEN 1 THEN ''1-Read Uncommitted (NOLOCK)''
+			WHEN 2 THEN ''2-Read Committed''
+			WHEN 3 THEN ''3-Repeatable Read''
+			WHEN 4 THEN ''4-Serializable''
+			WHEN 5 THEN ''5-Snapshot''
+			ELSE CONVERT (varchar(30), r.[transaction_isolation_level]) + ''-UNKNOWN''
+		END, 30) AS [transaction_isolation_level]
+		,r.[granted_query_memory] AS [granted_query_memory_pages]
+		,r.[percent_complete]
+		,SUBSTRING(
+			qt.[text],
+			r.[statement_start_offset] / 2 + 1,
+			(CASE WHEN r.[statement_end_offset] = -1
+				THEN DATALENGTH(qt.[text])
+				ELSE r.[statement_end_offset]
+			END - r.[statement_start_offset]) / 2 + 1
+		) AS [statement_text]
+		,qt.[objectid]
+		,QUOTENAME(OBJECT_SCHEMA_NAME(qt.[objectid], qt.[dbid])) + ''.'' +  QUOTENAME(OBJECT_NAME(qt.[objectid], qt.[dbid])) AS [stmt_object_name]
+		,DB_NAME(qt.dbid) AS [stmt_db_name]
+		,CONVERT(varchar(20),r.[query_hash],1) AS [query_hash]
+		,CONVERT(varchar(20),r.[query_plan_hash],1) AS [query_plan_hash]
+		,s.[is_user_process]
+		,[blocking_or_blocked] = COUNT(*) OVER(PARTITION BY ISNULL(NULLIF(r.[blocking_session_id], 0),s.[session_id]))'
+		+ @Columns + N'
+	FROM sys.dm_exec_sessions AS s
+	LEFT OUTER JOIN sys.dm_exec_requests AS r
+		ON s.[session_id] = r.[session_id]
+	OUTER APPLY sys.dm_exec_sql_text(r.[sql_handle]) AS qt
+) AS data
 WHERE
-	(s.[session_id] IN (SELECT blocking_session_id FROM #blockingSessions))
+	   [blocking_or_blocked] > 1 --Always include blocking or blocked sessions/requests
+	OR [open_transaction] >= 1   --Always include sessions with open transactions
 	OR (
-		r.[session_id] IS NOT NULL
-		AND (
-			s.is_user_process = 1 
-			OR r.[status] COLLATE Latin1_General_BIN NOT IN (''background'', ''sleeping'')
+		[request_id] IS NOT NULL	--A request must exists
+		AND (	--Always fetch user process (in any state), fetch system process only if active
+			[is_user_process] = 1
+			OR [status] COLLATE Latin1_General_BIN NOT IN (''background'', ''sleeping'')
 		)
+		AND [session_id] <> @@SPID  --Exclude current SPID
 	)
 OPTION(MAXDOP 1)'
 
-EXEC sp_executesql @SqlStatement
+BEGIN TRY
+	EXEC sp_executesql @SqlStatement
+END TRY
+BEGIN CATCH
+	SET @ErrorMessage = ERROR_MESSAGE();
+	DECLARE @ErrorSeverity INT = ERROR_SEVERITY();
+	DECLARE @ErrorState INT = ERROR_STATE();
+
+   IF (ERROR_NUMBER() <> 976) --Avoid possible errors from secondary replica
+	    RAISERROR (@ErrorMessage, @ErrorSeverity, @ErrorState );
+END CATCH
 `
 
 const sqlServerVolumeSpace string = `
+SET DEADLOCK_PRIORITY -10;
 IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
 	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
 	RAISERROR (@ErrorMessage,11,1)
@@ -1118,8 +1192,8 @@ END
 
 DECLARE
 	@MajorMinorVersion AS int = CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar),4) AS int)*100 + CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar),3) AS int)
-	
-IF @MajorMinorVersion >= 1050 BEGIN
+
+IF CAST(SERVERPROPERTY('ProductVersion') AS varchar(50)) >= '10.50.2500.0' BEGIN
 	SELECT DISTINCT
 		'sqlserver_volume_space' AS [measurement]
 		,SERVERPROPERTY('MachineName') AS [server_name]
@@ -1135,6 +1209,7 @@ END
 `
 
 const sqlServerRingBufferCPU string = `
+SET DEADLOCK_PRIORITY -10;
 IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
 	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
 	RAISERROR (@ErrorMessage,11,1)
@@ -1197,6 +1272,7 @@ FROM (
 // Collects availability replica state information from `sys.dm_hadr_availability_replica_states` for a High Availability / Disaster Recovery (HADR) setup
 // Certain fields are only supported on SQL Server 2016 and newer version, identified by check MajorMinorVersion >= 1300
 const sqlServerAvailabilityReplicaStates string = `
+SET DEADLOCK_PRIORITY -10;
 IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
 	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
 	RAISERROR (@ErrorMessage,11,1)
@@ -1263,6 +1339,7 @@ EXEC sp_executesql @SqlStatement
 // Collects database replica state information from `sys.dm_hadr_database_replica_states` for a High Availability / Disaster Recovery (HADR) setup
 // Certain fields are only supported on SQL Server 2016 and newer version, or SQL Server 2014 and newer, identified by check MajorMinorVersion >= 1300 or MajorMinorVersion >= 1200
 const sqlServerDatabaseReplicaStates string = `
+SET DEADLOCK_PRIORITY -10;
 IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
 	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
 	RAISERROR (@ErrorMessage,11,1)
@@ -1320,4 +1397,86 @@ IF SERVERPROPERTY(''IsHadrEnabled'') = 1 BEGIN
 END'
 
 EXEC sp_executesql @SqlStatement
+`
+
+const sqlServerRecentBackups string = `
+DECLARE @TimeZoneOffset INT = (SELECT DATEPART(TZOFFSET, SYSDATETIMEOFFSET()));
+SET DEADLOCK_PRIORITY -10;
+IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
+	DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
+	RAISERROR (@ErrorMessage,11,1)
+	RETURN
+END;
+
+WITH MostRecentBackups AS
+(
+	SELECT
+		database_name AS [Database],
+		MAX(bus.backup_finish_date) AS LastBackupTime,
+		CASE bus.type
+			WHEN 'D' THEN 'Full'
+			WHEN 'I' THEN 'Differential'
+			WHEN 'L' THEN 'Transaction Log'
+		END AS Type
+	FROM msdb.dbo.backupset bus
+	WHERE bus.type <> 'F'
+	GROUP BY bus.database_name,bus.type
+),
+BackupsWithSize AS
+(
+	SELECT mrb.*, CAST((SELECT TOP 1 b.backup_size FROM msdb.dbo.backupset b WHERE [Database] = b.database_name AND LastBackupTime = b.backup_finish_date) AS bigint) AS [backup_size]
+	FROM MostRecentBackups mrb
+)
+
+SELECT
+	'sqlserver_recentbackup' AS [measurement],
+	REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
+	d.name AS [database_name],
+	d.database_id as [database_id],
+	d.state_desc AS [state],
+	d.recovery_model_desc AS [recovery_model],
+	DATEDIFF(SECOND, {d '1970-01-01'}, DATEADD(MINUTE, -@TimeZoneOffset, bf.LastBackupTime)) AS [last_full_backup_time],
+    	bf.backup_size AS [full_backup_size_bytes],
+    	DATEDIFF(SECOND, {d '1970-01-01'}, DATEADD(MINUTE, -@TimeZoneOffset, bd.LastBackupTime)) AS [last_differential_backup_time],
+    	bd.backup_size AS [differential_backup_size_bytes],
+    	DATEDIFF(SECOND, {d '1970-01-01'}, DATEADD(MINUTE, -@TimeZoneOffset, bt.LastBackupTime)) AS [last_transaction_log_backup_time],
+    	bt.backup_size AS [transaction_log_backup_size_bytes]
+FROM sys.databases d
+LEFT JOIN BackupsWithSize bf ON (d.name = bf.[Database] AND (bf.Type = 'Full' OR bf.Type IS NULL))
+LEFT JOIN BackupsWithSize bd ON (d.name = bd.[Database] AND (bd.Type = 'Differential' OR bd.Type IS NULL))
+LEFT JOIN BackupsWithSize bt ON (d.name = bt.[Database] AND (bt.Type = 'Transaction Log' OR bt.Type IS NULL))
+WHERE d.name <> 'tempdb' AND d.source_database_id IS NULL
+`
+
+// Collects persistent version store information from `sys.dm_tran_persistent_version_store_stats` for Databases where Accelerated Database Recovery is enabled.
+// ADR was added in SQL Server 2019
+const sqlServerPersistentVersionStore string = `
+SET DEADLOCK_PRIORITY -10;
+IF SERVERPROPERTY('EngineEdition') NOT IN (2,3,4) BEGIN /*NOT IN Standard,Enterpris,Express*/
+    DECLARE @ErrorMessage AS nvarchar(500) = 'Telegraf - Connection string Server:'+ @@ServerName + ',Database:' + DB_NAME() +' is not a SQL Server Standard,Enterprise or Express. Check the database_type parameter in the telegraf configuration.';
+    RAISERROR (@ErrorMessage,11,1)
+    RETURN
+END;
+	 
+DECLARE
+	    
+    @MajorMinorVersion AS int = CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar),4) AS int)*100 + CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar),3) AS int)
+	 
+IF @MajorMinorVersion >= 1500 BEGIN
+    SELECT
+		'sqlserver_persistent_version_store_stats' AS [measurement]
+		,REPLACE(@@SERVERNAME,'\',':') AS [sql_instance]
+		,db_name(pvs.database_id) as [database_name]
+		,FILEGROUP_NAME(pvs.pvs_filegroup_id) as [filegroup_name]
+		,d.snapshot_isolation_state_desc
+		,pvs.persistent_version_store_size_kb
+		,pvs.online_index_version_store_size_kb
+		,pvs.current_aborted_transaction_count
+		,pvs.pvs_off_row_page_skipped_low_water_mark
+		,pvs.pvs_off_row_page_skipped_min_useful_xts
+	FROM sys.dm_tran_persistent_version_store_stats pvs
+	INNER JOIN sys.databases d
+		on d.database_id = pvs.database_id
+	    and d.is_accelerated_database_recovery_on = 1
+END;
 `

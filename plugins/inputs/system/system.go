@@ -1,33 +1,32 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package system
 
 import (
 	"bufio"
 	"bytes"
+	_ "embed"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/host"
+	"github.com/shirou/gopsutil/v4/load"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/host"
-	"github.com/shirou/gopsutil/load"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 type SystemStats struct {
 	Log telegraf.Logger
 }
 
-func (*SystemStats) Description() string {
-	return "Read metrics about system load & uptime"
-}
-
 func (*SystemStats) SampleConfig() string {
-	return `
-  ## Uncomment to remove deprecated metrics.
-  # fielddrop = ["uptime_format"]
-`
+	return sampleConfig
 }
 
 func (s *SystemStats) Gather(acc telegraf.Accumulator) error {
@@ -51,6 +50,7 @@ func (s *SystemStats) Gather(acc telegraf.Accumulator) error {
 	users, err := host.Users()
 	if err == nil {
 		fields["n_users"] = len(users)
+		fields["n_unique_users"] = findUniqueUsers(users)
 	} else if os.IsNotExist(err) {
 		s.Log.Debugf("Reading users: %s", err.Error())
 	} else if os.IsPermission(err) {
@@ -75,6 +75,17 @@ func (s *SystemStats) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
+func findUniqueUsers(userStats []host.UserStat) int {
+	uniqueUsers := make(map[string]bool)
+	for _, userstat := range userStats {
+		if _, ok := uniqueUsers[userstat.User]; !ok {
+			uniqueUsers[userstat.User] = true
+		}
+	}
+
+	return len(uniqueUsers)
+}
+
 func formatUptime(uptime uint64) string {
 	buf := new(bytes.Buffer)
 	w := bufio.NewWriter(buf)
@@ -86,8 +97,6 @@ func formatUptime(uptime uint64) string {
 		if days > 1 {
 			s = "s"
 		}
-		// This will always succeed, so skip checking the error
-		//nolint:errcheck,revive
 		fmt.Fprintf(w, "%d day%s, ", days, s)
 	}
 
@@ -96,12 +105,7 @@ func formatUptime(uptime uint64) string {
 	hours %= 24
 	minutes %= 60
 
-	// This will always succeed, so skip checking the error
-	//nolint:errcheck,revive
 	fmt.Fprintf(w, "%2d:%02d", hours, minutes)
-
-	// This will always succeed, so skip checking the error
-	//nolint:errcheck,revive
 	w.Flush()
 	return buf.String()
 }

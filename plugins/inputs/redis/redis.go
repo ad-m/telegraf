@@ -1,7 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package redis
 
 import (
 	"bufio"
+	"context"
+	_ "embed"
 	"fmt"
 	"io"
 	"net/url"
@@ -12,43 +15,52 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/v8"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-type RedisCommand struct {
-	Command []interface{}
-	Field   string
-	Type    string
-}
+//go:embed sample.conf
+var sampleConfig string
+
+var (
+	replicationSlaveMetricPrefix = regexp.MustCompile(`^slave\d+`)
+	tracking                     = map[string]string{
+		"uptime_in_seconds": "uptime",
+		"connected_clients": "clients",
+		"role":              "replication_role",
+	}
+)
 
 type Redis struct {
-	Commands []*RedisCommand
-	Servers  []string
-	Password string
+	Commands []*redisCommand `toml:"commands"`
+	Servers  []string        `toml:"servers"`
+	Username string          `toml:"username"`
+	Password string          `toml:"password"`
+
 	tls.ClientConfig
 
-	Log telegraf.Logger
+	Log telegraf.Logger `toml:"-"`
 
-	clients   []Client
+	clients   []client
 	connected bool
 }
 
-type Client interface {
-	Do(returnType string, args ...interface{}) (interface{}, error)
-	Info() *redis.StringCmd
-	BaseTags() map[string]string
+type redisCommand struct {
+	Command []interface{} `toml:"command"`
+	Field   string        `toml:"field"`
+	Type    string        `toml:"type"`
 }
 
-type RedisClient struct {
+type redisClient struct {
 	client *redis.Client
 	tags   map[string]string
 }
 
-// RedisFieldTypes defines the types expected for each of the fields redis reports on
-type RedisFieldTypes struct {
+// redisFieldTypes defines the types expected for each of the fields redis reports on
+type redisFieldTypes struct {
 	ActiveDefragHits            int64   `json:"active_defrag_hits"`
 	ActiveDefragKeyHits         int64   `json:"active_defrag_key_hits"`
 	ActiveDefragKeyMisses       int64   `json:"active_defrag_key_misses"`
@@ -158,80 +170,15 @@ type RedisFieldTypes struct {
 	UsedMemoryStartup           int64   `json:"used_memory_startup"`
 }
 
-func (r *RedisClient) Do(returnType string, args ...interface{}) (interface{}, error) {
-	rawVal := r.client.Do(args...)
-
-	switch returnType {
-	case "integer":
-		return rawVal.Int64()
-	case "string":
-		return rawVal.String()
-	case "float":
-		return rawVal.Float64()
-	default:
-		return rawVal.String()
-	}
+type client interface {
+	do(returnType string, args ...interface{}) (interface{}, error)
+	info() *redis.StringCmd
+	baseTags() map[string]string
+	close() error
 }
 
-func (r *RedisClient) Info() *redis.StringCmd {
-	return r.client.Info("ALL")
-}
-
-func (r *RedisClient) BaseTags() map[string]string {
-	tags := make(map[string]string)
-	for k, v := range r.tags {
-		tags[k] = v
-	}
-	return tags
-}
-
-var replicationSlaveMetricPrefix = regexp.MustCompile(`^slave\d+`)
-
-var sampleConfig = `
-  ## specify servers via a url matching:
-  ##  [protocol://][:password]@address[:port]
-  ##  e.g.
-  ##    tcp://localhost:6379
-  ##    tcp://:password@192.168.99.100
-  ##    unix:///var/run/redis.sock
-  ##
-  ## If no servers are specified, then localhost is used as the host.
-  ## If no port is specified, 6379 is used
-  servers = ["tcp://localhost:6379"]
-
-  ## Optional. Specify redis commands to retrieve values
-  # [[inputs.redis.commands]]
-  #   # The command to run where each argument is a separate element 
-  #   command = ["get", "sample-key"]
-  #   # The field to store the result in
-  #   field = "sample-key-value"
-  #   # The type of the result
-  #   # Can be "string", "integer", or "float"
-  #   type = "string"
-
-  ## specify server password
-  # password = "s#cr@t%"
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = true
-`
-
-func (r *Redis) SampleConfig() string {
+func (*Redis) SampleConfig() string {
 	return sampleConfig
-}
-
-func (r *Redis) Description() string {
-	return "Read metrics from one or many redis servers"
-}
-
-var Tracking = map[string]string{
-	"uptime_in_seconds": "uptime",
-	"connected_clients": "clients",
-	"role":              "replication_role",
 }
 
 func (r *Redis) Init() error {
@@ -244,6 +191,43 @@ func (r *Redis) Init() error {
 	return nil
 }
 
+func (*Redis) Start(telegraf.Accumulator) error {
+	return nil
+}
+
+func (r *Redis) Gather(acc telegraf.Accumulator) error {
+	if !r.connected {
+		err := r.connect()
+		if err != nil {
+			return err
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	for _, cl := range r.clients {
+		wg.Add(1)
+		go func(client client) {
+			defer wg.Done()
+			acc.AddError(gatherServer(client, acc))
+			acc.AddError(r.gatherCommandValues(client, acc))
+		}(cl)
+	}
+
+	wg.Wait()
+	return nil
+}
+
+// Stop close the client through ServiceInput interface Start/Stop methods impl.
+func (r *Redis) Stop() {
+	for _, c := range r.clients {
+		err := c.close()
+		if err != nil {
+			r.Log.Errorf("error closing client: %v", err)
+		}
+	}
+}
+
 func (r *Redis) connect() error {
 	if r.connected {
 		return nil
@@ -253,9 +237,8 @@ func (r *Redis) connect() error {
 		r.Servers = []string{"tcp://localhost:6379"}
 	}
 
-	r.clients = make([]Client, len(r.Servers))
-
-	for i, serv := range r.Servers {
+	r.clients = make([]client, 0, len(r.Servers))
+	for _, serv := range r.Servers {
 		if !strings.HasPrefix(serv, "tcp://") && !strings.HasPrefix(serv, "unix://") {
 			r.Log.Warn("Server URL found without scheme; please update your configuration file")
 			serv = "tcp://" + serv
@@ -263,15 +246,20 @@ func (r *Redis) connect() error {
 
 		u, err := url.Parse(serv)
 		if err != nil {
-			return fmt.Errorf("unable to parse to address %q: %s", serv, err.Error())
+			return fmt.Errorf("unable to parse to address %q: %w", serv, err)
 		}
 
+		username := ""
 		password := ""
 		if u.User != nil {
+			username = u.User.Username()
 			pw, ok := u.User.Password()
 			if ok {
 				password = pw
 			}
+		}
+		if len(r.Username) > 0 {
+			username = r.Username
 		}
 		if len(r.Password) > 0 {
 			password = r.Password
@@ -292,6 +280,7 @@ func (r *Redis) connect() error {
 		client := redis.NewClient(
 			&redis.Options{
 				Addr:      address,
+				Username:  username,
 				Password:  password,
 				Network:   u.Scheme,
 				PoolSize:  1,
@@ -299,7 +288,7 @@ func (r *Redis) connect() error {
 			},
 		)
 
-		tags := map[string]string{}
+		tags := make(map[string]string, 2)
 		if u.Scheme == "unix" {
 			tags["socket"] = u.Path
 		} else {
@@ -307,48 +296,23 @@ func (r *Redis) connect() error {
 			tags["port"] = u.Port()
 		}
 
-		r.clients[i] = &RedisClient{
+		r.clients = append(r.clients, &redisClient{
 			client: client,
 			tags:   tags,
-		}
+		})
 	}
 
 	r.connected = true
 	return nil
 }
 
-// Reads stats from all configured servers accumulates stats.
-// Returns one of the errors encountered while gather stats (if any).
-func (r *Redis) Gather(acc telegraf.Accumulator) error {
-	if !r.connected {
-		err := r.connect()
-		if err != nil {
-			return err
-		}
-	}
-
-	var wg sync.WaitGroup
-
-	for _, client := range r.clients {
-		wg.Add(1)
-		go func(client Client) {
-			defer wg.Done()
-			acc.AddError(r.gatherServer(client, acc))
-			acc.AddError(r.gatherCommandValues(client, acc))
-		}(client)
-	}
-
-	wg.Wait()
-	return nil
-}
-
-func (r *Redis) gatherCommandValues(client Client, acc telegraf.Accumulator) error {
+func (r *Redis) gatherCommandValues(client client, acc telegraf.Accumulator) error {
 	fields := make(map[string]interface{})
 	for _, command := range r.Commands {
-		val, err := client.Do(command.Type, command.Command...)
+		val, err := client.do(command.Type, command.Command...)
 		if err != nil {
 			if strings.Contains(err.Error(), "unexpected type=") {
-				return fmt.Errorf("could not get command result: %s", err)
+				return fmt.Errorf("could not get command result: %w", err)
 			}
 
 			return err
@@ -357,27 +321,53 @@ func (r *Redis) gatherCommandValues(client Client, acc telegraf.Accumulator) err
 		fields[command.Field] = val
 	}
 
-	acc.AddFields("redis_commands", fields, client.BaseTags())
+	acc.AddFields("redis_commands", fields, client.baseTags())
 
 	return nil
 }
 
-func (r *Redis) gatherServer(client Client, acc telegraf.Accumulator) error {
-	info, err := client.Info().Result()
+func (r *redisClient) do(returnType string, args ...interface{}) (interface{}, error) {
+	rawVal := r.client.Do(context.Background(), args...)
+
+	switch returnType {
+	case "integer":
+		return rawVal.Int64()
+	case "string":
+		return rawVal.Text()
+	case "float":
+		return rawVal.Float64()
+	default:
+		return rawVal.Text()
+	}
+}
+
+func (r *redisClient) info() *redis.StringCmd {
+	return r.client.Info(context.Background(), "ALL")
+}
+
+func (r *redisClient) baseTags() map[string]string {
+	tags := make(map[string]string)
+	for k, v := range r.tags {
+		tags[k] = v
+	}
+	return tags
+}
+
+func (r *redisClient) close() error {
+	return r.client.Close()
+}
+
+func gatherServer(client client, acc telegraf.Accumulator) error {
+	info, err := client.info().Result()
 	if err != nil {
 		return err
 	}
 
 	rdr := strings.NewReader(info)
-	return gatherInfoOutput(rdr, acc, client.BaseTags())
+	return gatherInfoOutput(rdr, acc, client.baseTags())
 }
 
-// gatherInfoOutput gathers
-func gatherInfoOutput(
-	rdr io.Reader,
-	acc telegraf.Accumulator,
-	tags map[string]string,
-) error {
+func gatherInfoOutput(rdr io.Reader, acc telegraf.Accumulator, tags map[string]string) error {
 	var section string
 	var keyspaceHits, keyspaceMisses int64
 
@@ -421,7 +411,7 @@ func gatherInfoOutput(
 			continue
 		}
 
-		metric, ok := Tracking[name]
+		metric, ok := tracking[name]
 		if !ok {
 			if section == "Keyspace" {
 				kline := strings.TrimSpace(parts[1])
@@ -430,12 +420,22 @@ func gatherInfoOutput(
 			}
 			if section == "Commandstats" {
 				kline := strings.TrimSpace(parts[1])
-				gatherCommandstateLine(name, kline, acc, tags)
+				gatherCommandStateLine(name, kline, acc, tags)
+				continue
+			}
+			if section == "Latencystats" {
+				kline := strings.TrimSpace(parts[1])
+				gatherLatencyStatsLine(name, kline, acc, tags)
 				continue
 			}
 			if section == "Replication" && replicationSlaveMetricPrefix.MatchString(name) {
 				kline := strings.TrimSpace(parts[1])
 				gatherReplicationLine(name, kline, acc, tags)
+				continue
+			}
+			if section == "Errorstats" {
+				kline := strings.TrimSpace(parts[1])
+				gatherErrorStatsLine(name, kline, acc, tags)
 				continue
 			}
 
@@ -483,7 +483,7 @@ func gatherInfoOutput(
 	}
 	fields["keyspace_hitrate"] = keyspaceHitrate
 
-	o := RedisFieldTypes{}
+	o := redisFieldTypes{}
 
 	setStructFieldsFromObject(fields, &o)
 	setExistingFieldsFromStruct(fields, &o)
@@ -494,14 +494,11 @@ func gatherInfoOutput(
 
 // Parse the special Keyspace line at end of redis stats
 // This is a special line that looks something like:
-//     db0:keys=2,expires=0,avg_ttl=0
+//
+//	db0:keys=2,expires=0,avg_ttl=0
+//
 // And there is one for each db on the redis instance
-func gatherKeyspaceLine(
-	name string,
-	line string,
-	acc telegraf.Accumulator,
-	globalTags map[string]string,
-) {
+func gatherKeyspaceLine(name, line string, acc telegraf.Accumulator, globalTags map[string]string) {
 	if strings.Contains(line, "keys=") {
 		fields := make(map[string]interface{})
 		tags := make(map[string]string)
@@ -523,14 +520,11 @@ func gatherKeyspaceLine(
 
 // Parse the special cmdstat lines.
 // Example:
-//     cmdstat_publish:calls=33791,usec=208789,usec_per_call=6.18
-// Tag: cmdstat=publish; Fields: calls=33791i,usec=208789i,usec_per_call=6.18
-func gatherCommandstateLine(
-	name string,
-	line string,
-	acc telegraf.Accumulator,
-	globalTags map[string]string,
-) {
+//
+//	cmdstat_publish:calls=33791,usec=208789,usec_per_call=6.18
+//
+// Tag: command=publish; Fields: calls=33791i,usec=208789i,usec_per_call=6.18
+func gatherCommandStateLine(name, line string, acc telegraf.Accumulator, globalTags map[string]string) {
 	if !strings.HasPrefix(name, "cmdstat") {
 		return
 	}
@@ -551,7 +545,7 @@ func gatherCommandstateLine(
 		switch kv[0] {
 		case "calls":
 			fallthrough
-		case "usec":
+		case "usec", "rejected_calls", "failed_calls":
 			ival, err := strconv.ParseInt(kv[1], 10, 64)
 			if err == nil {
 				fields[kv[0]] = ival
@@ -566,16 +560,48 @@ func gatherCommandstateLine(
 	acc.AddFields("redis_cmdstat", fields, tags)
 }
 
+// Parse the special latency_percentiles_usec lines.
+// Example:
+//
+//	latency_percentiles_usec_zadd:p50=9.023,p99=28.031,p99.9=43.007
+//
+// Tag: command=zadd; Fields: p50=9.023,p99=28.031,p99.9=43.007
+func gatherLatencyStatsLine(name, line string, acc telegraf.Accumulator, globalTags map[string]string) {
+	if !strings.HasPrefix(name, "latency_percentiles_usec") {
+		return
+	}
+
+	fields := make(map[string]interface{})
+	tags := make(map[string]string)
+	for k, v := range globalTags {
+		tags[k] = v
+	}
+	tags["command"] = strings.TrimPrefix(name, "latency_percentiles_usec_")
+	parts := strings.Split(line, ",")
+	for _, part := range parts {
+		kv := strings.Split(part, "=")
+		if len(kv) != 2 {
+			continue
+		}
+
+		switch kv[0] {
+		case "p50", "p99", "p99.9":
+			fval, err := strconv.ParseFloat(kv[1], 64)
+			if err == nil {
+				fields[kv[0]] = fval
+			}
+		}
+	}
+	acc.AddFields("redis_latency_percentiles_usec", fields, tags)
+}
+
 // Parse the special Replication line
 // Example:
-//     slave0:ip=127.0.0.1,port=7379,state=online,offset=4556468,lag=0
+//
+//	slave0:ip=127.0.0.1,port=7379,state=online,offset=4556468,lag=0
+//
 // This line will only be visible when a node has a replica attached.
-func gatherReplicationLine(
-	name string,
-	line string,
-	acc telegraf.Accumulator,
-	globalTags map[string]string,
-) {
+func gatherReplicationLine(name, line string, acc telegraf.Accumulator, globalTags map[string]string) {
 	fields := make(map[string]interface{})
 	tags := make(map[string]string)
 	for k, v := range globalTags {
@@ -610,13 +636,33 @@ func gatherReplicationLine(
 	acc.AddFields("redis_replication", fields, tags)
 }
 
-func init() {
-	inputs.Add("redis", func() telegraf.Input {
-		return &Redis{}
-	})
+// Parse the special Errorstats lines.
+// Example:
+//
+// errorstat_ERR:count=37
+// errorstat_MOVED:count=3626
+func gatherErrorStatsLine(name, line string, acc telegraf.Accumulator, globalTags map[string]string) {
+	tags := make(map[string]string, len(globalTags)+1)
+	for k, v := range globalTags {
+		tags[k] = v
+	}
+	tags["err"] = strings.TrimPrefix(name, "errorstat_")
+	kv := strings.Split(line, "=")
+	if len(kv) < 2 {
+		acc.AddError(fmt.Errorf("invalid line for %q: %s", name, line))
+		return
+	}
+	ival, err := strconv.ParseInt(kv[1], 10, 64)
+	if err != nil {
+		acc.AddError(fmt.Errorf("parsing value in line %q failed: %w", line, err))
+		return
+	}
+
+	fields := map[string]interface{}{"total": ival}
+	acc.AddFields("redis_errorstat", fields, tags)
 }
 
-func setExistingFieldsFromStruct(fields map[string]interface{}, o *RedisFieldTypes) {
+func setExistingFieldsFromStruct(fields map[string]interface{}, o *redisFieldTypes) {
 	val := reflect.ValueOf(o).Elem()
 	typ := val.Type()
 
@@ -634,7 +680,7 @@ func setExistingFieldsFromStruct(fields map[string]interface{}, o *RedisFieldTyp
 	}
 }
 
-func setStructFieldsFromObject(fields map[string]interface{}, o *RedisFieldTypes) {
+func setStructFieldsFromObject(fields map[string]interface{}, o *redisFieldTypes) {
 	val := reflect.ValueOf(o).Elem()
 	typ := val.Type()
 
@@ -676,7 +722,7 @@ func coerceType(value interface{}, typ reflect.Type) reflect.Value {
 				value = float64(0)
 			}
 		default:
-			panic(fmt.Sprintf("unhandled destination type %s", typ.Kind().String()))
+			panic("unhandled destination type " + typ.Kind().String())
 		}
 	case int, int8, int16, int32, int64:
 		switch typ.Kind() {
@@ -687,7 +733,7 @@ func coerceType(value interface{}, typ reflect.Type) reflect.Value {
 		case reflect.Float64:
 			value = float64(reflect.ValueOf(sourceType).Int())
 		default:
-			panic(fmt.Sprintf("unhandled destination type %s", typ.Kind().String()))
+			panic("unhandled destination type " + typ.Kind().String())
 		}
 	case uint, uint8, uint16, uint32, uint64:
 		switch typ.Kind() {
@@ -698,7 +744,7 @@ func coerceType(value interface{}, typ reflect.Type) reflect.Value {
 		case reflect.Float64:
 			value = float64(reflect.ValueOf(sourceType).Uint())
 		default:
-			panic(fmt.Sprintf("unhandled destination type %s", typ.Kind().String()))
+			panic("unhandled destination type " + typ.Kind().String())
 		}
 	case float32, float64:
 		switch typ.Kind() {
@@ -709,21 +755,29 @@ func coerceType(value interface{}, typ reflect.Type) reflect.Value {
 		case reflect.Float64:
 			// types match
 		default:
-			panic(fmt.Sprintf("unhandled destination type %s", typ.Kind().String()))
+			panic("unhandled destination type " + typ.Kind().String())
 		}
 	case string:
 		switch typ.Kind() {
 		case reflect.String:
 			// types match
 		case reflect.Int64:
+			//nolint:errcheck // no way to propagate, shouldn't panic
 			value, _ = strconv.ParseInt(value.(string), 10, 64)
 		case reflect.Float64:
+			//nolint:errcheck // no way to propagate, shouldn't panic
 			value, _ = strconv.ParseFloat(value.(string), 64)
 		default:
-			panic(fmt.Sprintf("unhandled destination type %s", typ.Kind().String()))
+			panic("unhandled destination type " + typ.Kind().String())
 		}
 	default:
 		panic(fmt.Sprintf("unhandled source type %T", sourceType))
 	}
 	return reflect.ValueOf(value)
+}
+
+func init() {
+	inputs.Add("redis", func() telegraf.Input {
+		return &Redis{}
+	})
 }

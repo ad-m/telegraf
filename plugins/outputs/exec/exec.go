@@ -1,10 +1,13 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package exec
 
 import (
 	"bytes"
+	_ "embed"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"os"
 	"os/exec"
 	"runtime"
 	"time"
@@ -13,92 +16,98 @@ import (
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	"github.com/influxdata/telegraf/plugins/serializers"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 const maxStderrBytes = 512
 
 // Exec defines the exec output plugin.
 type Exec struct {
-	Command []string        `toml:"command"`
-	Timeout config.Duration `toml:"timeout"`
+	Command        []string        `toml:"command"`
+	Environment    []string        `toml:"environment"`
+	Timeout        config.Duration `toml:"timeout"`
+	UseBatchFormat bool            `toml:"use_batch_format"`
+	Log            telegraf.Logger `toml:"-"`
 
 	runner     Runner
-	serializer serializers.Serializer
+	serializer telegraf.Serializer
 }
 
-var sampleConfig = `
-  ## Command to ingest metrics via stdin.
-  command = ["tee", "-a", "/dev/null"]
-
-  ## Timeout for command to complete.
-  # timeout = "5s"
-
-  ## Data format to output.
-  ## Each data format has its own unique set of configuration options, read
-  ## more about them here:
-  ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_OUTPUT.md
-  # data_format = "influx"
-`
+func (*Exec) SampleConfig() string {
+	return sampleConfig
+}
 
 func (e *Exec) Init() error {
+	e.runner = &CommandRunner{log: e.Log}
+
 	return nil
 }
 
 // SetSerializer sets the serializer for the output.
-func (e *Exec) SetSerializer(serializer serializers.Serializer) {
+func (e *Exec) SetSerializer(serializer telegraf.Serializer) {
 	e.serializer = serializer
 }
 
 // Connect satisfies the Output interface.
-func (e *Exec) Connect() error {
+func (*Exec) Connect() error {
 	return nil
 }
 
 // Close satisfies the Output interface.
-func (e *Exec) Close() error {
+func (*Exec) Close() error {
 	return nil
-}
-
-// Description describes the plugin.
-func (e *Exec) Description() string {
-	return "Send metrics to command as input over stdin"
-}
-
-// SampleConfig returns a sample configuration.
-func (e *Exec) SampleConfig() string {
-	return sampleConfig
 }
 
 // Write writes the metrics to the configured command.
 func (e *Exec) Write(metrics []telegraf.Metric) error {
 	var buffer bytes.Buffer
-	serializedMetrics, err := e.serializer.SerializeBatch(metrics)
-	if err != nil {
-		return err
-	}
-	buffer.Write(serializedMetrics)
+	if e.UseBatchFormat {
+		serializedMetrics, err := e.serializer.SerializeBatch(metrics)
+		if err != nil {
+			return err
+		}
+		buffer.Write(serializedMetrics)
 
-	if buffer.Len() <= 0 {
-		return nil
-	}
+		if buffer.Len() <= 0 {
+			return nil
+		}
 
-	return e.runner.Run(time.Duration(e.Timeout), e.Command, &buffer)
+		return e.runner.Run(time.Duration(e.Timeout), e.Command, e.Environment, &buffer)
+	}
+	errs := make([]error, 0, len(metrics))
+	for _, metric := range metrics {
+		serializedMetric, err := e.serializer.Serialize(metric)
+		if err != nil {
+			return err
+		}
+		buffer.Reset()
+		buffer.Write(serializedMetric)
+
+		err = e.runner.Run(time.Duration(e.Timeout), e.Command, e.Environment, &buffer)
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // Runner provides an interface for running exec.Cmd.
 type Runner interface {
-	Run(time.Duration, []string, io.Reader) error
+	Run(time.Duration, []string, []string, io.Reader) error
 }
 
 // CommandRunner runs a command with the ability to kill the process before the timeout.
 type CommandRunner struct {
 	cmd *exec.Cmd
+	log telegraf.Logger
 }
 
 // Run runs the command.
-func (c *CommandRunner) Run(timeout time.Duration, command []string, buffer io.Reader) error {
+func (c *CommandRunner) Run(timeout time.Duration, command, environments []string, buffer io.Reader) error {
 	cmd := exec.Command(command[0], command[1:]...)
+	if len(environments) > 0 {
+		cmd.Env = append(os.Environ(), environments...)
+	}
 	cmd.Stdin = buffer
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -107,24 +116,24 @@ func (c *CommandRunner) Run(timeout time.Duration, command []string, buffer io.R
 	s := stderr
 
 	if err != nil {
-		if err == internal.ErrTimeout {
+		if errors.Is(err, internal.ErrTimeout) {
 			return fmt.Errorf("%q timed out and was killed", command)
 		}
 
 		s = removeWindowsCarriageReturns(s)
 		if s.Len() > 0 {
-			if !telegraf.Debug {
-				log.Printf("E! [outputs.exec] Command error: %q", c.truncate(s))
+			if c.log.Level() < telegraf.Debug {
+				c.log.Errorf("Command error: %q", truncate(s))
 			} else {
-				log.Printf("D! [outputs.exec] Command error: %q", s)
+				c.log.Debugf("Command error: %q", s)
 			}
 		}
 
 		if status, ok := internal.ExitStatus(err); ok {
-			return fmt.Errorf("%q exited %d with %s", command, status, err.Error())
+			return fmt.Errorf("%q exited %d with %w", command, status, err)
 		}
 
-		return fmt.Errorf("%q failed with %s", command, err.Error())
+		return fmt.Errorf("%q failed with %w", command, err)
 	}
 
 	c.cmd = cmd
@@ -132,7 +141,7 @@ func (c *CommandRunner) Run(timeout time.Duration, command []string, buffer io.R
 	return nil
 }
 
-func (c *CommandRunner) truncate(buf bytes.Buffer) string {
+func truncate(buf bytes.Buffer) string {
 	// Limit the number of bytes.
 	didTruncate := false
 	if buf.Len() > maxStderrBytes {
@@ -155,8 +164,8 @@ func (c *CommandRunner) truncate(buf bytes.Buffer) string {
 func init() {
 	outputs.Add("exec", func() telegraf.Output {
 		return &Exec{
-			runner:  &CommandRunner{},
-			Timeout: config.Duration(time.Second * 5),
+			Timeout:        config.Duration(time.Second * 5),
+			UseBatchFormat: true,
 		}
 	})
 }
@@ -170,9 +179,9 @@ func removeWindowsCarriageReturns(b bytes.Buffer) bytes.Buffer {
 			byt, err := b.ReadBytes(0x0D)
 			byt = bytes.TrimRight(byt, "\x0d")
 			if len(byt) > 0 {
-				_, _ = buf.Write(byt)
+				buf.Write(byt)
 			}
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return buf
 			}
 		}

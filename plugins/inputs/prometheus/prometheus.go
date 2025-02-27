@@ -1,7 +1,9 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package prometheus
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"io"
@@ -13,177 +15,145 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/config"
-	"github.com/influxdata/telegraf/internal"
-	"github.com/influxdata/telegraf/plugins/common/tls"
-	"github.com/influxdata/telegraf/plugins/inputs"
-	parser_v2 "github.com/influxdata/telegraf/plugins/parsers/prometheus"
+	"github.com/prometheus/common/expfmt"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/tools/cache"
+
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/filter"
+	"github.com/influxdata/telegraf/internal"
+	"github.com/influxdata/telegraf/models"
+	common_http "github.com/influxdata/telegraf/plugins/common/http"
+	"github.com/influxdata/telegraf/plugins/inputs"
+	"github.com/influxdata/telegraf/plugins/parsers/openmetrics"
+	parsers_prometheus "github.com/influxdata/telegraf/plugins/parsers/prometheus"
 )
 
-const acceptHeader = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3,*/*;q=0.1`
+//go:embed sample.conf
+var sampleConfig string
+
+const (
+	acceptHeader = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3`
+
+	monitorMethodNone                   monitorMethod = ""
+	monitorMethodAnnotations            monitorMethod = "annotations"
+	monitorMethodSettings               monitorMethod = "settings"
+	monitorMethodSettingsAndAnnotations monitorMethod = "settings+annotations"
+)
 
 type Prometheus struct {
-	// An array of urls to scrape metrics from.
-	URLs []string `toml:"urls"`
+	URLs                 []string          `toml:"urls"`
+	BearerToken          string            `toml:"bearer_token"`
+	BearerTokenString    config.Secret     `toml:"bearer_token_string"`
+	Username             config.Secret     `toml:"username"`
+	Password             config.Secret     `toml:"password"`
+	HTTPHeaders          map[string]string `toml:"http_headers"`
+	ContentLengthLimit   config.Size       `toml:"content_length_limit"`
+	ContentTypeOverride  string            `toml:"content_type_override"`
+	EnableRequestMetrics bool              `toml:"enable_request_metrics"`
+	MetricVersion        int               `toml:"metric_version"`
+	URLTag               string            `toml:"url_tag"`
+	IgnoreTimestamp      bool              `toml:"ignore_timestamp"`
 
-	// An array of Kubernetes services to scrape metrics from.
-	KubernetesServices []string
+	// Kubernetes service discovery
+	MonitorPods                 bool                `toml:"monitor_kubernetes_pods"`
+	PodScrapeScope              string              `toml:"pod_scrape_scope"`
+	NodeIP                      string              `toml:"node_ip"`
+	PodScrapeInterval           int                 `toml:"pod_scrape_interval"`
+	PodNamespace                string              `toml:"monitor_kubernetes_pods_namespace"`
+	PodNamespaceLabelName       string              `toml:"pod_namespace_label_name"`
+	KubernetesServices          []string            `toml:"kubernetes_services"`
+	KubeConfig                  string              `toml:"kube_config"`
+	KubernetesLabelSelector     string              `toml:"kubernetes_label_selector"`
+	KubernetesFieldSelector     string              `toml:"kubernetes_field_selector"`
+	MonitorKubernetesPodsMethod monitorMethod       `toml:"monitor_kubernetes_pods_method"`
+	MonitorKubernetesPodsScheme string              `toml:"monitor_kubernetes_pods_scheme"`
+	MonitorKubernetesPodsPath   string              `toml:"monitor_kubernetes_pods_path"`
+	MonitorKubernetesPodsPort   int                 `toml:"monitor_kubernetes_pods_port"`
+	NamespaceAnnotationPass     map[string][]string `toml:"namespace_annotation_pass"`
+	NamespaceAnnotationDrop     map[string][]string `toml:"namespace_annotation_drop"`
+	PodAnnotationInclude        []string            `toml:"pod_annotation_include"`
+	PodAnnotationExclude        []string            `toml:"pod_annotation_exclude"`
+	PodLabelInclude             []string            `toml:"pod_label_include"`
+	PodLabelExclude             []string            `toml:"pod_label_exclude"`
+	CacheRefreshInterval        int                 `toml:"cache_refresh_interval"`
 
-	// Location of kubernetes config file
-	KubeConfig string
+	// Consul discovery
+	ConsulConfig consulConfig `toml:"consul"`
 
-	// Label Selector/s for Kubernetes
-	KubernetesLabelSelector string `toml:"kubernetes_label_selector"`
+	Log telegraf.Logger `toml:"-"`
+	common_http.HTTPClientConfig
 
-	// Field Selector/s for Kubernetes
-	KubernetesFieldSelector string `toml:"kubernetes_field_selector"`
+	client      *http.Client
+	headers     map[string]string
+	contentType string
 
-	// Consul SD configuration
-	ConsulConfig ConsulConfig `toml:"consul"`
-
-	// Bearer Token authorization file path
-	BearerToken       string `toml:"bearer_token"`
-	BearerTokenString string `toml:"bearer_token_string"`
-
-	// Basic authentication credentials
-	Username string `toml:"username"`
-	Password string `toml:"password"`
-
-	ResponseTimeout config.Duration `toml:"response_timeout"`
-
-	MetricVersion int `toml:"metric_version"`
-
-	URLTag string `toml:"url_tag"`
-
-	IgnoreTimestamp bool `toml:"ignore_timestamp"`
-
-	tls.ClientConfig
-
-	Log telegraf.Logger
-
-	client  *http.Client
-	headers map[string]string
+	nsStore          cache.Store
+	nsAnnotationPass []models.TagFilter
+	nsAnnotationDrop []models.TagFilter
 
 	// Should we scrape Kubernetes services for prometheus annotations
-	MonitorPods       bool   `toml:"monitor_kubernetes_pods"`
-	PodScrapeScope    string `toml:"pod_scrape_scope"`
-	NodeIP            string `toml:"node_ip"`
-	PodScrapeInterval int    `toml:"pod_scrape_interval"`
-	PodNamespace      string `toml:"monitor_kubernetes_pods_namespace"`
-	lock              sync.Mutex
-	kubernetesPods    map[string]URLAndAddress
-	cancel            context.CancelFunc
-	wg                sync.WaitGroup
+	lock           sync.Mutex
+	kubernetesPods map[podID]urlAndAddress
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
 
 	// Only for monitor_kubernetes_pods=true and pod_scrape_scope="node"
-	podLabelSelector  labels.Selector
-	podFieldSelector  fields.Selector
-	isNodeScrapeScope bool
+	podLabelSelector           labels.Selector
+	podFieldSelector           fields.Selector
+	isNodeScrapeScope          bool
+	podAnnotationIncludeFilter filter.Filter
+	podAnnotationExcludeFilter filter.Filter
+	podLabelIncludeFilter      filter.Filter
+	podLabelExcludeFilter      filter.Filter
 
 	// List of consul services to scrape
-	consulServices map[string]URLAndAddress
+	consulServices map[string]urlAndAddress
 }
 
-var sampleConfig = `
-  ## An array of urls to scrape metrics from.
-  urls = ["http://localhost:9100/metrics"]
+type urlAndAddress struct {
+	originalURL *url.URL
+	url         *url.URL
+	address     string
+	tags        map[string]string
+	namespace   string
+}
 
-  ## Metric version controls the mapping from Prometheus metrics into
-  ## Telegraf metrics.  When using the prometheus_client output, use the same
-  ## value in both plugins to ensure metrics are round-tripped without
-  ## modification.
-  ##
-  ##   example: metric_version = 1; 
-  ##            metric_version = 2; recommended version
-  # metric_version = 1
+type monitorMethod string
 
-  ## Url tag name (tag containing scrapped url. optional, default is "url")
-  # url_tag = "url"
+type podID string
 
-  ## Whether the timestamp of the scraped metrics will be ignored.
-  ## If set to true, the gather time will be used.
-  # ignore_timestamp = false
-
-  ## An array of Kubernetes services to scrape metrics from.
-  # kubernetes_services = ["http://my-service-dns.my-namespace:9100/metrics"]
-
-  ## Kubernetes config file to create client from.
-  # kube_config = "/path/to/kubernetes.config"
-
-  ## Scrape Kubernetes pods for the following prometheus annotations:
-  ## - prometheus.io/scrape: Enable scraping for this pod
-  ## - prometheus.io/scheme: If the metrics endpoint is secured then you will need to
-  ##     set this to 'https' & most likely set the tls config.
-  ## - prometheus.io/path: If the metrics path is not /metrics, define it with this annotation.
-  ## - prometheus.io/port: If port is not 9102 use this annotation
-  # monitor_kubernetes_pods = true
-  ## Get the list of pods to scrape with either the scope of
-  ## - cluster: the kubernetes watch api (default, no need to specify)
-  ## - node: the local cadvisor api; for scalability. Note that the config node_ip or the environment variable NODE_IP must be set to the host IP.
-  # pod_scrape_scope = "cluster"
-  ## Only for node scrape scope: node IP of the node that telegraf is running on.
-  ## Either this config or the environment variable NODE_IP must be set.
-  # node_ip = "10.180.1.1"
-	## Only for node scrape scope: interval in seconds for how often to get updated pod list for scraping.
-	## Default is 60 seconds.
-	# pod_scrape_interval = 60
-  ## Restricts Kubernetes monitoring to a single namespace
-  ##   ex: monitor_kubernetes_pods_namespace = "default"
-  # monitor_kubernetes_pods_namespace = ""
-  # label selector to target pods which have the label
-  # kubernetes_label_selector = "env=dev,app=nginx"
-  # field selector to target pods
-  # eg. To scrape pods on a specific node
-  # kubernetes_field_selector = "spec.nodeName=$HOSTNAME"
-
-  ## Scrape Services available in Consul Catalog
-  # [inputs.prometheus.consul]
-  #   enabled = true
-  #   agent = "http://localhost:8500"
-  #   query_interval = "5m"
-
-  #   [[inputs.prometheus.consul.query]]
-  #     name = "a service name"
-  #     tag = "a service tag"
-  #     url = 'http://{{if ne .ServiceAddress ""}}{{.ServiceAddress}}{{else}}{{.Address}}{{end}}:{{.ServicePort}}/{{with .ServiceMeta.metrics_path}}{{.}}{{else}}metrics{{end}}'
-  #     [inputs.prometheus.consul.query.tags]
-  #       host = "{{.Node}}"
-
-  ## Use bearer token for authorization. ('bearer_token' takes priority)
-  # bearer_token = "/path/to/bearer/token"
-  ## OR
-  # bearer_token_string = "abc_123"
-
-  ## HTTP Basic Authentication username and password. ('bearer_token' and
-  ## 'bearer_token_string' take priority)
-  # username = ""
-  # password = ""
-
-  ## Specify timeout duration for slower prometheus clients (default is 3s)
-  # response_timeout = "3s"
-
-  ## Optional TLS Config
-  # tls_ca = /path/to/cafile
-  # tls_cert = /path/to/certfile
-  # tls_key = /path/to/keyfile
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-`
-
-func (p *Prometheus) SampleConfig() string {
+func (*Prometheus) SampleConfig() string {
 	return sampleConfig
 }
 
-func (p *Prometheus) Description() string {
-	return "Read metrics from one or many prometheus clients"
-}
-
 func (p *Prometheus) Init() error {
+	// Setup content-type override if requested
+	switch p.ContentTypeOverride {
+	case "": // No override
+	case "text":
+		p.contentType = string(expfmt.NewFormat(expfmt.TypeTextPlain))
+	case "protobuf-delimiter":
+		p.contentType = string(expfmt.NewFormat(expfmt.TypeProtoDelim))
+	case "protobuf-compact":
+		p.contentType = string(expfmt.NewFormat(expfmt.TypeProtoCompact))
+	case "protobuf-text":
+		p.contentType = string(expfmt.NewFormat(expfmt.TypeProtoText))
+	case "openmetrics-text":
+		f, err := expfmt.NewOpenMetricsFormat(expfmt.OpenMetricsVersion_1_0_0)
+		if err != nil {
+			return err
+		}
+		p.contentType = string(f)
+	case "openmetrics-protobuf":
+		p.contentType = "application/openmetrics-protobuf;version=1.0.0"
+	default:
+		return fmt.Errorf("invalid 'content_type_override' setting %q", p.ContentTypeOverride)
+	}
 
-	// Config proccessing for node scrape scope for monitor_kubernetes_pods
+	// Config processing for node scrape scope for monitor_kubernetes_pods
 	p.isNodeScrapeScope = strings.EqualFold(p.PodScrapeScope, "node")
 	if p.isNodeScrapeScope {
 		// Need node IP to make cAdvisor call for pod list. Check if set in config and valid IP address
@@ -199,32 +169,176 @@ func (p *Prometheus) Init() error {
 
 			p.NodeIP = envVarNodeIP
 		}
-
-		// Parse label and field selectors - will be used to filter pods after cAdvisor call
-		var err error
-		p.podLabelSelector, err = labels.Parse(p.KubernetesLabelSelector)
-		if err != nil {
-			return fmt.Errorf("error parsing the specified label selector(s): %s", err.Error())
-		}
-		p.podFieldSelector, err = fields.ParseSelector(p.KubernetesFieldSelector)
-		if err != nil {
-			return fmt.Errorf("error parsing the specified field selector(s): %s", err.Error())
-		}
-		isValid, invalidSelector := fieldSelectorIsSupported(p.podFieldSelector)
-		if !isValid {
-			return fmt.Errorf("the field selector %s is not supported for pods", invalidSelector)
-		}
-
 		p.Log.Infof("Using pod scrape scope at node level to get pod list using cAdvisor.")
-		p.Log.Infof("Using the label selector: %v and field selector: %v", p.podLabelSelector, p.podFieldSelector)
 	}
+
+	if p.MonitorKubernetesPodsMethod == monitorMethodNone {
+		p.MonitorKubernetesPodsMethod = monitorMethodAnnotations
+	}
+
+	// Parse label and field selectors - will be used to filter pods after cAdvisor call
+	var err error
+	p.podLabelSelector, err = labels.Parse(p.KubernetesLabelSelector)
+	if err != nil {
+		return fmt.Errorf("error parsing the specified label selector(s): %w", err)
+	}
+	p.podFieldSelector, err = fields.ParseSelector(p.KubernetesFieldSelector)
+	if err != nil {
+		return fmt.Errorf("error parsing the specified field selector(s): %w", err)
+	}
+	isValid, invalidSelector := fieldSelectorIsSupported(p.podFieldSelector)
+	if !isValid {
+		return fmt.Errorf("the field selector %q is not supported for pods", invalidSelector)
+	}
+
+	if p.KubernetesLabelSelector != "" {
+		p.Log.Debugf("Using the label selector: %v", p.podLabelSelector)
+	}
+	if p.KubernetesFieldSelector != "" {
+		p.Log.Debugf("Using the field selector: %v", p.podFieldSelector)
+	}
+
+	for k, vs := range p.NamespaceAnnotationPass {
+		tagFilter := models.TagFilter{}
+		tagFilter.Name = k
+		tagFilter.Values = append(tagFilter.Values, vs...)
+		if err := tagFilter.Compile(); err != nil {
+			return fmt.Errorf("error compiling 'namespace_annotation_pass', %w", err)
+		}
+		p.nsAnnotationPass = append(p.nsAnnotationPass, tagFilter)
+	}
+
+	for k, vs := range p.NamespaceAnnotationDrop {
+		tagFilter := models.TagFilter{}
+		tagFilter.Name = k
+		tagFilter.Values = append(tagFilter.Values, vs...)
+		if err := tagFilter.Compile(); err != nil {
+			return fmt.Errorf("error compiling 'namespace_annotation_drop', %w", err)
+		}
+		p.nsAnnotationDrop = append(p.nsAnnotationDrop, tagFilter)
+	}
+
+	if err := p.initFilters(); err != nil {
+		return err
+	}
+
+	if p.MetricVersion == 0 {
+		p.MetricVersion = 1
+	}
+
+	ctx := context.Background()
+
+	client, err := p.HTTPClientConfig.CreateClient(ctx, p.Log)
+	if err != nil {
+		return err
+	}
+	p.client = client
+	if p.HTTPClientConfig.ResponseHeaderTimeout != 0 {
+		p.Log.Warn(
+			"Config option response_timeout was set to non-zero value. This option's behavior was " +
+				"changed in Telegraf 1.30.2 and now controls the HTTP client's header timeout and " +
+				"not the Prometheus timeout. Users can ignore this warning if that was the intention. " +
+				"Otherwise, please use the timeout config option for the Prometheus timeout.",
+		)
+	}
+
+	p.headers = map[string]string{
+		"User-Agent": internal.ProductToken(),
+		"Accept":     acceptHeader,
+	}
+
+	p.kubernetesPods = make(map[podID]urlAndAddress)
 
 	return nil
 }
 
-var ErrProtocolError = errors.New("prometheus protocol error")
+// Start will start the Kubernetes and/or Consul scraping if enabled in the configuration
+func (p *Prometheus) Start(_ telegraf.Accumulator) error {
+	var ctx context.Context
+	p.wg = sync.WaitGroup{}
+	ctx, p.cancel = context.WithCancel(context.Background())
 
-func (p *Prometheus) AddressToURL(u *url.URL, address string) *url.URL {
+	if p.ConsulConfig.Enabled && len(p.ConsulConfig.Queries) > 0 {
+		if err := p.startConsul(ctx); err != nil {
+			return err
+		}
+	}
+	if p.MonitorPods {
+		if err := p.startK8s(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *Prometheus) Gather(acc telegraf.Accumulator) error {
+	var wg sync.WaitGroup
+
+	allURLs, err := p.getAllURLs()
+	if err != nil {
+		return err
+	}
+	for _, URL := range allURLs {
+		wg.Add(1)
+		go func(serviceURL urlAndAddress) {
+			defer wg.Done()
+			requestFields, tags, err := p.gatherURL(serviceURL, acc)
+			acc.AddError(err)
+
+			// Add metrics
+			if p.EnableRequestMetrics {
+				acc.AddFields("prometheus_request", requestFields, tags)
+			}
+		}(URL)
+	}
+
+	wg.Wait()
+
+	return nil
+}
+
+func (p *Prometheus) Stop() {
+	p.cancel()
+	p.wg.Wait()
+
+	if p.client != nil {
+		p.client.CloseIdleConnections()
+	}
+}
+
+func (p *Prometheus) initFilters() error {
+	if p.PodAnnotationExclude != nil {
+		podAnnotationExclude, err := filter.Compile(p.PodAnnotationExclude)
+		if err != nil {
+			return fmt.Errorf("error compiling 'pod_annotation_exclude': %w", err)
+		}
+		p.podAnnotationExcludeFilter = podAnnotationExclude
+	}
+	if p.PodAnnotationInclude != nil {
+		podAnnotationInclude, err := filter.Compile(p.PodAnnotationInclude)
+		if err != nil {
+			return fmt.Errorf("error compiling 'pod_annotation_include': %w", err)
+		}
+		p.podAnnotationIncludeFilter = podAnnotationInclude
+	}
+	if p.PodLabelExclude != nil {
+		podLabelExclude, err := filter.Compile(p.PodLabelExclude)
+		if err != nil {
+			return fmt.Errorf("error compiling 'pod_label_exclude': %w", err)
+		}
+		p.podLabelExcludeFilter = podLabelExclude
+	}
+	if p.PodLabelInclude != nil {
+		podLabelInclude, err := filter.Compile(p.PodLabelInclude)
+		if err != nil {
+			return fmt.Errorf("error compiling 'pod_label_include': %w", err)
+		}
+		p.podLabelIncludeFilter = podLabelInclude
+	}
+	return nil
+}
+
+func addressToURL(u *url.URL, address string) *url.URL {
 	host := address
 	if u.Port() != "" {
 		host = address + ":" + u.Port()
@@ -243,22 +357,15 @@ func (p *Prometheus) AddressToURL(u *url.URL, address string) *url.URL {
 	return reconstructedURL
 }
 
-type URLAndAddress struct {
-	OriginalURL *url.URL
-	URL         *url.URL
-	Address     string
-	Tags        map[string]string
-}
-
-func (p *Prometheus) GetAllURLs() (map[string]URLAndAddress, error) {
-	allURLs := make(map[string]URLAndAddress)
+func (p *Prometheus) getAllURLs() (map[string]urlAndAddress, error) {
+	allURLs := make(map[string]urlAndAddress, len(p.URLs)+len(p.consulServices)+len(p.kubernetesPods))
 	for _, u := range p.URLs {
-		URL, err := url.Parse(u)
+		address, err := url.Parse(u)
 		if err != nil {
 			p.Log.Errorf("Could not parse %q, skipping it. Error: %s", u, err.Error())
 			continue
 		}
-		allURLs[URL.String()] = URLAndAddress{URL: URL, OriginalURL: URL}
+		allURLs[address.String()] = urlAndAddress{url: address, originalURL: address}
 	}
 
 	p.lock.Lock()
@@ -268,120 +375,83 @@ func (p *Prometheus) GetAllURLs() (map[string]URLAndAddress, error) {
 		allURLs[k] = v
 	}
 	// loop through all pods scraped via the prometheus annotation on the pods
-	for k, v := range p.kubernetesPods {
-		allURLs[k] = v
+	for _, v := range p.kubernetesPods {
+		if namespaceAnnotationMatch(v.namespace, p) {
+			allURLs[v.url.String()] = v
+		}
 	}
 
 	for _, service := range p.KubernetesServices {
-		URL, err := url.Parse(service)
+		address, err := url.Parse(service)
 		if err != nil {
 			return nil, err
 		}
 
-		resolvedAddresses, err := net.LookupHost(URL.Hostname())
+		resolvedAddresses, err := net.LookupHost(address.Hostname())
 		if err != nil {
-			p.Log.Errorf("Could not resolve %q, skipping it. Error: %s", URL.Host, err.Error())
+			p.Log.Errorf("Could not resolve %q, skipping it. Error: %s", address.Host, err.Error())
 			continue
 		}
 		for _, resolved := range resolvedAddresses {
-			serviceURL := p.AddressToURL(URL, resolved)
-			allURLs[serviceURL.String()] = URLAndAddress{
-				URL:         serviceURL,
-				Address:     resolved,
-				OriginalURL: URL,
+			serviceURL := addressToURL(address, resolved)
+			allURLs[serviceURL.String()] = urlAndAddress{
+				url:         serviceURL,
+				address:     resolved,
+				originalURL: address,
 			}
 		}
 	}
 	return allURLs, nil
 }
 
-// Reads stats from all configured servers accumulates stats.
-// Returns one of the errors encountered while gather stats (if any).
-func (p *Prometheus) Gather(acc telegraf.Accumulator) error {
-	if p.client == nil {
-		client, err := p.createHTTPClient()
-		if err != nil {
-			return err
-		}
-		p.client = client
-		p.headers = map[string]string{
-			"User-Agent": internal.ProductToken(),
-			"Accept":     acceptHeader,
-		}
-	}
-
-	var wg sync.WaitGroup
-
-	allURLs, err := p.GetAllURLs()
-	if err != nil {
-		return err
-	}
-	for _, URL := range allURLs {
-		wg.Add(1)
-		go func(serviceURL URLAndAddress) {
-			defer wg.Done()
-			acc.AddError(p.gatherURL(serviceURL, acc))
-		}(URL)
-	}
-
-	wg.Wait()
-
-	return nil
-}
-
-func (p *Prometheus) createHTTPClient() (*http.Client, error) {
-	tlsCfg, err := p.ClientConfig.TLSConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig:   tlsCfg,
-			DisableKeepAlives: true,
-		},
-		Timeout: time.Duration(p.ResponseTimeout),
-	}
-
-	return client, nil
-}
-
-func (p *Prometheus) gatherURL(u URLAndAddress, acc telegraf.Accumulator) error {
+func (p *Prometheus) gatherURL(u urlAndAddress, acc telegraf.Accumulator) (map[string]interface{}, map[string]string, error) {
 	var req *http.Request
-	var err error
 	var uClient *http.Client
-	var metrics []telegraf.Metric
-	if u.URL.Scheme == "unix" {
-		path := u.URL.Query().Get("path")
+	requestFields := make(map[string]interface{})
+	tags := make(map[string]string, len(u.tags)+2)
+	if p.URLTag != "" {
+		tags[p.URLTag] = u.originalURL.String()
+	}
+	if u.address != "" {
+		tags["address"] = u.address
+	}
+	for k, v := range u.tags {
+		tags[k] = v
+	}
+
+	if u.url.Scheme == "unix" {
+		path := u.url.Query().Get("path")
 		if path == "" {
 			path = "/metrics"
 		}
+
+		var err error
 		addr := "http://localhost" + path
 		req, err = http.NewRequest("GET", addr, nil)
 		if err != nil {
-			return fmt.Errorf("unable to create new request '%s': %s", addr, err)
+			return nil, nil, fmt.Errorf("unable to create new request %q: %w", addr, err)
 		}
 
-		// ignore error because it's been handled before getting here
-		tlsCfg, _ := p.ClientConfig.TLSConfig()
+		//nolint:errcheck // ignore error because it's been handled before getting here
+		tlsCfg, _ := p.HTTPClientConfig.TLSConfig()
 		uClient = &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig:   tlsCfg,
 				DisableKeepAlives: true,
-				Dial: func(network, addr string) (net.Conn, error) {
-					c, err := net.Dial("unix", u.URL.Path)
+				Dial: func(string, string) (net.Conn, error) {
+					c, err := net.Dial("unix", u.url.Path)
 					return c, err
 				},
 			},
-			Timeout: time.Duration(p.ResponseTimeout),
 		}
 	} else {
-		if u.URL.Path == "" {
-			u.URL.Path = "/metrics"
+		if u.url.Path == "" {
+			u.url.Path = "/metrics"
 		}
-		req, err = http.NewRequest("GET", u.URL.String(), nil)
+		var err error
+		req, err = http.NewRequest("GET", u.url.String(), nil)
 		if err != nil {
-			return fmt.Errorf("unable to create new request '%s': %s", u.URL.String(), err)
+			return nil, nil, fmt.Errorf("unable to create new request %q: %w", u.url.String(), err)
 		}
 	}
 
@@ -390,61 +460,123 @@ func (p *Prometheus) gatherURL(u URLAndAddress, acc telegraf.Accumulator) error 
 	if p.BearerToken != "" {
 		token, err := os.ReadFile(p.BearerToken)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+string(token))
-	} else if p.BearerTokenString != "" {
-		req.Header.Set("Authorization", "Bearer "+p.BearerTokenString)
-	} else if p.Username != "" || p.Password != "" {
-		req.SetBasicAuth(p.Username, p.Password)
+	} else if !p.BearerTokenString.Empty() {
+		token, err := p.BearerTokenString.Get()
+		if err != nil {
+			return nil, nil, fmt.Errorf("getting token secret failed: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token.String())
+		token.Destroy()
+	} else if !p.Username.Empty() || !p.Password.Empty() {
+		username, err := p.Username.Get()
+		if err != nil {
+			return nil, nil, fmt.Errorf("getting username secret failed: %w", err)
+		}
+		password, err := p.Password.Get()
+		if err != nil {
+			return nil, nil, fmt.Errorf("getting password secret failed: %w", err)
+		}
+		req.SetBasicAuth(username.String(), password.String())
+		username.Destroy()
+		password.Destroy()
 	}
 
+	for key, value := range p.HTTPHeaders {
+		if strings.EqualFold(key, "host") {
+			req.Host = value
+		} else {
+			req.Header.Set(key, value)
+		}
+	}
+
+	var err error
 	var resp *http.Response
-	if u.URL.Scheme != "unix" {
+	var start time.Time
+	if u.url.Scheme != "unix" {
+		start = time.Now()
 		resp, err = p.client.Do(req)
 	} else {
+		start = time.Now()
 		resp, err = uClient.Do(req)
 	}
+	end := time.Since(start).Seconds()
 	if err != nil {
-		return fmt.Errorf("error making HTTP request to %s: %s", u.URL, err)
+		return requestFields, tags, fmt.Errorf("error making HTTP request to %q: %w", u.url, err)
 	}
+	requestFields["response_time"] = end
+
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s returned HTTP status %s", u.URL, resp.Status)
+		return requestFields, tags, fmt.Errorf("%q returned HTTP status %q", u.url, resp.Status)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("error reading body: %s", err)
-	}
+	var body []byte
+	if p.ContentLengthLimit != 0 {
+		limit := int64(p.ContentLengthLimit)
 
-	if p.MetricVersion == 2 {
-		parser := parser_v2.Parser{
-			Header:          resp.Header,
-			IgnoreTimestamp: p.IgnoreTimestamp,
+		// To determine whether io.ReadAll() ended due to EOF or reached the specified limit,
+		// read up to the specified limit plus one extra byte, and then make a decision based
+		// on the length of the result.
+		lr := io.LimitReader(resp.Body, limit+1)
+
+		body, err = io.ReadAll(lr)
+		if err != nil {
+			return requestFields, tags, fmt.Errorf("error reading body: %w", err)
 		}
-		metrics, err = parser.Parse(body)
+		if int64(len(body)) > limit {
+			p.Log.Infof("skipping %s: content length exceeded maximum body size (%d)", u.url, limit)
+			return requestFields, tags, nil
+		}
 	} else {
-		metrics, err = Parse(body, resp.Header, p.IgnoreTimestamp)
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return requestFields, tags, fmt.Errorf("error reading body: %w", err)
+		}
+	}
+	requestFields["content_length"] = len(body)
+
+	// Override the response format if the user requested it
+	if p.contentType != "" {
+		resp.Header.Set("Content-Type", p.contentType)
 	}
 
+	// Parse the metrics
+	var metricParser telegraf.Parser
+	if openmetrics.AcceptsContent(resp.Header) {
+		metricParser = &openmetrics.Parser{
+			Header:          resp.Header,
+			MetricVersion:   p.MetricVersion,
+			IgnoreTimestamp: p.IgnoreTimestamp,
+			Log:             p.Log,
+		}
+	} else {
+		metricParser = &parsers_prometheus.Parser{
+			Header:          resp.Header,
+			MetricVersion:   p.MetricVersion,
+			IgnoreTimestamp: p.IgnoreTimestamp,
+			Log:             p.Log,
+		}
+	}
+	metrics, err := metricParser.Parse(body)
 	if err != nil {
-		return fmt.Errorf("error reading metrics for %s: %s",
-			u.URL, err)
+		return requestFields, tags, fmt.Errorf("error reading metrics for %q: %w", u.url, err)
 	}
 
 	for _, metric := range metrics {
 		tags := metric.Tags()
 		// strip user and password from URL
-		u.OriginalURL.User = nil
+		u.originalURL.User = nil
 		if p.URLTag != "" {
-			tags[p.URLTag] = u.OriginalURL.String()
+			tags[p.URLTag] = u.originalURL.String()
 		}
-		if u.Address != "" {
-			tags["address"] = u.Address
+		if u.address != "" {
+			tags["address"] = u.address
 		}
-		for k, v := range u.Tags {
+		for k, v := range u.tags {
 			tags[k] = v
 		}
 
@@ -462,7 +594,7 @@ func (p *Prometheus) gatherURL(u URLAndAddress, acc telegraf.Accumulator) error 
 		}
 	}
 
-	return nil
+	return requestFields, tags, nil
 }
 
 func (p *Prometheus) addHeaders(req *http.Request) {
@@ -495,37 +627,12 @@ func fieldSelectorIsSupported(fieldSelector fields.Selector) (bool, string) {
 	return true, ""
 }
 
-// Start will start the Kubernetes and/or Consul scraping if enabled in the configuration
-func (p *Prometheus) Start(_ telegraf.Accumulator) error {
-	var ctx context.Context
-	p.wg = sync.WaitGroup{}
-	ctx, p.cancel = context.WithCancel(context.Background())
-
-	if p.ConsulConfig.Enabled && len(p.ConsulConfig.Queries) > 0 {
-		if err := p.startConsul(ctx); err != nil {
-			return err
-		}
-	}
-	if p.MonitorPods {
-		if err := p.startK8s(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (p *Prometheus) Stop() {
-	p.cancel()
-	p.wg.Wait()
-}
-
 func init() {
 	inputs.Add("prometheus", func() telegraf.Input {
 		return &Prometheus{
-			ResponseTimeout: config.Duration(time.Second * 3),
-			kubernetesPods:  map[string]URLAndAddress{},
-			consulServices:  map[string]URLAndAddress{},
-			URLTag:          "url",
+			kubernetesPods: make(map[podID]urlAndAddress),
+			consulServices: make(map[string]urlAndAddress),
+			URLTag:         "url",
 		}
 	})
 }

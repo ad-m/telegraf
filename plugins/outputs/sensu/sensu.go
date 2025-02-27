@@ -1,8 +1,11 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package sensu
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -21,62 +24,65 @@ import (
 	"github.com/influxdata/telegraf/plugins/outputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 const (
 	defaultURL           = "http://127.0.0.1:3031"
 	defaultClientTimeout = 5 * time.Second
 	defaultContentType   = "application/json; charset=utf-8"
 )
 
-type OutputMetadata struct {
+type outputMetadata struct {
 	Name string `json:"name"`
 }
 
-type OutputEntity struct {
-	Metadata *OutputMetadata `json:"metadata"`
+type outputEntity struct {
+	Metadata *outputMetadata `json:"metadata"`
 }
 
-type OutputCheck struct {
-	Metadata             *OutputMetadata `json:"metadata"`
+type outputCheck struct {
+	Metadata             *outputMetadata `json:"metadata"`
 	Status               int             `json:"status"`
 	Output               string          `json:"output"`
 	Issued               int64           `json:"issued"`
 	OutputMetricHandlers []string        `json:"output_metric_handlers"`
 }
 
-type OutputMetrics struct {
+type outputMetrics struct {
 	Handlers []string        `json:"handlers"`
-	Metrics  []*OutputMetric `json:"points"`
+	Metrics  []*outputMetric `json:"points"`
 }
 
-type OutputMetric struct {
+type outputMetric struct {
 	Name      string       `json:"name"`
-	Tags      []*OutputTag `json:"tags"`
+	Tags      []*outputTag `json:"tags"`
 	Value     interface{}  `json:"value"`
 	Timestamp int64        `json:"timestamp"`
 }
 
-type OutputTag struct {
+type outputTag struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 }
 
-type OutputEvent struct {
-	Entity    *OutputEntity  `json:"entity,omitempty"`
-	Check     *OutputCheck   `json:"check"`
-	Metrics   *OutputMetrics `json:"metrics"`
+type outputEvent struct {
+	Entity    *outputEntity  `json:"entity,omitempty"`
+	Check     *outputCheck   `json:"check"`
+	Metrics   *outputMetrics `json:"metrics"`
 	Timestamp int64          `json:"timestamp"`
 }
 
-type SensuEntity struct {
+type sensuEntity struct {
 	Name      *string `toml:"name"`
 	Namespace *string `toml:"namespace"`
 }
 
-type SensuCheck struct {
+type sensuCheck struct {
 	Name *string `toml:"name"`
 }
 
-type SensuMetrics struct {
+type sensuMetrics struct {
 	Handlers []string `toml:"handlers"`
 }
 
@@ -84,121 +90,21 @@ type Sensu struct {
 	APIKey        *string           `toml:"api_key"`
 	AgentAPIURL   *string           `toml:"agent_api_url"`
 	BackendAPIURL *string           `toml:"backend_api_url"`
-	Entity        *SensuEntity      `toml:"entity"`
+	Entity        *sensuEntity      `toml:"entity"`
 	Tags          map[string]string `toml:"tags"`
-	Metrics       *SensuMetrics     `toml:"metrics"`
-	Check         *SensuCheck       `toml:"check"`
+	Metrics       *sensuMetrics     `toml:"metrics"`
+	Check         *sensuCheck       `toml:"check"`
 
 	Timeout         config.Duration `toml:"timeout"`
 	ContentEncoding string          `toml:"content_encoding"`
 
 	EndpointURL string
-	OutEntity   *OutputEntity
+	OutEntity   *outputEntity
 
 	Log telegraf.Logger `toml:"-"`
 
 	tls.ClientConfig
 	client *http.Client
-}
-
-var sampleConfig = `
-  ## BACKEND API URL is the Sensu Backend API root URL to send metrics to
-  ## (protocol, host, and port only). The output plugin will automatically
-  ## append the corresponding backend API path
-  ## /api/core/v2/namespaces/:entity_namespace/events/:entity_name/:check_name).
-  ##
-  ## Backend Events API reference:
-  ## https://docs.sensu.io/sensu-go/latest/api/events/
-  ##
-  ## AGENT API URL is the Sensu Agent API root URL to send metrics to
-  ## (protocol, host, and port only). The output plugin will automatically
-  ## append the correspeonding agent API path (/events).
-  ##
-  ## Agent API Events API reference:
-  ## https://docs.sensu.io/sensu-go/latest/api/events/
-  ## 
-  ## NOTE: if backend_api_url and agent_api_url and api_key are set, the output 
-  ## plugin will use backend_api_url. If backend_api_url and agent_api_url are 
-  ## not provided, the output plugin will default to use an agent_api_url of 
-  ## http://127.0.0.1:3031
-  ## 
-  # backend_api_url = "http://127.0.0.1:8080"
-  # agent_api_url = "http://127.0.0.1:3031"
-
-  ## API KEY is the Sensu Backend API token 
-  ## Generate a new API token via: 
-  ## 
-  ## $ sensuctl cluster-role create telegraf --verb create --resource events,entities
-  ## $ sensuctl cluster-role-binding create telegraf --cluster-role telegraf --group telegraf
-  ## $ sensuctl user create telegraf --group telegraf --password REDACTED 
-  ## $ sensuctl api-key grant telegraf
-  ##
-  ## For more information on Sensu RBAC profiles & API tokens, please visit: 
-  ## - https://docs.sensu.io/sensu-go/latest/reference/rbac/
-  ## - https://docs.sensu.io/sensu-go/latest/reference/apikeys/ 
-  ## 
-  # api_key = "${SENSU_API_KEY}"
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-
-  ## Timeout for HTTP message
-  # timeout = "5s"
-
-  ## HTTP Content-Encoding for write request body, can be set to "gzip" to
-  ## compress body or "identity" to apply no encoding.
-  # content_encoding = "identity"
-
-  ## Sensu Event details
-  ##
-  ## Below are the event details to be sent to Sensu.  The main portions of the
-  ## event are the check, entity, and metrics specifications. For more information
-  ## on Sensu events and its components, please visit:
-  ## - Events - https://docs.sensu.io/sensu-go/latest/reference/events
-  ## - Checks -  https://docs.sensu.io/sensu-go/latest/reference/checks
-  ## - Entities - https://docs.sensu.io/sensu-go/latest/reference/entities
-  ## - Metrics - https://docs.sensu.io/sensu-go/latest/reference/events#metrics
-  ##
-  ## Check specification
-  ## The check name is the name to give the Sensu check associated with the event
-  ## created. This maps to check.metatadata.name in the event.
-  [outputs.sensu.check]
-  name = "telegraf"
-
-  ## Entity specification
-  ## Configure the entity name and namespace, if necessary. This will be part of
-  ## the entity.metadata in the event.
-  ##
-  ## NOTE: if the output plugin is configured to send events to a
-  ## backend_api_url and entity_name is not set, the value returned by
-  ## os.Hostname() will be used; if the output plugin is configured to send
-  ## events to an agent_api_url, entity_name and entity_namespace are not used.
-  # [outputs.sensu.entity]
-  #   name = "server-01"
-  #   namespace = "default"
-
-  ## Metrics specification
-  ## Configure the tags for the metrics that are sent as part of the Sensu event
-  # [outputs.sensu.tags]
-  #   source = "telegraf"
-
-  ## Configure the handler(s) for processing the provided metrics
-  # [outputs.sensu.metrics]
-  #   handlers = ["influxdb","elasticsearch"]
-`
-
-// Description provides a description of the plugin
-func (s *Sensu) Description() string {
-	return "Send aggregate metrics to Sensu Monitor"
-}
-
-// SampleConfig provides a sample configuration for the plugin
-func (s *Sensu) SampleConfig() string {
-	return sampleConfig
 }
 
 func (s *Sensu) createClient() (*http.Client, error) {
@@ -215,6 +121,10 @@ func (s *Sensu) createClient() (*http.Client, error) {
 	}
 
 	return client, nil
+}
+
+func (*Sensu) SampleConfig() string {
+	return sampleConfig
 }
 
 func (s *Sensu) Connect() error {
@@ -244,19 +154,19 @@ func (s *Sensu) Close() error {
 }
 
 func (s *Sensu) Write(metrics []telegraf.Metric) error {
-	var points []*OutputMetric
+	var points []*outputMetric
 	for _, metric := range metrics {
 		// Add tags from config to each metric point
-		tagList := make([]*OutputTag, 0, len(s.Tags)+len(metric.TagList()))
+		tagList := make([]*outputTag, 0, len(s.Tags)+len(metric.TagList()))
 		for name, value := range s.Tags {
-			tag := &OutputTag{
+			tag := &outputTag{
 				Name:  name,
 				Value: value,
 			}
 			tagList = append(tagList, tag)
 		}
 		for _, tagSet := range metric.TagList() {
-			tag := &OutputTag{
+			tag := &outputTag{
 				Name:  tagSet.Key,
 				Value: tagSet.Value,
 			}
@@ -281,7 +191,7 @@ func (s *Sensu) Write(metrics []telegraf.Metric) error {
 				continue
 			}
 
-			point := &OutputMetric{
+			point := &outputMetric{
 				Name:      metric.Name() + "." + key,
 				Tags:      tagList,
 				Timestamp: metric.Time().Unix(),
@@ -296,18 +206,15 @@ func (s *Sensu) Write(metrics []telegraf.Metric) error {
 		return err
 	}
 
-	return s.write(reqBody)
+	return s.writeMetrics(reqBody)
 }
 
-func (s *Sensu) write(reqBody []byte) error {
+func (s *Sensu) writeMetrics(reqBody []byte) error {
 	var reqBodyBuffer io.Reader = bytes.NewBuffer(reqBody)
 	method := http.MethodPost
 
 	if s.ContentEncoding == "gzip" {
-		rc, err := internal.CompressWithGzip(reqBodyBuffer)
-		if err != nil {
-			return err
-		}
+		rc := internal.CompressWithGzip(reqBodyBuffer)
 		defer rc.Close()
 		reqBodyBuffer = rc
 	}
@@ -414,18 +321,18 @@ func init() {
 	})
 }
 
-func (s *Sensu) encodeToJSON(metricPoints []*OutputMetric) ([]byte, error) {
+func (s *Sensu) encodeToJSON(metricPoints []*outputMetric) ([]byte, error) {
 	timestamp := time.Now().Unix()
 
 	check, err := s.getCheck(metricPoints)
 	if err != nil {
-		return []byte{}, err
+		return make([]byte, 0), err
 	}
 
-	output, err := json.Marshal(&OutputEvent{
+	output, err := json.Marshal(&outputEvent{
 		Entity: s.OutEntity,
 		Check:  check,
-		Metrics: &OutputMetrics{
+		Metrics: &outputMetrics{
 			Handlers: s.getHandlers(),
 			Metrics:  metricPoints,
 		},
@@ -445,33 +352,33 @@ func (s *Sensu) setEntity() error {
 		} else {
 			defaultHostname, err := os.Hostname()
 			if err != nil {
-				return fmt.Errorf("resolving hostname failed: %v", err)
+				return fmt.Errorf("resolving hostname failed: %w", err)
 			}
 			entityName = defaultHostname
 		}
 
-		s.OutEntity = &OutputEntity{
-			Metadata: &OutputMetadata{
+		s.OutEntity = &outputEntity{
+			Metadata: &outputMetadata{
 				Name: entityName,
 			},
 		}
 		return nil
 	}
-	s.OutEntity = &OutputEntity{}
+	s.OutEntity = &outputEntity{}
 	return nil
 }
 
 // Constructs the check payload
 // Throws if check name is not provided
-func (s *Sensu) getCheck(metricPoints []*OutputMetric) (*OutputCheck, error) {
+func (s *Sensu) getCheck(metricPoints []*outputMetric) (*outputCheck, error) {
 	count := len(metricPoints)
 
 	if s.Check == nil || s.Check.Name == nil {
-		return &OutputCheck{}, fmt.Errorf("missing check name")
+		return &outputCheck{}, errors.New("missing check name")
 	}
 
-	return &OutputCheck{
-		Metadata: &OutputMetadata{
+	return &outputCheck{
+		Metadata: &outputMetadata{
 			Name: *s.Check.Name,
 		},
 		Status:               0, // Always OK
@@ -483,7 +390,7 @@ func (s *Sensu) getCheck(metricPoints []*OutputMetric) (*OutputCheck, error) {
 
 func (s *Sensu) getHandlers() []string {
 	if s.Metrics == nil || s.Metrics.Handlers == nil {
-		return []string{}
+		return make([]string, 0)
 	}
 	return s.Metrics.Handlers
 }

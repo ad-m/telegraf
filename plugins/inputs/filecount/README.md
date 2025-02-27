@@ -1,15 +1,25 @@
 # Filecount Input Plugin
 
-Reports the number and total size of files in specified directories.
+This plugin reports the number and total size of files in specified directories.
 
-### Configuration:
+⭐ Telegraf v1.8.0
+🏷️ system
+💻 all
 
-```toml
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
+
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Configuration
+
+```toml @sample.conf
+# Count files in a directory
 [[inputs.filecount]]
-  ## Directory to gather stats about.
-  ##   deprecated in 1.9; use the directories option
-  # directory = "/var/cache/apt/archives"
-
   ## Directories to gather stats about.
   ## This accept standard unit glob matching rules, but with the addition of
   ## ** as a "super asterisk". ie:
@@ -42,7 +52,7 @@ Reports the number and total size of files in specified directories.
   mtime = "0s"
 ```
 
-### Metrics
+## Metrics
 
 - filecount
   - tags:
@@ -50,10 +60,12 @@ Reports the number and total size of files in specified directories.
   - fields:
     - count (integer)
     - size_bytes (integer)
+    - oldest_file_timestamp (int, unix time nanoseconds)
+    - newest_file_timestamp (int, unix time nanoseconds)
 
-### Example Output:
+## Example Output
 
-```
-filecount,directory=/var/cache/apt count=7i,size_bytes=7438336i 1530034445000000000
-filecount,directory=/tmp count=17i,size_bytes=28934786i 1530034445000000000
+```text
+filecount,directory=/var/cache/apt count=7i,size_bytes=7438336i,oldest_file_timestamp=1507152973123456789i,newest_file_timestamp=1507152973123456789i 1530034445000000000
+filecount,directory=/tmp count=17i,size_bytes=28934786i,oldest_file_timestamp=1507152973123456789i,newest_file_timestamp=1507152973123456789i 1530034445000000000
 ```

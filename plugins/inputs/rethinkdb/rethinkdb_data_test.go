@@ -3,14 +3,15 @@ package rethinkdb
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/assert"
 )
 
 var tags = make(map[string]string)
 
 func TestAddEngineStats(t *testing.T) {
-	engine := &Engine{
+	engine := &engine{
 		ClientConns:   0,
 		ClientActive:  0,
 		QueriesPerSec: 0,
@@ -33,15 +34,15 @@ func TestAddEngineStats(t *testing.T) {
 		"written_docs_per_sec",
 		"total_writes",
 	}
-	engine.AddEngineStats(keys, &acc, tags)
+	engine.addEngineStats(keys, &acc, tags)
 
 	for _, metric := range keys {
-		assert.True(t, acc.HasInt64Field("rethinkdb_engine", metric))
+		require.True(t, acc.HasInt64Field("rethinkdb_engine", metric))
 	}
 }
 
 func TestAddEngineStatsPartial(t *testing.T) {
-	engine := &Engine{
+	engine := &engine{
 		ClientConns:   0,
 		ClientActive:  0,
 		QueriesPerSec: 0,
@@ -64,24 +65,24 @@ func TestAddEngineStatsPartial(t *testing.T) {
 		"total_reads",
 		"total_writes",
 	}
-	engine.AddEngineStats(keys, &acc, tags)
+	engine.addEngineStats(keys, &acc, tags)
 
 	for _, metric := range missingKeys {
-		assert.False(t, acc.HasInt64Field("rethinkdb", metric))
+		require.False(t, acc.HasInt64Field("rethinkdb", metric))
 	}
 }
 
 func TestAddStorageStats(t *testing.T) {
-	storage := &Storage{
-		Cache: Cache{
+	storage := &storage{
+		Cache: cache{
 			BytesInUse: 0,
 		},
-		Disk: Disk{
+		Disk: disk{
 			ReadBytesPerSec:  0,
 			ReadBytesTotal:   0,
 			WriteBytesPerSec: 0,
 			WriteBytesTotal:  0,
-			SpaceUsage: SpaceUsage{
+			SpaceUsage: spaceUsage{
 				Data:     0,
 				Garbage:  0,
 				Metadata: 0,
@@ -104,9 +105,9 @@ func TestAddStorageStats(t *testing.T) {
 		"disk_usage_preallocated_bytes",
 	}
 
-	storage.AddStats(&acc, tags)
+	storage.addStats(&acc, tags)
 
 	for _, metric := range keys {
-		assert.True(t, acc.HasInt64Field("rethinkdb", metric))
+		require.True(t, acc.HasInt64Field("rethinkdb", metric))
 	}
 }

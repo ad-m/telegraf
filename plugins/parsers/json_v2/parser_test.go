@@ -1,81 +1,168 @@
 package json_v2_test
 
 import (
-	"bufio"
-	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/plugins/inputs/file"
 	"github.com/influxdata/telegraf/plugins/parsers/influx"
+	"github.com/influxdata/telegraf/plugins/parsers/json_v2"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
 )
 
 func TestMultipleConfigs(t *testing.T) {
 	// Get all directories in testdata
-	folders, err := ioutil.ReadDir("testdata")
+	folders, err := os.ReadDir("testdata")
 	require.NoError(t, err)
 	// Make sure testdata contains data
-	require.Greater(t, len(folders), 0)
+	require.NotEmpty(t, folders)
+
+	// Setup influx parser for parsing the expected metrics
+	parser := &influx.Parser{}
+	require.NoError(t, parser.Init())
+
+	inputs.Add("file", func() telegraf.Input {
+		return &file.File{}
+	})
 
 	for _, f := range folders {
+		// Only use directories as those contain test-cases
+		if !f.IsDir() {
+			continue
+		}
+		testdataPath := filepath.Join("testdata", f.Name())
+		configFilename := filepath.Join(testdataPath, "telegraf.conf")
+		expectedFilename := filepath.Join(testdataPath, "expected.out")
+		expectedErrorFilename := filepath.Join(testdataPath, "expected.err")
+
 		t.Run(f.Name(), func(t *testing.T) {
-			// Process the telegraf config file for the test
-			buf, err := os.ReadFile(fmt.Sprintf("testdata/%s/telegraf.conf", f.Name()))
-			require.NoError(t, err)
-			inputs.Add("file", func() telegraf.Input {
-				return &file.File{}
-			})
-			cfg := config.NewConfig()
-			err = cfg.LoadConfigData(buf)
+			// Read the expected output
+			expected, err := testutil.ParseMetricsFromFile(expectedFilename, parser)
 			require.NoError(t, err)
 
+			// Read the expected errors if any
+			var expectedErrors []string
+			if _, err := os.Stat(expectedErrorFilename); err == nil {
+				var err error
+				expectedErrors, err = testutil.ParseLinesFromFile(expectedErrorFilename)
+				require.NoError(t, err)
+				require.NotEmpty(t, expectedErrors)
+			}
+
+			// Configure the plugin
+			cfg := config.NewConfig()
+			require.NoError(t, cfg.LoadConfig(configFilename))
+
 			// Gather the metrics from the input file configure
-			acc := testutil.Accumulator{}
-			for _, i := range cfg.Inputs {
-				err = i.Init()
-				require.NoError(t, err)
-				err = i.Gather(&acc)
-				require.NoError(t, err)
+			var acc testutil.Accumulator
+			var actualErrorMsgs []string
+			for _, input := range cfg.Inputs {
+				require.NoError(t, input.Init())
+				if err := input.Gather(&acc); err != nil {
+					actualErrorMsgs = append(actualErrorMsgs, err.Error())
+				}
+			}
+
+			// If the test has expected error(s) then compare them
+			if len(expectedErrors) > 0 {
+				sort.Strings(actualErrorMsgs)
+				sort.Strings(expectedErrors)
+				for i, msg := range expectedErrors {
+					require.Contains(t, actualErrorMsgs[i], msg)
+				}
+			} else {
+				require.Empty(t, actualErrorMsgs)
 			}
 
 			// Process expected metrics and compare with resulting metrics
-			expectedOutputs, err := readMetricFile(fmt.Sprintf("testdata/%s/expected.out", f.Name()))
-			require.NoError(t, err)
-			testutil.RequireMetricsEqual(t, expectedOutputs, acc.GetTelegrafMetrics(), testutil.IgnoreTime())
+			actual := acc.GetTelegrafMetrics()
+			testutil.RequireMetricsEqual(t, expected, actual, testutil.IgnoreTime())
+
+			// Folder with timestamp prefixed will also check for matching timestamps to make sure they are parsed correctly
+			// The milliseconds weren't matching, seemed like a rounding difference between the influx parser
+			// Compares each metrics times separately and ignores milliseconds
+			if strings.HasPrefix(f.Name(), "timestamp") {
+				require.Equal(t, len(expected), len(actual))
+				for i, m := range actual {
+					require.Equal(t, expected[i].Time().Truncate(time.Second), m.Time().Truncate(time.Second))
+				}
+			}
 		})
 	}
 }
 
-func readMetricFile(path string) ([]telegraf.Metric, error) {
-	var metrics []telegraf.Metric
-	expectedFile, err := os.Open(path)
-	if err != nil {
-		return metrics, err
-	}
-	defer expectedFile.Close()
+func TestParserEmptyConfig(t *testing.T) {
+	plugin := &json_v2.Parser{}
+	require.ErrorContains(t, plugin.Init(), "no configuration provided")
+}
 
-	parser := influx.NewParser(influx.NewMetricHandler())
-	scanner := bufio.NewScanner(expectedFile)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line != "" {
-			m, err := parser.ParseLine(line)
-			if err != nil {
-				return nil, fmt.Errorf("unable to parse metric in %q failed: %v", line, err)
-			}
-			metrics = append(metrics, m)
+func BenchmarkParsingSequential(b *testing.B) {
+	inputFilename := filepath.Join("testdata", "benchmark", "input.json")
+
+	// Configure the plugin
+	plugin := &json_v2.Parser{
+		Configs: []json_v2.Config{
+			{
+				MeasurementName: "benchmark",
+				JSONObjects: []json_v2.Object{
+					{
+						Path:               "metrics",
+						DisablePrependKeys: true,
+					},
+				},
+			},
+		},
+	}
+	require.NoError(b, plugin.Init())
+
+	// Read the input data
+	input, err := os.ReadFile(inputFilename)
+	require.NoError(b, err)
+
+	// Do the benchmarking
+	for n := 0; n < b.N; n++ {
+		//nolint:errcheck // Benchmarking so skip the error check to avoid the unnecessary operations
+		plugin.Parse(input)
+	}
+}
+
+func BenchmarkParsingParallel(b *testing.B) {
+	inputFilename := filepath.Join("testdata", "benchmark", "input.json")
+
+	// Configure the plugin
+	plugin := &json_v2.Parser{
+		Configs: []json_v2.Config{
+			{
+				MeasurementName: "benchmark",
+				JSONObjects: []json_v2.Object{
+					{
+						Path:               "metrics",
+						DisablePrependKeys: true,
+					},
+				},
+			},
+		},
+	}
+	require.NoError(b, plugin.Init())
+
+	// Read the input data
+	input, err := os.ReadFile(inputFilename)
+	require.NoError(b, err)
+
+	// Do the benchmarking
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			//nolint:errcheck // Benchmarking so skip the error check to avoid the unnecessary operations
+			plugin.Parse(input)
 		}
-	}
-	err = expectedFile.Close()
-	if err != nil {
-		return metrics, err
-	}
-
-	return metrics, nil
+	})
 }

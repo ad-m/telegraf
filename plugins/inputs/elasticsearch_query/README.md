@@ -1,21 +1,34 @@
-# Elasticsearch query input plugin
+# Elasticsearch Query Input Plugin
 
-This [elasticsearch](https://www.elastic.co/) query plugin queries endpoints to obtain metrics from data stored in an Elasticsearch cluster.
+This plugin allows to query an [Elasticsearch][elastic] instance to obtain
+metrics from data stored in the cluster. The plugins supports counting the
+number of hits for a search query, calculating statistics for numeric fields,
+filtered by a query, aggregated per tag and to count the number of terms for a
+particular field.
 
-The following is supported:
+> [!IMPORTANT]
+> This plugins supports Elasticsearch 5.x and 6.x but is known to break on 7.x
+> or higher.
 
-- return number of hits for a search query
-- calculate the avg/max/min/sum for a numeric field, filtered by a query, aggregated per tag
-- count number of terms for a particular field
+⭐ Telegraf v1.20.0
+🏷️ datastore
+💻 all
 
-## Elasticsearch support
+[elastic]: https://www.elastic.co/
 
-This plugins is tested against Elasticsearch 5.x and 6.x releases.
-Currently it is known to break on 7.x or greater versions.
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
+
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
 
 ## Configuration
 
-```toml
+```toml @sample.conf
+# Derive metrics from aggregating Elasticsearch query results
 [[inputs.elasticsearch_query]]
   ## The full HTTP endpoint URL for your Elasticsearch instance
   ## Multiple urls can be specified as part of the same cluster,
@@ -43,6 +56,13 @@ Currently it is known to break on 7.x or greater versions.
   # tls_key = "/etc/telegraf/key.pem"
   ## Use TLS but skip chain & host verification
   # insecure_skip_verify = false
+ 
+  ## If 'use_system_proxy' is set to true, Telegraf will check env vars such as
+  ## HTTP_PROXY, HTTPS_PROXY, and NO_PROXY (or their lowercase counterparts).
+  ## If 'use_system_proxy' is set to false (default) and 'http_proxy_url' is
+  ## provided, Telegraf will use the specified URL as HTTP proxy.
+  # use_system_proxy = false
+  # http_proxy_url = "http://localhost:8888"
 
   [[inputs.elasticsearch_query.aggregation]]
     ## measurement name for the results of the aggregation query
@@ -77,7 +97,8 @@ Currently it is known to break on 7.x or greater versions.
     # metric_function = "avg"
 
     ## Fields to be used as tags
-    ## Must be text, non-analyzed fields. Metric aggregations are performed per tag
+    ## Must be text, non-analyzed fields. Metric aggregations are performed
+    ## per tag
     # tags = ["field.keyword", "field2.keyword"]
 
     ## Set to true to not ignore documents when the tag(s) above are missing
@@ -90,7 +111,8 @@ Currently it is known to break on 7.x or greater versions.
 
 ## Examples
 
-Please note that the `[[inputs.elasticsearch_query]]` is still required for all of the examples below.
+Please note that the `[[inputs.elasticsearch_query]]` is still required for all
+of the examples below.
 
 ### Search the average response time, per URI and per response status code
 
@@ -150,17 +172,36 @@ Please note that the `[[inputs.elasticsearch_query]]` is still required for all 
 
 ### Required parameters
 
-- `measurement_name`: The target measurement to be stored the results of the aggregation query.
+- `measurement_name`: The target measurement to be stored the results of the
+  aggregation query.
 - `index`: The index name to query on Elasticsearch
-- `query_period`: The time window to query (eg. "1m" to query documents from last minute). Normally should be set to same as collection
+- `query_period`: The time window to query (eg. "1m" to query documents from
+  last minute). Normally should be set to same as collection
 - `date_field`: The date/time field in the Elasticsearch index
 
 ### Optional parameters
 
-- `date_field_custom_format`: Not needed if using one of the built in date/time formats of Elasticsearch, but may be required if using a custom date/time format. The format syntax uses the [Joda date format](https://www.elastic.co/guide/en/elasticsearch/reference/6.8/search-aggregations-bucket-daterange-aggregation.html#date-format-pattern).
+- `date_field_custom_format`: Not needed if using one of the built in date/time
+  formats of Elasticsearch, but may be required if using a custom date/time
+  format. The format syntax uses the [Joda date format][joda].
 - `filter_query`: Lucene query to filter the results (default: "\*")
-- `metric_fields`: The list of fields to perform metric aggregation (these must be indexed as numeric fields)
-- `metric_funcion`: The single-value metric aggregation function to be performed on the `metric_fields` defined. Currently supported aggregations are "avg", "min", "max", "sum". (see [https://www.elastic.co/guide/en/elasticsearch/reference/current/search-aggregations-metrics.html](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-aggregations-metrics.html)
-- `tags`: The list of fields to be used as tags (these must be indexed as non-analyzed fields). A "terms aggregation" will be done per tag defined
-- `include_missing_tag`: Set to true to not ignore documents where the tag(s) specified above does not exist. (If false, documents without the specified tag field will be ignored in `doc_count` and in the metric aggregation)
-- `missing_tag_value`: The value of the tag that will be set for documents in which the tag field does not exist. Only used when `include_missing_tag` is set to `true`.
+- `metric_fields`: The list of fields to perform metric aggregation (these must
+  be indexed as numeric fields)
+- `metric_function`: The single-value metric aggregation function to be performed
+  on the `metric_fields` defined. Currently supported aggregations are "avg",
+  "min", "max", "sum". (see the [aggregation docs][agg]
+- `tags`: The list of fields to be used as tags (these must be indexed as
+  non-analyzed fields). A "terms aggregation" will be done per tag defined
+- `include_missing_tag`: Set to true to not ignore documents where the tag(s)
+  specified above does not exist. (If false, documents without the specified tag
+  field will be ignored in `doc_count` and in the metric aggregation)
+- `missing_tag_value`: The value of the tag that will be set for documents in
+  which the tag field does not exist. Only used when `include_missing_tag` is
+  set to `true`.
+
+[joda]: https://www.elastic.co/guide/en/elasticsearch/reference/6.8/search-aggregations-bucket-daterange-aggregation.html#date-format-pattern
+[agg]: https://www.elastic.co/guide/en/elasticsearch/reference/current/search-aggregations-metrics.html
+
+## Metrics
+
+## Example Output

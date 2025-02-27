@@ -2,12 +2,15 @@
 
 Telegraf contains many general purpose plugins that support parsing input data
 using a configurable parser into [metrics][].  This allows, for example, the
-`kafka_consumer` input plugin to process messages in either InfluxDB Line
-Protocol or in JSON format.
+`kafka_consumer` input plugin to process messages in any of InfluxDB Line
+Protocol, JSON format, or Apache Avro format.
 
+- [Avro](/plugins/parsers/avro)
+- [Binary](/plugins/parsers/binary)
 - [Collectd](/plugins/parsers/collectd)
 - [CSV](/plugins/parsers/csv)
 - [Dropwizard](/plugins/parsers/dropwizard)
+- [Form URL Encoded](/plugins/parsers/form_urlencoded)
 - [Graphite](/plugins/parsers/graphite)
 - [Grok](/plugins/parsers/grok)
 - [InfluxDB Line Protocol](/plugins/parsers/influx)
@@ -15,6 +18,9 @@ Protocol or in JSON format.
 - [JSON v2](/plugins/parsers/json_v2)
 - [Logfmt](/plugins/parsers/logfmt)
 - [Nagios](/plugins/parsers/nagios)
+- [OpenMetrics](/plugins/parsers/openmetrics)
+- [OpenTSDB](/plugins/parsers/opentsdb)
+- [Parquet](/plugins/parsers/parquet)
 - [Prometheus](/plugins/parsers/prometheus)
 - [PrometheusRemoteWrite](/plugins/parsers/prometheusremotewrite)
 - [Value](/plugins/parsers/value), ie: 45 or "booyah"

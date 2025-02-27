@@ -4,10 +4,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/inputs/uwsgi"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
 )
 
 func TestBasic(t *testing.T) {
@@ -110,7 +113,11 @@ func TestBasic(t *testing.T) {
 
 	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			_, _ = w.Write([]byte(js))
+			if _, err := w.Write([]byte(js)); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+				return
+			}
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -123,7 +130,7 @@ func TestBasic(t *testing.T) {
 	}
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Gather(&acc))
-	require.Equal(t, 0, len(acc.Errors))
+	require.Empty(t, acc.Errors)
 }
 
 func TestInvalidJSON(t *testing.T) {
@@ -141,7 +148,11 @@ func TestInvalidJSON(t *testing.T) {
 
 	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			_, _ = w.Write([]byte(js))
+			if _, err := w.Write([]byte(js)); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+				return
+			}
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -154,16 +165,17 @@ func TestInvalidJSON(t *testing.T) {
 	}
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Gather(&acc))
-	require.Equal(t, 1, len(acc.Errors))
+	require.Len(t, acc.Errors, 1)
 }
 
 func TestHttpError(t *testing.T) {
 	plugin := &uwsgi.Uwsgi{
 		Servers: []string{"http://novalidurladress/"},
+		Timeout: config.Duration(10 * time.Millisecond),
 	}
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Gather(&acc))
-	require.Equal(t, 1, len(acc.Errors))
+	require.Len(t, acc.Errors, 1)
 }
 
 func TestTcpError(t *testing.T) {
@@ -172,7 +184,7 @@ func TestTcpError(t *testing.T) {
 	}
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Gather(&acc))
-	require.Equal(t, 1, len(acc.Errors))
+	require.Len(t, acc.Errors, 1)
 }
 
 func TestUnixSocketError(t *testing.T) {
@@ -181,5 +193,5 @@ func TestUnixSocketError(t *testing.T) {
 	}
 	var acc testutil.Accumulator
 	require.NoError(t, plugin.Gather(&acc))
-	require.Equal(t, 1, len(acc.Errors))
+	require.Len(t, acc.Errors, 1)
 }

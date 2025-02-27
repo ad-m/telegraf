@@ -3,12 +3,14 @@ package thrift
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
+
 	"github.com/influxdata/telegraf/plugins/inputs/zipkin/codec"
 	"github.com/influxdata/telegraf/plugins/inputs/zipkin/codec/thrift/gen-go/zipkincore"
 )
@@ -16,9 +18,7 @@ import (
 // UnmarshalThrift converts raw bytes in thrift format to a slice of spans
 func UnmarshalThrift(body []byte) ([]*zipkincore.Span, error) {
 	buffer := thrift.NewTMemoryBuffer()
-	if _, err := buffer.Write(body); err != nil {
-		return nil, err
-	}
+	buffer.Write(body)
 
 	transport := thrift.NewTBinaryProtocolConf(buffer, nil)
 	_, size, err := transport.ReadListBegin(context.Background())
@@ -26,16 +26,16 @@ func UnmarshalThrift(body []byte) ([]*zipkincore.Span, error) {
 		return nil, err
 	}
 
-	spans := make([]*zipkincore.Span, size)
+	spans := make([]*zipkincore.Span, 0, size)
 	for i := 0; i < size; i++ {
 		zs := &zipkincore.Span{}
-		if err = zs.Read(context.Background(), transport); err != nil {
+		if err := zs.Read(context.Background(), transport); err != nil {
 			return nil, err
 		}
-		spans[i] = zs
+		spans = append(spans, zs)
 	}
 
-	if err = transport.ReadListEnd(context.Background()); err != nil {
+	if err := transport.ReadListEnd(context.Background()); err != nil {
 		return nil, err
 	}
 	return spans, nil
@@ -45,15 +45,15 @@ func UnmarshalThrift(body []byte) ([]*zipkincore.Span, error) {
 type Thrift struct{}
 
 // Decode unmarshals and validates bytes in thrift format
-func (t *Thrift) Decode(octets []byte) ([]codec.Span, error) {
+func (*Thrift) Decode(octets []byte) ([]codec.Span, error) {
 	spans, err := UnmarshalThrift(octets)
 	if err != nil {
 		return nil, err
 	}
 
-	res := make([]codec.Span, len(spans))
-	for i, s := range spans {
-		res[i] = &span{s}
+	res := make([]codec.Span, 0, len(spans))
+	for _, s := range spans {
+		res = append(res, &span{s})
 	}
 	return res, nil
 }
@@ -145,7 +145,7 @@ type span struct {
 
 func (s *span) Trace() (string, error) {
 	if s.Span.GetTraceIDHigh() == 0 && s.Span.GetTraceID() == 0 {
-		return "", fmt.Errorf("Span does not have a trace ID")
+		return "", errors.New("span does not have a trace ID")
 	}
 
 	if s.Span.GetTraceIDHigh() == 0 {
@@ -171,17 +171,17 @@ func (s *span) Name() string {
 }
 
 func (s *span) Annotations() []codec.Annotation {
-	res := make([]codec.Annotation, len(s.Span.Annotations))
-	for i := range s.Span.Annotations {
-		res[i] = &annotation{s.Span.Annotations[i]}
+	res := make([]codec.Annotation, 0, len(s.Span.Annotations))
+	for _, ann := range s.Span.Annotations {
+		res = append(res, &annotation{ann})
 	}
 	return res
 }
 
 func (s *span) BinaryAnnotations() ([]codec.BinaryAnnotation, error) {
-	res := make([]codec.BinaryAnnotation, len(s.Span.BinaryAnnotations))
-	for i := range s.Span.BinaryAnnotations {
-		res[i] = &binaryAnnotation{s.Span.BinaryAnnotations[i]}
+	res := make([]codec.BinaryAnnotation, 0, len(s.Span.BinaryAnnotations))
+	for _, ann := range s.Span.BinaryAnnotations {
+		res = append(res, &binaryAnnotation{ann})
 	}
 	return res, nil
 }

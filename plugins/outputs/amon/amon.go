@@ -1,8 +1,11 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package amon
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,6 +16,9 @@ import (
 	"github.com/influxdata/telegraf/plugins/outputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 type Amon struct {
 	ServerKey    string          `toml:"server_key"`
 	AmonInstance string          `toml:"amon_instance"`
@@ -21,17 +27,6 @@ type Amon struct {
 
 	client *http.Client
 }
-
-var sampleConfig = `
-  ## Amon Server Key
-  server_key = "my-server-key" # required.
-
-  ## Amon Instance URL
-  amon_instance = "https://youramoninstance" # required
-
-  ## Connection timeout.
-  # timeout = "5s"
-`
 
 type TimeSeries struct {
 	Series []*Metric `json:"series"`
@@ -44,9 +39,13 @@ type Metric struct {
 
 type Point [2]float64
 
+func (*Amon) SampleConfig() string {
+	return sampleConfig
+}
+
 func (a *Amon) Connect() error {
 	if a.ServerKey == "" || a.AmonInstance == "" {
-		return fmt.Errorf("serverkey and amon_instance are required fields for amon output")
+		return errors.New("serverkey and amon_instance are required fields for amon output")
 	}
 	a.client = &http.Client{
 		Transport: &http.Transport{
@@ -61,16 +60,15 @@ func (a *Amon) Write(metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
-	ts := TimeSeries{}
-	tempSeries := []*Metric{}
-	metricCounter := 0
 
+	metricCounter := 0
+	tempSeries := make([]*Metric, 0, len(metrics))
 	for _, m := range metrics {
-		mname := strings.Replace(m.Name(), "_", ".", -1)
+		mname := strings.ReplaceAll(m.Name(), "_", ".")
 		if amonPts, err := buildMetrics(m); err == nil {
 			for fieldName, amonPt := range amonPts {
 				metric := &Metric{
-					Metric: mname + "_" + strings.Replace(fieldName, "_", ".", -1),
+					Metric: mname + "_" + strings.ReplaceAll(fieldName, "_", "."),
 				}
 				metric.Points[0] = amonPt
 				tempSeries = append(tempSeries, metric)
@@ -81,21 +79,22 @@ func (a *Amon) Write(metrics []telegraf.Metric) error {
 		}
 	}
 
+	ts := TimeSeries{}
 	ts.Series = make([]*Metric, metricCounter)
 	copy(ts.Series, tempSeries[0:])
 	tsBytes, err := json.Marshal(ts)
 	if err != nil {
-		return fmt.Errorf("unable to marshal TimeSeries, %s", err.Error())
+		return fmt.Errorf("unable to marshal TimeSeries: %w", err)
 	}
 	req, err := http.NewRequest("POST", a.authenticatedURL(), bytes.NewBuffer(tsBytes))
 	if err != nil {
-		return fmt.Errorf("unable to create http.Request, %s", err.Error())
+		return fmt.Errorf("unable to create http.Request: %w", err)
 	}
 	req.Header.Add("Content-Type", "application/json")
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("error POSTing metrics, %s", err.Error())
+		return fmt.Errorf("error POSTing metrics: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -104,14 +103,6 @@ func (a *Amon) Write(metrics []telegraf.Metric) error {
 	}
 
 	return nil
-}
-
-func (a *Amon) SampleConfig() string {
-	return sampleConfig
-}
-
-func (a *Amon) Description() string {
-	return "Configuration for Amon Server to send metrics to."
 }
 
 func (a *Amon) authenticatedURL() string {
@@ -123,7 +114,7 @@ func buildMetrics(m telegraf.Metric) (map[string]Point, error) {
 	for k, v := range m.Fields() {
 		var p Point
 		if err := p.setValue(v); err != nil {
-			return ms, fmt.Errorf("unable to extract value from Fields, %s", err.Error())
+			return ms, fmt.Errorf("unable to extract value from Fields: %w", err)
 		}
 		p[0] = float64(m.Time().Unix())
 		ms[k] = p
@@ -142,14 +133,14 @@ func (p *Point) setValue(v interface{}) error {
 	case float32:
 		p[1] = float64(d)
 	case float64:
-		p[1] = float64(d)
+		p[1] = d
 	default:
-		return fmt.Errorf("undeterminable type")
+		return errors.New("undeterminable type")
 	}
 	return nil
 }
 
-func (a *Amon) Close() error {
+func (*Amon) Close() error {
 	return nil
 }
 

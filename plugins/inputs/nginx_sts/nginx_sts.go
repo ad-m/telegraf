@@ -1,8 +1,11 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package nginx_sts
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,6 +20,9 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 type NginxSTS struct {
 	Urls            []string        `toml:"urls"`
 	ResponseTimeout config.Duration `toml:"response_timeout"`
@@ -25,27 +31,8 @@ type NginxSTS struct {
 	client *http.Client
 }
 
-var sampleConfig = `
-  ## An array of ngx_http_status_module or status URI to gather stats.
-  urls = ["http://localhost/status"]
-
-  ## HTTP response timeout (default: 5s)
-  response_timeout = "5s"
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-`
-
-func (n *NginxSTS) SampleConfig() string {
+func (*NginxSTS) SampleConfig() string {
 	return sampleConfig
-}
-
-func (n *NginxSTS) Description() string {
-	return "Read Nginx virtual host traffic status module information (nginx-module-sts)"
 }
 
 func (n *NginxSTS) Gather(acc telegraf.Accumulator) error {
@@ -65,7 +52,7 @@ func (n *NginxSTS) Gather(acc telegraf.Accumulator) error {
 	for _, u := range n.Urls {
 		addr, err := url.Parse(u)
 		if err != nil {
-			acc.AddError(fmt.Errorf("Unable to parse address '%s': %s", u, err))
+			acc.AddError(fmt.Errorf("unable to parse address %q: %w", u, err))
 			continue
 		}
 
@@ -103,7 +90,7 @@ func (n *NginxSTS) createHTTPClient() (*http.Client, error) {
 func (n *NginxSTS) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 	resp, err := n.client.Get(addr.String())
 	if err != nil {
-		return fmt.Errorf("error making HTTP request to %s: %s", addr.String(), err)
+		return fmt.Errorf("error making HTTP request to %q: %w", addr.String(), err)
 	}
 
 	defer resp.Body.Close()
@@ -119,7 +106,7 @@ func (n *NginxSTS) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 	}
 }
 
-type NginxSTSResponse struct {
+type nginxSTSResponse struct {
 	Connections struct {
 		Active   uint64 `json:"active"`
 		Reading  uint64 `json:"reading"`
@@ -130,12 +117,12 @@ type NginxSTSResponse struct {
 		Requests uint64 `json:"requests"`
 	} `json:"connections"`
 	Hostname            string                       `json:"hostName"`
-	StreamFilterZones   map[string]map[string]Server `json:"streamFilterZones"`
-	StreamServerZones   map[string]Server            `json:"streamServerZones"`
-	StreamUpstreamZones map[string][]Upstream        `json:"streamUpstreamZones"`
+	StreamFilterZones   map[string]map[string]server `json:"streamFilterZones"`
+	StreamServerZones   map[string]server            `json:"streamServerZones"`
+	StreamUpstreamZones map[string][]upstream        `json:"streamUpstreamZones"`
 }
 
-type Server struct {
+type server struct {
 	ConnectCounter     uint64 `json:"connectCounter"`
 	InBytes            uint64 `json:"inBytes"`
 	OutBytes           uint64 `json:"outBytes"`
@@ -150,7 +137,7 @@ type Server struct {
 	} `json:"responses"`
 }
 
-type Upstream struct {
+type upstream struct {
 	Server         string `json:"server"`
 	ConnectCounter uint64 `json:"connectCounter"`
 	InBytes        uint64 `json:"inBytes"`
@@ -179,9 +166,9 @@ type Upstream struct {
 
 func gatherStatusURL(r *bufio.Reader, tags map[string]string, acc telegraf.Accumulator) error {
 	dec := json.NewDecoder(r)
-	status := &NginxSTSResponse{}
+	status := &nginxSTSResponse{}
 	if err := dec.Decode(status); err != nil {
-		return fmt.Errorf("Error while decoding JSON response")
+		return errors.New("error while decoding JSON response")
 	}
 
 	acc.AddFields("nginx_sts_connections", map[string]interface{}{
@@ -195,7 +182,7 @@ func gatherStatusURL(r *bufio.Reader, tags map[string]string, acc telegraf.Accum
 	}, tags)
 
 	for zoneName, zone := range status.StreamServerZones {
-		zoneTags := map[string]string{}
+		zoneTags := make(map[string]string, len(tags)+1)
 		for k, v := range tags {
 			zoneTags[k] = v
 		}
@@ -218,7 +205,7 @@ func gatherStatusURL(r *bufio.Reader, tags map[string]string, acc telegraf.Accum
 
 	for filterName, filters := range status.StreamFilterZones {
 		for filterKey, upstream := range filters {
-			filterTags := map[string]string{}
+			filterTags := make(map[string]string, len(tags)+2)
 			for k, v := range tags {
 				filterTags[k] = v
 			}
@@ -243,7 +230,7 @@ func gatherStatusURL(r *bufio.Reader, tags map[string]string, acc telegraf.Accum
 
 	for upstreamName, upstreams := range status.StreamUpstreamZones {
 		for _, upstream := range upstreams {
-			upstreamServerTags := map[string]string{}
+			upstreamServerTags := make(map[string]string, len(tags)+2)
 			for k, v := range tags {
 				upstreamServerTags[k] = v
 			}

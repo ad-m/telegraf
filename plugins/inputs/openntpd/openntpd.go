@@ -1,8 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package openntpd
 
 import (
 	"bufio"
 	"bytes"
+	_ "embed"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -15,82 +17,50 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-// Mapping of the ntpctl tag key to the index in the command output
-var tagI = map[string]int{
-	"stratum": 2,
-}
+//go:embed sample.conf
+var sampleConfig string
 
-// Mapping of float metrics to their index in the command output
-var floatI = map[string]int{
-	"offset": 5,
-	"delay":  6,
-	"jitter": 7,
-}
+var (
+	defaultBinary  = "/usr/sbin/ntpctl"
+	defaultTimeout = config.Duration(5 * time.Second)
 
-// Mapping of int metrics to their index in the command output
-var intI = map[string]int{
-	"wt":   0,
-	"tl":   1,
-	"next": 3,
-	"poll": 4,
-}
+	// Mapping of the ntpctl tag key to the index in the command output
+	tagI = map[string]int{
+		"stratum": 2,
+	}
+	// Mapping of float metrics to their index in the command output
+	floatI = map[string]int{
+		"offset": 5,
+		"delay":  6,
+		"jitter": 7,
+	}
+	// Mapping of int metrics to their index in the command output
+	intI = map[string]int{
+		"wt":   0,
+		"tl":   1,
+		"next": 3,
+		"poll": 4,
+	}
+)
 
-type runner func(cmdName string, timeout config.Duration, useSudo bool) (*bytes.Buffer, error)
-
-// Openntpd is used to store configuration values
 type Openntpd struct {
-	Binary  string
-	Timeout config.Duration
-	UseSudo bool
+	Binary  string          `toml:"binary"`
+	Timeout config.Duration `toml:"timeout"`
+	UseSudo bool            `toml:"use_sudo"`
 
 	run runner
 }
 
-var defaultBinary = "/usr/sbin/ntpctl"
-var defaultTimeout = config.Duration(5 * time.Second)
+type runner func(cmdName string, timeout config.Duration, useSudo bool) (*bytes.Buffer, error)
 
-func (n *Openntpd) Description() string {
-	return "Get standard NTP query metrics from OpenNTPD."
-}
-
-func (n *Openntpd) SampleConfig() string {
-	return `
-  ## Run ntpctl binary with sudo.
-  # use_sudo = false
-
-  ## Location of the ntpctl binary.
-  # binary = "/usr/sbin/ntpctl"
-
-  ## Maximum time the ntpctl binary is allowed to run.
-  # timeout = "5ms"
-  `
-}
-
-// Shell out to ntpctl and return the output
-func openntpdRunner(cmdName string, timeout config.Duration, useSudo bool) (*bytes.Buffer, error) {
-	cmdArgs := []string{"-s", "peers"}
-
-	cmd := exec.Command(cmdName, cmdArgs...)
-
-	if useSudo {
-		cmdArgs = append([]string{cmdName}, cmdArgs...)
-		cmd = exec.Command("sudo", cmdArgs...)
-	}
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := internal.RunTimeout(cmd, time.Duration(timeout))
-	if err != nil {
-		return &out, fmt.Errorf("error running ntpctl: %s", err)
-	}
-
-	return &out, nil
+func (*Openntpd) SampleConfig() string {
+	return sampleConfig
 }
 
 func (n *Openntpd) Gather(acc telegraf.Accumulator) error {
 	out, err := n.run(n.Binary, n.Timeout, n.UseSudo)
 	if err != nil {
-		return fmt.Errorf("error gathering metrics: %s", err)
+		return fmt.Errorf("error gathering metrics: %w", err)
 	}
 
 	lineCounter := 0
@@ -196,6 +166,27 @@ func (n *Openntpd) Gather(acc telegraf.Accumulator) error {
 		lineCounter++
 	}
 	return nil
+}
+
+// Shell out to ntpctl and return the output
+func openntpdRunner(cmdName string, timeout config.Duration, useSudo bool) (*bytes.Buffer, error) {
+	cmdArgs := []string{"-s", "peers"}
+
+	cmd := exec.Command(cmdName, cmdArgs...)
+
+	if useSudo {
+		cmdArgs = append([]string{cmdName}, cmdArgs...)
+		cmd = exec.Command("sudo", cmdArgs...)
+	}
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := internal.RunTimeout(cmd, time.Duration(timeout))
+	if err != nil {
+		return &out, fmt.Errorf("error running ntpctl: %w", err)
+	}
+
+	return &out, nil
 }
 
 func init() {

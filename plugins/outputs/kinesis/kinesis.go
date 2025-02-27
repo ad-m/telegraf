@@ -1,18 +1,23 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package kinesis
 
 import (
 	"context"
+	_ "embed"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
+
 	"github.com/influxdata/telegraf"
-	internalaws "github.com/influxdata/telegraf/config/aws"
+	common_aws "github.com/influxdata/telegraf/plugins/common/aws"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	"github.com/influxdata/telegraf/plugins/serializers"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 // Limit set by AWS (https://docs.aws.amazon.com/kinesis/latest/APIReference/API_PutRecords.html)
 const maxRecordsPerRequest uint32 = 500
@@ -20,16 +25,16 @@ const maxRecordsPerRequest uint32 = 500
 type (
 	KinesisOutput struct {
 		StreamName         string     `toml:"streamname"`
-		PartitionKey       string     `toml:"partitionkey"`
-		RandomPartitionKey bool       `toml:"use_random_partitionkey"`
+		PartitionKey       string     `toml:"partitionkey" deprecated:"1.5.0;1.35.0;use 'partition.key' instead"`
+		RandomPartitionKey bool       `toml:"use_random_partitionkey" deprecated:"1.5.0;1.35.0;use 'partition.method' instead"`
 		Partition          *Partition `toml:"partition"`
 		Debug              bool       `toml:"debug"`
 
 		Log        telegraf.Logger `toml:"-"`
-		serializer serializers.Serializer
+		serializer telegraf.Serializer
 		svc        kinesisClient
 
-		internalaws.CredentialConfig
+		common_aws.CredentialConfig
 	}
 
 	Partition struct {
@@ -43,81 +48,8 @@ type kinesisClient interface {
 	PutRecords(context.Context, *kinesis.PutRecordsInput, ...func(*kinesis.Options)) (*kinesis.PutRecordsOutput, error)
 }
 
-var sampleConfig = `
-  ## Amazon REGION of kinesis endpoint.
-  region = "ap-southeast-2"
-
-  ## Amazon Credentials
-  ## Credentials are loaded in the following order
-  ## 1) Web identity provider credentials via STS if role_arn and web_identity_token_file are specified
-  ## 2) Assumed credentials via STS if role_arn is specified
-  ## 3) explicit credentials from 'access_key' and 'secret_key'
-  ## 4) shared profile from 'profile'
-  ## 5) environment variables
-  ## 6) shared credentials file
-  ## 7) EC2 Instance Profile
-  #access_key = ""
-  #secret_key = ""
-  #token = ""
-  #role_arn = ""
-  #web_identity_token_file = ""
-  #role_session_name = ""
-  #profile = ""
-  #shared_credential_file = ""
-
-  ## Endpoint to make request against, the correct endpoint is automatically
-  ## determined and this option should only be set if you wish to override the
-  ## default.
-  ##   ex: endpoint_url = "http://localhost:8000"
-  # endpoint_url = ""
-
-  ## Kinesis StreamName must exist prior to starting telegraf.
-  streamname = "StreamName"
-  ## DEPRECATED: PartitionKey as used for sharding data.
-  partitionkey = "PartitionKey"
-  ## DEPRECATED: If set the partitionKey will be a random UUID on every put.
-  ## This allows for scaling across multiple shards in a stream.
-  ## This will cause issues with ordering.
-  use_random_partitionkey = false
-  ## The partition key can be calculated using one of several methods:
-  ##
-  ## Use a static value for all writes:
-  #  [outputs.kinesis.partition]
-  #    method = "static"
-  #    key = "howdy"
-  #
-  ## Use a random partition key on each write:
-  #  [outputs.kinesis.partition]
-  #    method = "random"
-  #
-  ## Use the measurement name as the partition key:
-  #  [outputs.kinesis.partition]
-  #    method = "measurement"
-  #
-  ## Use the value of a tag for all writes, if the tag is not set the empty
-  ## default option will be used. When no default, defaults to "telegraf"
-  #  [outputs.kinesis.partition]
-  #    method = "tag"
-  #    key = "host"
-  #    default = "mykey"
-
-
-  ## Data format to output.
-  ## Each data format has its own unique set of configuration options, read
-  ## more about them here:
-  ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_OUTPUT.md
-  data_format = "influx"
-
-  ## debug will show upstream aws messages.
-  debug = false
-`
-
-func (k *KinesisOutput) SampleConfig() string {
+func (*KinesisOutput) SampleConfig() string {
 	return sampleConfig
-}
-
-func (k *KinesisOutput) Description() string {
-	return "Configuration for the AWS Kinesis output."
 }
 
 func (k *KinesisOutput) Connect() error {
@@ -136,6 +68,10 @@ func (k *KinesisOutput) Connect() error {
 		return err
 	}
 
+	if k.EndpointURL != "" {
+		cfg.BaseEndpoint = &k.EndpointURL
+	}
+
 	svc := kinesis.NewFromConfig(cfg)
 
 	_, err = svc.DescribeStreamSummary(context.Background(), &kinesis.DescribeStreamSummaryInput{
@@ -145,11 +81,11 @@ func (k *KinesisOutput) Connect() error {
 	return err
 }
 
-func (k *KinesisOutput) Close() error {
+func (*KinesisOutput) Close() error {
 	return nil
 }
 
-func (k *KinesisOutput) SetSerializer(serializer serializers.Serializer) {
+func (k *KinesisOutput) SetSerializer(serializer telegraf.Serializer) {
 	k.serializer = serializer
 }
 
@@ -200,7 +136,7 @@ func (k *KinesisOutput) getPartitionKey(metric telegraf.Metric) string {
 			// Default partition name if default is not set
 			return "telegraf"
 		default:
-			k.Log.Errorf("You have configured a Partition method of '%s' which is not supported", k.Partition.Method)
+			k.Log.Errorf("You have configured a Partition method of %q which is not supported", k.Partition.Method)
 		}
 	}
 	if k.RandomPartitionKey {
@@ -220,8 +156,7 @@ func (k *KinesisOutput) Write(metrics []telegraf.Metric) error {
 		return nil
 	}
 
-	r := []types.PutRecordsRequestEntry{}
-
+	r := make([]types.PutRecordsRequestEntry, 0, len(metrics))
 	for _, metric := range metrics {
 		sz++
 
@@ -239,7 +174,6 @@ func (k *KinesisOutput) Write(metrics []telegraf.Metric) error {
 		}
 
 		r = append(r, d)
-
 		if sz == maxRecordsPerRequest {
 			elapsed := k.writeKinesis(r)
 			k.Log.Debugf("Wrote a %d point batch to Kinesis in %+v.", sz, elapsed)

@@ -3,10 +3,11 @@ package shim
 import (
 	"errors"
 	"fmt"
-	"log"
+	"log" //nolint:depguard // Allow exceptional but valid use of log here.
 	"os"
 
 	"github.com/BurntSushi/toml"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/plugins/outputs"
@@ -59,10 +60,7 @@ func LoadConfig(filePath *string) (loaded loadedConfig, err error) {
 
 		data = expandEnvVars(b)
 	} else {
-		conf, err = DefaultImportedPlugins()
-		if err != nil {
-			return loadedConfig{}, err
-		}
+		conf = DefaultImportedPlugins()
 	}
 
 	md, err := toml.Decode(data, &conf)
@@ -114,7 +112,7 @@ func createPluginsWithTomlConfig(md toml.MetaData, conf config) (loadedConfig, e
 		if len(primitives) > 0 {
 			primitive := primitives[0]
 			var p telegraf.PluginDescriber = plugin
-			if processor, ok := plugin.(unwrappable); ok {
+			if processor, ok := plugin.(processors.HasUnwrap); ok {
 				p = processor.Unwrap()
 			}
 			if err := md.PrimitiveDecode(primitive, p); err != nil {
@@ -147,30 +145,26 @@ func createPluginsWithTomlConfig(md toml.MetaData, conf config) (loadedConfig, e
 // DefaultImportedPlugins defaults to whatever plugins happen to be loaded and
 // have registered themselves with the registry. This makes loading plugins
 // without having to define a config dead easy.
-func DefaultImportedPlugins() (config, error) {
+func DefaultImportedPlugins() config {
 	conf := config{
-		Inputs:     map[string][]toml.Primitive{},
-		Processors: map[string][]toml.Primitive{},
-		Outputs:    map[string][]toml.Primitive{},
+		Inputs:     make(map[string][]toml.Primitive, len(inputs.Inputs)),
+		Processors: make(map[string][]toml.Primitive, len(processors.Processors)),
+		Outputs:    make(map[string][]toml.Primitive, len(outputs.Outputs)),
 	}
 	for name := range inputs.Inputs {
 		log.Println("No config found. Loading default config for plugin", name)
-		conf.Inputs[name] = []toml.Primitive{}
-		return conf, nil
+		conf.Inputs[name] = make([]toml.Primitive, 0)
+		return conf
 	}
 	for name := range processors.Processors {
 		log.Println("No config found. Loading default config for plugin", name)
-		conf.Processors[name] = []toml.Primitive{}
-		return conf, nil
+		conf.Processors[name] = make([]toml.Primitive, 0)
+		return conf
 	}
 	for name := range outputs.Outputs {
 		log.Println("No config found. Loading default config for plugin", name)
-		conf.Outputs[name] = []toml.Primitive{}
-		return conf, nil
+		conf.Outputs[name] = make([]toml.Primitive, 0)
+		return conf
 	}
-	return conf, nil
-}
-
-type unwrappable interface {
-	Unwrap() telegraf.Processor
+	return conf
 }

@@ -37,11 +37,11 @@ func (e *ElasticsearchQuery) runAggregationQuery(ctx context.Context, aggregatio
 
 	src, err := query.Source()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get query source - %v", err)
+		return nil, fmt.Errorf("failed to get query source: %w", err)
 	}
 	data, err := json.Marshal(src)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response - %v", err)
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 	e.Log.Debugf("{\"query\": %s}", string(data))
 
@@ -69,7 +69,7 @@ func (e *ElasticsearchQuery) getMetricFields(ctx context.Context, aggregation es
 	for _, metricField := range aggregation.MetricFields {
 		resp, err := e.esClient.GetFieldMapping().Index(aggregation.Index).Field(metricField).Do(ctx)
 		if err != nil {
-			return mapMetricFields, fmt.Errorf("error retrieving field mappings for %s: %s", aggregation.Index, err.Error())
+			return mapMetricFields, fmt.Errorf("error retrieving field mappings for %s: %w", aggregation.Index, err)
 		}
 
 		for _, index := range resp {
@@ -153,7 +153,7 @@ func (aggregation *esAggregation) buildAggregationQuery() error {
 				measurement: aggregation.MeasurementName,
 				function:    aggregation.MetricFunction,
 				field:       k,
-				name:        strings.Replace(k, ".", "_", -1) + "_" + aggregation.MetricFunction,
+				name:        strings.ReplaceAll(k, ".", "_") + "_" + aggregation.MetricFunction,
 			},
 			isParent:    true,
 			aggregation: agg,
@@ -185,7 +185,7 @@ func (aggregation *esAggregation) buildAggregationQuery() error {
 				measurement: aggregation.MeasurementName,
 				function:    "terms",
 				field:       term,
-				name:        strings.Replace(term, ".", "_", -1),
+				name:        strings.ReplaceAll(term, ".", "_"),
 			},
 			isParent:    true,
 			aggregation: agg,
@@ -197,7 +197,7 @@ func (aggregation *esAggregation) buildAggregationQuery() error {
 	return nil
 }
 
-func getFunctionAggregation(function string, aggfield string) (elastic5.Aggregation, error) {
+func getFunctionAggregation(function, aggfield string) (elastic5.Aggregation, error) {
 	var agg elastic5.Aggregation
 
 	switch function {
@@ -210,7 +210,7 @@ func getFunctionAggregation(function string, aggfield string) (elastic5.Aggregat
 	case "max":
 		agg = elastic5.NewMaxAggregation().Field(aggfield)
 	default:
-		return nil, fmt.Errorf("aggregation function '%s' not supported", function)
+		return nil, fmt.Errorf("aggregation function %q not supported", function)
 	}
 
 	return agg, nil

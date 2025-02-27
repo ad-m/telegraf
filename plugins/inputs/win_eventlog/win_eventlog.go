@@ -1,176 +1,164 @@
+//go:generate ../../../tools/readme_config_includer/generator
 //go:build windows
-// +build windows
 
-//revive:disable-next-line:var-naming
-// Package win_eventlog Input plugin to collect Windows Event Log messages
 package win_eventlog
 
 import (
 	"bufio"
 	"bytes"
+	_ "embed"
 	"encoding/xml"
+	"errors"
 	"fmt"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/plugins/inputs"
 	"golang.org/x/sys/windows"
+
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/filter"
+	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-var sampleConfig = `
-  ## Telegraf should have Administrator permissions to subscribe for some Windows Events channels
-  ## (System log, for example)
+//go:embed sample.conf
+var sampleConfig string
 
-  ## LCID (Locale ID) for event rendering
-  ## 1033 to force English language
-  ## 0 to use default Windows locale
-  # locale = 0
+const bufferSize = 1 << 14
 
-  ## Name of eventlog, used only if xpath_query is empty
-  ## Example: "Application"
-  # eventlog_name = ""
-
-  ## xpath_query can be in defined short form like "Event/System[EventID=999]"
-  ## or you can form a XML Query. Refer to the Consuming Events article:
-  ## https://docs.microsoft.com/en-us/windows/win32/wes/consuming-events
-  ## XML query is the recommended form, because it is most flexible
-  ## You can create or debug XML Query by creating Custom View in Windows Event Viewer
-  ## and then copying resulting XML here
-  xpath_query = '''
-  <QueryList>
-    <Query Id="0" Path="Security">
-      <Select Path="Security">*</Select>
-      <Suppress Path="Security">*[System[( (EventID &gt;= 5152 and EventID &lt;= 5158) or EventID=5379 or EventID=4672)]]</Suppress>
-    </Query>
-    <Query Id="1" Path="Application">
-      <Select Path="Application">*[System[(Level &lt; 4)]]</Select>
-    </Query>
-    <Query Id="2" Path="Windows PowerShell">
-      <Select Path="Windows PowerShell">*[System[(Level &lt; 4)]]</Select>
-    </Query>
-    <Query Id="3" Path="System">
-      <Select Path="System">*</Select>
-    </Query>
-    <Query Id="4" Path="Setup">
-      <Select Path="Setup">*</Select>
-    </Query>
-  </QueryList>
-  '''
-
-  ## System field names:
-  ##   "Source", "EventID", "Version", "Level", "Task", "Opcode", "Keywords", "TimeCreated",
-  ##   "EventRecordID", "ActivityID", "RelatedActivityID", "ProcessID", "ThreadID", "ProcessName",
-  ##   "Channel", "Computer", "UserID", "UserName", "Message", "LevelText", "TaskText", "OpcodeText"
-
-  ## In addition to System, Data fields can be unrolled from additional XML nodes in event.
-  ## Human-readable representation of those nodes is formatted into event Message field,
-  ## but XML is more machine-parsable
-
-  # Process UserData XML to fields, if this node exists in Event XML
-  process_userdata = true
-
-  # Process EventData XML to fields, if this node exists in Event XML
-  process_eventdata = true
-
-  ## Separator character to use for unrolled XML Data field names
-  separator = "_"
-
-  ## Get only first line of Message field. For most events first line is usually more than enough
-  only_first_line_of_message = true
-
-  ## Parse timestamp from TimeCreated.SystemTime event field.
-  ## Will default to current time of telegraf processing on parsing error or if set to false
-  timestamp_from_event = true
-
-  ## Fields to include as tags. Globbing supported ("Level*" for both "Level" and "LevelText")
-  event_tags = ["Source", "EventID", "Level", "LevelText", "Task", "TaskText", "Opcode", "OpcodeText", "Keywords", "Channel", "Computer"]
-
-  ## Default list of fields to send. All fields are sent by default. Globbing supported
-  event_fields = ["*"]
-
-  ## Fields to exclude. Also applied to data fields. Globbing supported
-  exclude_fields = ["TimeCreated", "Binary", "Data_Address*"]
-
-  ## Skip those tags or fields if their value is empty or equals to zero. Globbing supported
-  exclude_empty = ["*ActivityID", "UserID"]
-`
-
-// WinEventLog config
 type WinEventLog struct {
-	Locale                 uint32   `toml:"locale"`
-	EventlogName           string   `toml:"eventlog_name"`
-	Query                  string   `toml:"xpath_query"`
-	ProcessUserData        bool     `toml:"process_userdata"`
-	ProcessEventData       bool     `toml:"process_eventdata"`
-	Separator              string   `toml:"separator"`
-	OnlyFirstLineOfMessage bool     `toml:"only_first_line_of_message"`
-	TimeStampFromEvent     bool     `toml:"timestamp_from_event"`
-	EventTags              []string `toml:"event_tags"`
-	EventFields            []string `toml:"event_fields"`
-	ExcludeFields          []string `toml:"exclude_fields"`
-	ExcludeEmpty           []string `toml:"exclude_empty"`
-	subscription           EvtHandle
-	buf                    []byte
-	Log                    telegraf.Logger
+	Locale                 uint32          `toml:"locale"`
+	EventlogName           string          `toml:"eventlog_name"`
+	Query                  string          `toml:"xpath_query"`
+	FromBeginning          bool            `toml:"from_beginning"`
+	BatchSize              uint32          `toml:"event_batch_size"`
+	ProcessUserData        bool            `toml:"process_userdata"`
+	ProcessEventData       bool            `toml:"process_eventdata"`
+	Separator              string          `toml:"separator"`
+	OnlyFirstLineOfMessage bool            `toml:"only_first_line_of_message"`
+	TimeStampFromEvent     bool            `toml:"timestamp_from_event"`
+	EventTags              []string        `toml:"event_tags"`
+	EventFields            []string        `toml:"event_fields"`
+	ExcludeFields          []string        `toml:"exclude_fields"`
+	ExcludeEmpty           []string        `toml:"exclude_empty"`
+	Log                    telegraf.Logger `toml:"-"`
+
+	subscription     evtHandle
+	subscriptionFlag evtSubscribeFlag
+	bookmark         evtHandle
+	tagFilter        filter.Filter
+	fieldFilter      filter.Filter
+	fieldEmptyFilter filter.Filter
 }
 
-var bufferSize = 1 << 14
-
-var description = "Input plugin to collect Windows Event Log messages"
-
-// Description for win_eventlog
-func (w *WinEventLog) Description() string {
-	return description
-}
-
-// SampleConfig for win_eventlog
-func (w *WinEventLog) SampleConfig() string {
+func (*WinEventLog) SampleConfig() string {
 	return sampleConfig
 }
 
-// Gather Windows Event Log entries
-func (w *WinEventLog) Gather(acc telegraf.Accumulator) error {
-
-	var err error
-	if w.subscription == 0 {
-		w.subscription, err = w.evtSubscribe(w.EventlogName, w.Query)
-		if err != nil {
-			return fmt.Errorf("Windows Event Log subscription error: %v", err.Error())
-		}
+func (w *WinEventLog) Init() error {
+	// Set default for batch-size
+	if w.BatchSize < 1 {
+		w.BatchSize = 5
 	}
+
+	w.subscriptionFlag = evtSubscribeToFutureEvents
+	if w.FromBeginning {
+		w.subscriptionFlag = evtSubscribeStartAtOldestRecord
+	}
+
+	if w.Query == "" {
+		w.Query = "*"
+	}
+
+	bookmark, err := evtCreateBookmark(nil)
+	if err != nil {
+		return err
+	}
+	w.bookmark = bookmark
+
+	if w.tagFilter, err = filter.Compile(w.EventTags); err != nil {
+		return fmt.Errorf("creating tag filter failed: %w", err)
+	}
+
+	if w.fieldFilter, err = filter.NewIncludeExcludeFilter(w.EventFields, w.ExcludeFields); err != nil {
+		return fmt.Errorf("creating field filter failed: %w", err)
+	}
+
+	if w.fieldEmptyFilter, err = filter.Compile(w.ExcludeEmpty); err != nil {
+		return fmt.Errorf("creating empty fields filter failed: %w", err)
+	}
+
+	return nil
+}
+
+func (w *WinEventLog) Start(telegraf.Accumulator) error {
+	subscription, err := w.evtSubscribe()
+	if err != nil {
+		return fmt.Errorf("subscription of Windows Event Log failed: %w", err)
+	}
+	w.subscription = subscription
 	w.Log.Debug("Subscription handle id:", w.subscription)
 
-loop:
+	return nil
+}
+
+func (w *WinEventLog) GetState() interface{} {
+	bookmarkXML, err := renderBookmark(w.bookmark)
+	if err != nil {
+		w.Log.Errorf("State-persistence failed, cannot render bookmark: %v", err)
+		return ""
+	}
+	return bookmarkXML
+}
+
+func (w *WinEventLog) SetState(state interface{}) error {
+	bookmarkXML, ok := state.(string)
+	if !ok {
+		return fmt.Errorf("invalid type %T for state", state)
+	}
+
+	ptr, err := syscall.UTF16PtrFromString(bookmarkXML)
+	if err != nil {
+		return fmt.Errorf("conversion to pointer failed: %w", err)
+	}
+
+	bookmark, err := evtCreateBookmark(ptr)
+	if err != nil {
+		return fmt.Errorf("creating bookmark failed: %w", err)
+	}
+	w.bookmark = bookmark
+	w.subscriptionFlag = evtSubscribeStartAfterBookmark
+
+	return nil
+}
+
+func (w *WinEventLog) Gather(acc telegraf.Accumulator) error {
 	for {
 		events, err := w.fetchEvents(w.subscription)
 		if err != nil {
-			switch {
-			case err == ERROR_NO_MORE_ITEMS:
-				break loop
-			case err != nil:
-				w.Log.Error("Error getting events:", err.Error())
-				return err
+			if errors.Is(err, errNoMoreItems) {
+				break
 			}
+			w.Log.Errorf("Error getting events: %v", err)
+			return err
 		}
 
-		for _, event := range events {
+		for i := range events {
 			// Prepare fields names usage counter
-			var fieldsUsage = map[string]int{}
+			fieldsUsage := make(map[string]int)
 
-			tags := map[string]string{}
-			fields := map[string]interface{}{}
+			tags := make(map[string]string)
+			fields := make(map[string]interface{})
+			event := events[i]
 			evt := reflect.ValueOf(&event).Elem()
 			timeStamp := time.Now()
-			// Walk through all fields of Event struct to process System tags or fields
+			// Walk through all fields of event struct to process System tags or fields
 			for i := 0; i < evt.NumField(); i++ {
 				fieldName := evt.Type().Field(i).Name
 				fieldType := evt.Field(i).Type().String()
 				fieldValue := evt.Field(i).Interface()
-				computedValues := map[string]interface{}{}
+				computedValues := make(map[string]interface{})
 				switch fieldName {
 				case "Source":
 					fieldValue = event.Source.Name
@@ -181,7 +169,7 @@ loop:
 					fieldName = "ProcessID"
 					// Look up Process Name from pid
 					if should, _ := w.shouldProcessField("ProcessName"); should {
-						_, _, processName, err := GetFromSnapProcess(fieldValue)
+						processName, err := getFromSnapProcess(fieldValue)
 						if err == nil {
 							computedValues["ProcessName"] = processName
 						}
@@ -221,7 +209,6 @@ loop:
 							}
 						}
 					}
-				default:
 				}
 				if should, where := w.shouldProcessField(fieldName); should {
 					if where == "tags" {
@@ -253,20 +240,26 @@ loop:
 			}
 
 			// Unroll additional XML
-			var xmlFields []EventField
+			var xmlFields []eventField
 			if w.ProcessUserData {
-				fieldsUserData, xmlFieldsUsage := UnrollXMLFields(event.UserData.InnerXML, fieldsUsage, w.Separator)
+				fieldsUserData, xmlFieldsUsage := unrollXMLFields(event.UserData.InnerXML, fieldsUsage, w.Separator)
 				xmlFields = append(xmlFields, fieldsUserData...)
 				fieldsUsage = xmlFieldsUsage
 			}
 			if w.ProcessEventData {
-				fieldsEventData, xmlFieldsUsage := UnrollXMLFields(event.EventData.InnerXML, fieldsUsage, w.Separator)
+				fieldsEventData, xmlFieldsUsage := unrollXMLFields(event.EventData.InnerXML, fieldsUsage, w.Separator)
 				xmlFields = append(xmlFields, fieldsEventData...)
 				fieldsUsage = xmlFieldsUsage
 			}
-			uniqueXMLFields := UniqueFieldNames(xmlFields, fieldsUsage, w.Separator)
+			uniqueXMLFields := uniqueFieldNames(xmlFields, fieldsUsage, w.Separator)
 			for _, xmlField := range uniqueXMLFields {
-				if !w.shouldExclude(xmlField.Name) {
+				should, where := w.shouldProcessField(xmlField.Name)
+				if !should {
+					continue
+				}
+				if where == "tags" {
+					tags[xmlField.Name] = xmlField.Value
+				} else {
 					fields[xmlField.Name] = xmlField.Value
 				}
 			}
@@ -279,72 +272,62 @@ loop:
 	return nil
 }
 
-func (w *WinEventLog) shouldExclude(field string) (should bool) {
-	for _, excludePattern := range w.ExcludeFields {
-		// Check if field name matches excluded list
-		if matched, _ := filepath.Match(excludePattern, field); matched {
-			return true
-		}
-	}
-	return false
+func (w *WinEventLog) Stop() {
+	//nolint:errcheck // ending the subscription, error can be ignored
+	_ = evtClose(w.subscription)
 }
 
 func (w *WinEventLog) shouldProcessField(field string) (should bool, list string) {
-	for _, pattern := range w.EventTags {
-		if matched, _ := filepath.Match(pattern, field); matched {
-			// Tags are not excluded
-			return true, "tags"
-		}
+	if w.tagFilter != nil && w.tagFilter.Match(field) {
+		return true, "tags"
 	}
 
-	for _, pattern := range w.EventFields {
-		if matched, _ := filepath.Match(pattern, field); matched {
-			if w.shouldExclude(field) {
-				return false, "excluded"
-			}
-			return true, "fields"
-		}
+	if w.fieldFilter.Match(field) {
+		return true, "fields"
 	}
+
 	return false, "excluded"
 }
 
-func (w *WinEventLog) shouldExcludeEmptyField(field string, fieldType string, fieldValue interface{}) (should bool) {
-	for _, pattern := range w.ExcludeEmpty {
-		if matched, _ := filepath.Match(pattern, field); matched {
-			switch fieldType {
-			case "string":
-				return len(fieldValue.(string)) < 1
-			case "int":
-				return fieldValue.(int) == 0
-			case "uint32":
-				return fieldValue.(uint32) == 0
-			}
-		}
+func (w *WinEventLog) shouldExcludeEmptyField(field, fieldType string, fieldValue interface{}) (should bool) {
+	if w.fieldEmptyFilter == nil || !w.fieldEmptyFilter.Match(field) {
+		return false
 	}
+
+	switch fieldType {
+	case "string":
+		return len(fieldValue.(string)) < 1
+	case "int":
+		return fieldValue.(int) == 0
+	case "uint32":
+		return fieldValue.(uint32) == 0
+	}
+
 	return false
 }
 
-func (w *WinEventLog) evtSubscribe(logName, xquery string) (EvtHandle, error) {
-	var logNamePtr, xqueryPtr *uint16
-
+func (w *WinEventLog) evtSubscribe() (evtHandle, error) {
 	sigEvent, err := windows.CreateEvent(nil, 0, 0, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer windows.CloseHandle(sigEvent)
 
-	logNamePtr, err = syscall.UTF16PtrFromString(logName)
+	logNamePtr, err := syscall.UTF16PtrFromString(w.EventlogName)
 	if err != nil {
 		return 0, err
 	}
 
-	xqueryPtr, err = syscall.UTF16PtrFromString(xquery)
+	xqueryPtr, err := syscall.UTF16PtrFromString(w.Query)
 	if err != nil {
 		return 0, err
 	}
 
-	subsHandle, err := _EvtSubscribe(0, uintptr(sigEvent), logNamePtr, xqueryPtr,
-		0, 0, 0, EvtSubscribeToFutureEvents)
+	var bookmark evtHandle
+	if w.subscriptionFlag == evtSubscribeStartAfterBookmark {
+		bookmark = w.bookmark
+	}
+	subsHandle, err := evtSubscribe(0, uintptr(sigEvent), logNamePtr, xqueryPtr, bookmark, 0, 0, w.subscriptionFlag)
 	if err != nil {
 		return 0, err
 	}
@@ -352,18 +335,13 @@ func (w *WinEventLog) evtSubscribe(logName, xquery string) (EvtHandle, error) {
 	return subsHandle, nil
 }
 
-func (w *WinEventLog) fetchEventHandles(subsHandle EvtHandle) ([]EvtHandle, error) {
-	var eventsNumber uint32
+func (w *WinEventLog) fetchEventHandles(subsHandle evtHandle) ([]evtHandle, error) {
 	var evtReturned uint32
 
-	eventsNumber = 5
-
-	eventHandles := make([]EvtHandle, eventsNumber)
-
-	err := _EvtNext(subsHandle, eventsNumber, &eventHandles[0], 0, 0, &evtReturned)
-	if err != nil {
-		if err == ERROR_INVALID_OPERATION && evtReturned == 0 {
-			return nil, ERROR_NO_MORE_ITEMS
+	eventHandles := make([]evtHandle, w.BatchSize)
+	if err := evtNext(subsHandle, w.BatchSize, &eventHandles[0], 0, 0, &evtReturned); err != nil {
+		if errors.Is(err, errInvalidOperation) && evtReturned == 0 {
+			return nil, errNoMoreItems
 		}
 		return nil, err
 	}
@@ -371,66 +349,99 @@ func (w *WinEventLog) fetchEventHandles(subsHandle EvtHandle) ([]EvtHandle, erro
 	return eventHandles[:evtReturned], nil
 }
 
-func (w *WinEventLog) fetchEvents(subsHandle EvtHandle) ([]Event, error) {
-	var events []Event
+func (w *WinEventLog) fetchEvents(subsHandle evtHandle) ([]event, error) {
+	var events []event
 
 	eventHandles, err := w.fetchEventHandles(subsHandle)
 	if err != nil {
 		return nil, err
 	}
 
+	var evterr error
 	for _, eventHandle := range eventHandles {
-		if eventHandle != 0 {
-			event, err := w.renderEvent(eventHandle)
-			if err == nil {
-				// w.Log.Debugf("Got event: %v", event)
-				events = append(events, event)
-			}
+		if eventHandle == 0 {
+			continue
 		}
-	}
+		if event, err := w.renderEvent(eventHandle); err == nil {
+			events = append(events, event)
+		}
+		if err := evtUpdateBookmark(w.bookmark, eventHandle); err != nil && evterr == nil {
+			evterr = err
+		}
 
-	for i := 0; i < len(eventHandles); i++ {
-		err := _EvtClose(eventHandles[i])
-		if err != nil {
-			return events, err
+		if err := evtClose(eventHandle); err != nil && evterr == nil {
+			evterr = err
 		}
 	}
-	return events, nil
+	return events, evterr
 }
 
-func (w *WinEventLog) renderEvent(eventHandle EvtHandle) (Event, error) {
+func renderBookmark(bookmark evtHandle) (string, error) {
 	var bufferUsed, propertyCount uint32
 
-	event := Event{}
-	err := _EvtRender(0, eventHandle, EvtRenderEventXml, uint32(len(w.buf)), &w.buf[0], &bufferUsed, &propertyCount)
+	buf := make([]byte, bufferSize)
+	err := evtRender(0, bookmark, evtRenderBookmark, uint32(len(buf)), &buf[0], &bufferUsed, &propertyCount)
+	if err != nil {
+		return "", err
+	}
+
+	x, err := decodeUTF16(buf[:bufferUsed])
+	if err != nil {
+		return "", err
+	}
+	if x[len(x)-1] == 0 {
+		x = x[:len(x)-1]
+	}
+	return string(x), err
+}
+
+func (w *WinEventLog) renderEvent(eventHandle evtHandle) (event, error) {
+	var bufferUsed, propertyCount uint32
+
+	buf := make([]byte, bufferSize)
+	event := event{}
+	err := evtRender(0, eventHandle, evtRenderEventXML, uint32(len(buf)), &buf[0], &bufferUsed, &propertyCount)
 	if err != nil {
 		return event, err
 	}
 
-	eventXML, err := DecodeUTF16(w.buf[:bufferUsed])
+	eventXML, err := decodeUTF16(buf[:bufferUsed])
 	if err != nil {
 		return event, err
 	}
-	err = xml.Unmarshal([]byte(eventXML), &event)
+
+	err = xml.Unmarshal(eventXML, &event)
 	if err != nil {
-		// We can return event without most text values,
-		// that way we will not loose information
+		//nolint:nilerr // We can return event without most text values, that way we will not lose information
 		// This can happen when processing Forwarded Events
 		return event, nil
 	}
 
+	// Do resolve local messages the usual way, while using built-in information for events forwarded by WEC.
+	// This is a safety measure as the underlying Windows-internal EvtFormatMessage might segfault in cases
+	// where the publisher (i.e. the remote machine which forwarded the event) is unavailable e.g. due to
+	// a reboot. See https://github.com/influxdata/telegraf/issues/12328 for the full story.
+	if event.RenderingInfo == nil {
+		return w.renderLocalMessage(event, eventHandle)
+	}
+
+	// We got 'RenderInfo' elements, so try to apply them in the following function
+	return w.renderRemoteMessage(event)
+}
+
+func (w *WinEventLog) renderLocalMessage(event event, eventHandle evtHandle) (event, error) {
 	publisherHandle, err := openPublisherMetadata(0, event.Source.Name, w.Locale)
 	if err != nil {
 		return event, nil
 	}
-	defer _EvtClose(publisherHandle)
+	defer evtClose(publisherHandle) //nolint:errcheck // Ignore error returned during Close
 
 	// Populating text values
-	keywords, err := formatEventString(EvtFormatMessageKeyword, eventHandle, publisherHandle)
+	keywords, err := formatEventString(evtFormatMessageKeyword, eventHandle, publisherHandle)
 	if err == nil {
 		event.Keywords = keywords
 	}
-	message, err := formatEventString(EvtFormatMessageEvent, eventHandle, publisherHandle)
+	message, err := formatEventString(evtFormatMessageEvent, eventHandle, publisherHandle)
 	if err == nil {
 		if w.OnlyFirstLineOfMessage {
 			scanner := bufio.NewScanner(strings.NewReader(message))
@@ -439,51 +450,78 @@ func (w *WinEventLog) renderEvent(eventHandle EvtHandle) (Event, error) {
 		}
 		event.Message = message
 	}
-	level, err := formatEventString(EvtFormatMessageLevel, eventHandle, publisherHandle)
+	level, err := formatEventString(evtFormatMessageLevel, eventHandle, publisherHandle)
 	if err == nil {
 		event.LevelText = level
 	}
-	task, err := formatEventString(EvtFormatMessageTask, eventHandle, publisherHandle)
+	task, err := formatEventString(evtFormatMessageTask, eventHandle, publisherHandle)
 	if err == nil {
 		event.TaskText = task
 	}
-	opcode, err := formatEventString(EvtFormatMessageOpcode, eventHandle, publisherHandle)
+	opcode, err := formatEventString(evtFormatMessageOpcode, eventHandle, publisherHandle)
 	if err == nil {
 		event.OpcodeText = opcode
 	}
 	return event, nil
 }
 
-func formatEventString(
-	messageFlag EvtFormatMessageFlag,
-	eventHandle EvtHandle,
-	publisherHandle EvtHandle,
-) (string, error) {
+func (w *WinEventLog) renderRemoteMessage(event event) (event, error) {
+	// Populating text values from RenderingInfo part of the XML
+	if len(event.RenderingInfo.Keywords) > 0 {
+		event.Keywords = strings.Join(event.RenderingInfo.Keywords, ",")
+	}
+	if event.RenderingInfo.Message != "" {
+		message := event.RenderingInfo.Message
+		if w.OnlyFirstLineOfMessage {
+			scanner := bufio.NewScanner(strings.NewReader(message))
+			scanner.Scan()
+			message = scanner.Text()
+		}
+		event.Message = message
+	}
+	if event.RenderingInfo.Level != "" {
+		event.LevelText = event.RenderingInfo.Level
+	}
+	if event.RenderingInfo.Task != "" {
+		event.TaskText = event.RenderingInfo.Task
+	}
+	if event.RenderingInfo.Opcode != "" {
+		event.OpcodeText = event.RenderingInfo.Opcode
+	}
+	return event, nil
+}
+
+func formatEventString(messageFlag evtFormatMessageFlag, eventHandle, publisherHandle evtHandle) (string, error) {
 	var bufferUsed uint32
-	err := _EvtFormatMessage(publisherHandle, eventHandle, 0, 0, 0, messageFlag,
+	err := evtFormatMessage(publisherHandle, eventHandle, 0, 0, 0, messageFlag,
 		0, nil, &bufferUsed)
-	if err != nil && err != ERROR_INSUFFICIENT_BUFFER {
+	if err != nil && !errors.Is(err, errInsufficientBuffer) {
 		return "", err
+	}
+
+	// Handle empty elements
+	if bufferUsed < 1 {
+		return "", nil
 	}
 
 	bufferUsed *= 2
 	buffer := make([]byte, bufferUsed)
 	bufferUsed = 0
 
-	err = _EvtFormatMessage(publisherHandle, eventHandle, 0, 0, 0, messageFlag,
+	err = evtFormatMessage(publisherHandle, eventHandle, 0, 0, 0, messageFlag,
 		uint32(len(buffer)/2), &buffer[0], &bufferUsed)
 	bufferUsed *= 2
 	if err != nil {
 		return "", err
 	}
 
-	result, err := DecodeUTF16(buffer[:bufferUsed])
+	result, err := decodeUTF16(buffer[:bufferUsed])
 	if err != nil {
 		return "", err
 	}
 
 	var out string
-	if messageFlag == EvtFormatMessageKeyword {
+	if messageFlag == evtFormatMessageKeyword {
 		// Keywords are returned as array of a zero-terminated strings
 		splitZero := func(c rune) bool { return c == '\x00' }
 		eventKeywords := strings.FieldsFunc(string(result), splitZero)
@@ -497,18 +535,14 @@ func formatEventString(
 }
 
 // openPublisherMetadata opens a handle to the publisher's metadata. Close must
-// be called on returned EvtHandle when finished with the handle.
-func openPublisherMetadata(
-	session EvtHandle,
-	publisherName string,
-	lang uint32,
-) (EvtHandle, error) {
+// be called on returned evtHandle when finished with the handle.
+func openPublisherMetadata(session evtHandle, publisherName string, lang uint32) (evtHandle, error) {
 	p, err := syscall.UTF16PtrFromString(publisherName)
 	if err != nil {
 		return 0, err
 	}
 
-	h, err := _EvtOpenPublisherMetadata(session, p, nil, lang, 0)
+	h, err := evtOpenPublisherMetadata(session, p, nil, lang, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -519,14 +553,12 @@ func openPublisherMetadata(
 func init() {
 	inputs.Add("win_eventlog", func() telegraf.Input {
 		return &WinEventLog{
-			buf:                    make([]byte, bufferSize),
 			ProcessUserData:        true,
 			ProcessEventData:       true,
 			Separator:              "_",
 			OnlyFirstLineOfMessage: true,
 			TimeStampFromEvent:     true,
 			EventTags:              []string{"Source", "EventID", "Level", "LevelText", "Keywords", "Channel", "Computer"},
-			EventFields:            []string{"*"},
 			ExcludeEmpty:           []string{"Task", "Opcode", "*ActivityID", "UserID"},
 		}
 	})

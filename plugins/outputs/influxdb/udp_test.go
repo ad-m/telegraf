@@ -3,6 +3,7 @@ package influxdb_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -11,11 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/plugins/outputs/influxdb"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -57,11 +59,11 @@ func (c *MockConn) Close() error {
 }
 
 type MockDialer struct {
-	DialContextF func(network, address string) (influxdb.Conn, error)
+	DialContextF func() (influxdb.Conn, error)
 }
 
-func (d *MockDialer) DialContext(_ context.Context, network string, address string) (influxdb.Conn, error) {
-	return d.DialContextF(network, address)
+func (d *MockDialer) DialContext(_ context.Context, _, _ string) (influxdb.Conn, error) {
+	return d.DialContextF()
 }
 
 func TestUDP_NewUDPClientNoURL(t *testing.T) {
@@ -88,7 +90,7 @@ func TestUDP_Simple(t *testing.T) {
 	config := influxdb.UDPConfig{
 		URL: getURL(),
 		Dialer: &MockDialer{
-			DialContextF: func(network, address string) (influxdb.Conn, error) {
+			DialContextF: func() (influxdb.Conn, error) {
 				conn := &MockConn{
 					WriteF: func(b []byte) (n int, err error) {
 						buffer.Write(b)
@@ -119,9 +121,8 @@ func TestUDP_DialError(t *testing.T) {
 	config := influxdb.UDPConfig{
 		URL: u,
 		Dialer: &MockDialer{
-			DialContextF: func(network, address string) (influxdb.Conn, error) {
-				return nil, fmt.Errorf(
-					`unsupported scheme [invalid://localhost:9999]: "invalid"`)
+			DialContextF: func() (influxdb.Conn, error) {
+				return nil, errors.New(`unsupported scheme [invalid://localhost:9999]: "invalid"`)
 			},
 		},
 	}
@@ -139,11 +140,10 @@ func TestUDP_WriteError(t *testing.T) {
 	config := influxdb.UDPConfig{
 		URL: getURL(),
 		Dialer: &MockDialer{
-			DialContextF: func(network, address string) (influxdb.Conn, error) {
+			DialContextF: func() (influxdb.Conn, error) {
 				conn := &MockConn{
-					WriteF: func(b []byte) (n int, err error) {
-						return 0, fmt.Errorf(
-							"write udp 127.0.0.1:52190->127.0.0.1:9999: write: connection refused")
+					WriteF: func(_ []byte) (n int, err error) {
+						return 0, errors.New("write udp 127.0.0.1:52190->127.0.0.1:9999: write: connection refused")
 					},
 					CloseF: func() error {
 						closed = true
@@ -176,7 +176,7 @@ func TestUDP_ErrorLogging(t *testing.T) {
 				MaxPayloadSize: 1,
 				URL:            getURL(),
 				Dialer: &MockDialer{
-					DialContextF: func(network, address string) (influxdb.Conn, error) {
+					DialContextF: func() (influxdb.Conn, error) {
 						conn := &MockConn{}
 						return conn, nil
 					},
@@ -191,7 +191,7 @@ func TestUDP_ErrorLogging(t *testing.T) {
 			config: influxdb.UDPConfig{
 				URL: getURL(),
 				Dialer: &MockDialer{
-					DialContextF: func(network, address string) (influxdb.Conn, error) {
+					DialContextF: func() (influxdb.Conn, error) {
 						conn := &MockConn{}
 						return conn, nil
 					},

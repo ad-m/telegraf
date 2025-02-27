@@ -2,19 +2,38 @@
 
 Reads metrics from RabbitMQ servers via the [Management Plugin][management].
 
-For additional details reference the [RabbitMQ Management HTTP Stats][management-reference].
+For additional details reference the [RabbitMQ Management HTTP
+Stats][management-reference].
 
 [management]: https://www.rabbitmq.com/management.html
 [management-reference]: https://raw.githack.com/rabbitmq/rabbitmq-management/rabbitmq_v3_6_9/priv/www/api/index.html
 
-### Configuration
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
 
-```toml
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Secret-store support
+
+This plugin supports secrets from secret-stores for the `username` and
+`password` option.
+See the [secret-store documentation][SECRETSTORE] for more details on how
+to use them.
+
+[SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
+
+## Configuration
+
+```toml @sample.conf
+# Reads metrics from RabbitMQ servers via the Management Plugin
 [[inputs.rabbitmq]]
   ## Management Plugin url. (default: http://localhost:15672)
   # url = "http://localhost:15672"
-  ## Tag added to rabbitmq_overview series; deprecated: use tags
-  # name = "rmq-server-1"
+
   ## Credentials
   # username = "guest"
   # password = "guest"
@@ -40,10 +59,6 @@ For additional details reference the [RabbitMQ Management HTTP Stats][management
   ## specified, metrics for all nodes are gathered.
   # nodes = ["rabbit@node1", "rabbit@node2"]
 
-  ## A list of queues to gather as the rabbitmq_queue measurement. If not
-  ## specified, metrics for all queues are gathered.
-  # queues = ["telegraf"]
-
   ## A list of exchanges to gather as the rabbitmq_exchange measurement. If not
   ## specified, metrics for all exchanges are gathered.
   # exchanges = ["telegraf"]
@@ -66,7 +81,7 @@ For additional details reference the [RabbitMQ Management HTTP Stats][management
   # federation_upstream_exclude = []
 ```
 
-### Metrics
+## Metrics
 
 - rabbitmq_overview
   - tags:
@@ -90,7 +105,7 @@ For additional details reference the [RabbitMQ Management HTTP Stats][management
     - return_unroutable (int, number of unroutable messages)
     - return_unroutable_rate (float, number of unroutable messages per second)
 
-+ rabbitmq_node
+- rabbitmq_node
   - tags:
     - url
     - node
@@ -160,6 +175,7 @@ For additional details reference the [RabbitMQ Management HTTP Stats][management
     - consumer_utilisation (float, percent)
     - consumers (int, int)
     - idle_since (string, time - e.g., "2006-01-02 15:04:05")
+    - head_message_timestamp (int, unix timestamp - only emitted if available from API)
     - memory (int, bytes)
     - message_bytes (int, bytes)
     - message_bytes_persist (int, bytes)
@@ -182,7 +198,7 @@ For additional details reference the [RabbitMQ Management HTTP Stats][management
     - slave_nodes (int, count)
     - synchronised_slave_nodes (int, count)
 
-+ rabbitmq_exchange
+- rabbitmq_exchange
   - tags:
     - url
     - exchange
@@ -217,18 +233,20 @@ For additional details reference the [RabbitMQ Management HTTP Stats][management
     - messages_publish (int, count)
     - messages_return_unroutable (int, count)
 
-### Sample Queries
+## Sample Queries
 
-Message rates for the entire node can be calculated from total message counts. For instance, to get the rate of messages published per minute, use this query:
+Message rates for the entire node can be calculated from total message
+counts. For instance, to get the rate of messages published per minute, use this
+query:
 
-```
+```sql
 SELECT NON_NEGATIVE_DERIVATIVE(LAST("messages_published"), 1m) AS messages_published_rate FROM rabbitmq_overview WHERE time > now() - 10m GROUP BY time(1m)
 ```
 
-### Example Output
+## Example Output
 
-```
-rabbitmq_queue,url=http://amqp.example.org:15672,queue=telegraf,vhost=influxdb,node=rabbit@amqp.example.org,durable=true,auto_delete=false,host=amqp.example.org messages_deliver_get=0i,messages_publish=329i,messages_publish_rate=0.2,messages_redeliver_rate=0,message_bytes_ready=0i,message_bytes_unacked=0i,messages_deliver=329i,messages_unack=0i,consumers=1i,idle_since="",messages=0i,messages_deliver_rate=0.2,messages_deliver_get_rate=0.2,messages_redeliver=0i,memory=43032i,message_bytes_ram=0i,messages_ack=329i,messages_ready=0i,messages_ack_rate=0.2,consumer_utilisation=1,message_bytes=0i,message_bytes_persist=0i 1493684035000000000
+```text
+rabbitmq_queue,url=http://amqp.example.org:15672,queue=telegraf,vhost=influxdb,node=rabbit@amqp.example.org,durable=true,auto_delete=false,host=amqp.example.org head_message_timestamp=1493684017,messages_deliver_get=0i,messages_publish=329i,messages_publish_rate=0.2,messages_redeliver_rate=0,message_bytes_ready=0i,message_bytes_unacked=0i,messages_deliver=329i,messages_unack=0i,consumers=1i,idle_since="",messages=0i,messages_deliver_rate=0.2,messages_deliver_get_rate=0.2,messages_redeliver=0i,memory=43032i,message_bytes_ram=0i,messages_ack=329i,messages_ready=0i,messages_ack_rate=0.2,consumer_utilisation=1,message_bytes=0i,message_bytes_persist=0i 1493684035000000000
 rabbitmq_overview,url=http://amqp.example.org:15672,host=amqp.example.org channels=2i,consumers=1i,exchanges=17i,messages_acked=329i,messages=0i,messages_ready=0i,messages_unacked=0i,connections=2i,queues=1i,messages_delivered=329i,messages_published=329i,clustering_listeners=2i,amqp_listeners=1i 1493684035000000000
 rabbitmq_node,url=http://amqp.example.org:15672,node=rabbit@amqp.example.org,host=amqp.example.org fd_total=1024i,fd_used=32i,mem_limit=8363329126i,sockets_total=829i,disk_free=8175935488i,disk_free_limit=50000000i,mem_used=58771080i,proc_total=1048576i,proc_used=267i,run_queue=0i,sockets_used=2i,running=1i 149368403500000000
 rabbitmq_exchange,url=http://amqp.example.org:15672,exchange=telegraf,type=fanout,vhost=influxdb,internal=false,durable=true,auto_delete=false,host=amqp.example.org messages_publish_in=2i,messages_publish_out=1i 149368403500000000

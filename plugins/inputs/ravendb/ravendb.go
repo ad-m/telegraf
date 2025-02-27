@@ -1,6 +1,8 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package ravendb
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,14 +18,14 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-// defaultURL will set a default value that corresponds to the default value
-// used by RavenDB
-const defaultURL = "http://localhost:8080"
+//go:embed sample.conf
+var sampleConfig string
 
-const defaultTimeout = 5
+const (
+	defaultURL     = "http://localhost:8080"
+	defaultTimeout = 5
+)
 
-// RavenDB defines the configuration necessary for gathering metrics,
-// see the sample config for further details
 type RavenDB struct {
 	URL  string `toml:"url"`
 	Name string `toml:"name"`
@@ -46,46 +48,32 @@ type RavenDB struct {
 	requestURLCollection string
 }
 
-var sampleConfig = `
-  ## Node URL and port that RavenDB is listening on
-  url = "https://localhost:8080"
-
-  ## RavenDB X509 client certificate setup
-  # tls_cert = "/etc/telegraf/raven.crt"
-  # tls_key = "/etc/telegraf/raven.key"
-
-  ## Optional request timeout
-  ##
-  ## Timeout, specifies the amount of time to wait
-  ## for a server's response headers after fully writing the request and 
-  ## time limit for requests made by this client
-  # timeout = "5s"
-
-  ## List of statistics which are collected
-  # At least one is required
-  # Allowed values: server, databases, indexes, collections
-  #
-  # stats_include = ["server", "databases", "indexes", "collections"]
-
-  ## List of db where database stats are collected
-  ## If empty, all db are concerned
-  # db_stats_dbs = []
-
-  ## List of db where index status are collected
-  ## If empty, all indexes from all db are concerned
-  # index_stats_dbs = []
-
-  ## List of db where collection status are collected
-  ## If empty, all collections from all db are concerned
-  # collection_stats_dbs = []
-`
-
-func (r *RavenDB) SampleConfig() string {
+func (*RavenDB) SampleConfig() string {
 	return sampleConfig
 }
 
-func (r *RavenDB) Description() string {
-	return "Reads metrics from RavenDB servers via the Monitoring Endpoints"
+func (r *RavenDB) Init() error {
+	if r.URL == "" {
+		r.URL = defaultURL
+	}
+
+	r.requestURLServer = r.URL + "/admin/monitoring/v1/server"
+	r.requestURLDatabases = r.URL + "/admin/monitoring/v1/databases" + prepareDBNamesURLPart(r.DbStatsDbs)
+	r.requestURLIndexes = r.URL + "/admin/monitoring/v1/indexes" + prepareDBNamesURLPart(r.IndexStatsDbs)
+	r.requestURLCollection = r.URL + "/admin/monitoring/v1/collections" + prepareDBNamesURLPart(r.IndexStatsDbs)
+
+	err := choice.CheckSlice(r.StatsInclude, []string{"server", "databases", "indexes", "collections"})
+	if err != nil {
+		return err
+	}
+
+	err = r.ensureClient()
+	if nil != err {
+		r.Log.Errorf("Error with Client %s", err)
+		return err
+	}
+
+	return nil
 }
 
 func (r *RavenDB) Gather(acc telegraf.Accumulator) error {
@@ -159,7 +147,7 @@ func (r *RavenDB) requestJSON(u string, target interface{}) error {
 
 	r.Log.Debugf("%s: %s", u, resp.Status)
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("invalid response code to request '%s': %d - %s", r.URL, resp.StatusCode, resp.Status)
+		return fmt.Errorf("invalid response code to request %q: %d - %s", r.URL, resp.StatusCode, resp.Status)
 	}
 
 	return json.NewDecoder(resp.Body).Decode(target)
@@ -295,6 +283,11 @@ func (r *RavenDB) gatherDatabases(acc telegraf.Accumulator) {
 			"storage_indexes_used_data_file_in_mb":        dbResponse.Storage.IndexesUsedDataFileInMb,
 			"storage_total_allocated_storage_file_in_mb":  dbResponse.Storage.TotalAllocatedStorageFileInMb,
 			"storage_total_free_space_in_mb":              dbResponse.Storage.TotalFreeSpaceInMb,
+			"storage_io_read_operations":                  dbResponse.Storage.IoReadOperations,
+			"storage_io_write_operations":                 dbResponse.Storage.IoWriteOperations,
+			"storage_read_throughput_in_kb":               dbResponse.Storage.ReadThroughputInKb,
+			"storage_write_throughput_in_kb":              dbResponse.Storage.WriteThroughputInKb,
+			"storage_queue_length":                        dbResponse.Storage.QueueLength,
 			"time_since_last_backup_in_sec":               dbResponse.TimeSinceLastBackupInSec,
 			"uptime_in_sec":                               dbResponse.UptimeInSec,
 		}
@@ -389,30 +382,6 @@ func prepareDBNamesURLPart(dbNames []string) string {
 	}
 
 	return result
-}
-
-func (r *RavenDB) Init() error {
-	if r.URL == "" {
-		r.URL = defaultURL
-	}
-
-	r.requestURLServer = r.URL + "/admin/monitoring/v1/server"
-	r.requestURLDatabases = r.URL + "/admin/monitoring/v1/databases" + prepareDBNamesURLPart(r.DbStatsDbs)
-	r.requestURLIndexes = r.URL + "/admin/monitoring/v1/indexes" + prepareDBNamesURLPart(r.IndexStatsDbs)
-	r.requestURLCollection = r.URL + "/admin/monitoring/v1/collections" + prepareDBNamesURLPart(r.IndexStatsDbs)
-
-	err := choice.CheckSlice(r.StatsInclude, []string{"server", "databases", "indexes", "collections"})
-	if err != nil {
-		return err
-	}
-
-	err = r.ensureClient()
-	if nil != err {
-		r.Log.Errorf("Error with Client %s", err)
-		return err
-	}
-
-	return nil
 }
 
 func init() {

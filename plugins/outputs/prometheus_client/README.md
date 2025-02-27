@@ -1,21 +1,51 @@
 # Prometheus Output Plugin
 
-This plugin starts a [Prometheus](https://prometheus.io/) Client, it exposes
-all metrics on `/metrics` (default) to be polled by a Prometheus server.
+This plugin starts a [Prometheus][prometheus] client and exposes the written
+metrics on a `/metrics` endpoint by default. This endpoint can then be polled
+by a Prometheus server.
 
-### Configuration
+⭐ Telegraf v0.2.1
+🏷️ applications
+💻 all
 
-```toml
+[prometheus]: https://prometheus.io
+
+## Global configuration options <!-- @/docs/includes/plugin_config.md -->
+
+In addition to the plugin-specific configuration settings, plugins support
+additional global and plugin configuration settings. These settings are used to
+modify metrics, tags, and field or create aliases and configure ordering, etc.
+See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
+
+[CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
+
+## Secret-store support
+
+This plugin supports secrets from secret-stores for the `basic_password` option.
+See the [secret-store documentation][SECRETSTORE] for more details on how
+to use them.
+
+[SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
+
+## Configuration
+
+```toml @sample.conf
+# Configuration for the Prometheus client to spawn
 [[outputs.prometheus_client]]
   ## Address to listen on.
+  ##   ex:
+  ##     listen = ":9273"
+  ##     listen = "vsock://:9273"
   listen = ":9273"
 
-  ## Metric version controls the mapping from Telegraf metrics into
-  ## Prometheus format.  When using the prometheus input, use the same value in
-  ## both plugins to ensure metrics are round-tripped without modification.
-  ##
-  ##   example: metric_version = 1;
-  ##            metric_version = 2; recommended version
+  ## Maximum duration before timing out read of the request
+  # read_timeout = "10s"
+  ## Maximum duration before timing out write of the response
+  # write_timeout = "10s"
+
+  ## Metric version controls the mapping from Prometheus metrics into Telegraf metrics.
+  ## See "Metric Format Configuration" in plugins/inputs/prometheus/README.md for details.
+  ## Valid options: 1, 2
   # metric_version = 1
 
   ## Use HTTP Basic Authentication.
@@ -50,10 +80,17 @@ all metrics on `/metrics` (default) to be polled by a Prometheus server.
 
   ## Export metric collection time.
   # export_timestamp = false
+
+  ## Specify the metric type explicitly.
+  ## This overrides the metric-type of the Telegraf metric. Globbing is allowed.
+  # [outputs.prometheus_client.metric_types]
+  #   counter = []
+  #   gauge = []
 ```
 
-### Metrics
+## Metrics
 
-Prometheus metrics are produced in the same manner as the [prometheus serializer][].
+Prometheus metrics are produced in the same manner as the [prometheus
+serializer][].
 
 [prometheus serializer]: /plugins/serializers/prometheus/README.md#Metrics

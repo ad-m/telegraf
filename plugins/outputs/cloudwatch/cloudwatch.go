@@ -1,8 +1,11 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package cloudwatch
 
 import (
 	"context"
+	_ "embed"
 	"math"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -12,20 +15,23 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 
 	"github.com/influxdata/telegraf"
-	internalaws "github.com/influxdata/telegraf/config/aws"
+	common_aws "github.com/influxdata/telegraf/plugins/common/aws"
+	common_http "github.com/influxdata/telegraf/plugins/common/http"
 	"github.com/influxdata/telegraf/plugins/outputs"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 type CloudWatch struct {
 	Namespace             string `toml:"namespace"` // CloudWatch Metrics Namespace
 	HighResolutionMetrics bool   `toml:"high_resolution_metrics"`
 	svc                   *cloudwatch.Client
-
-	WriteStatistics bool `toml:"write_statistics"`
-
-	Log telegraf.Logger `toml:"-"`
-
-	internalaws.CredentialConfig
+	WriteStatistics       bool            `toml:"write_statistics"`
+	Log                   telegraf.Logger `toml:"-"`
+	common_aws.CredentialConfig
+	common_http.HTTPClientConfig
+	client *http.Client
 }
 
 type statisticType int
@@ -63,20 +69,20 @@ func (f *statisticField) buildDatum() []types.MetricDatum {
 
 	if f.hasAllFields() {
 		// If we have all required fields, we build datum with StatisticValues
-		min := f.values[statisticTypeMin]
-		max := f.values[statisticTypeMax]
-		sum := f.values[statisticTypeSum]
-		count := f.values[statisticTypeCount]
+		vmin := f.values[statisticTypeMin]
+		vmax := f.values[statisticTypeMax]
+		vsum := f.values[statisticTypeSum]
+		vcount := f.values[statisticTypeCount]
 
 		datum := types.MetricDatum{
 			MetricName: aws.String(strings.Join([]string{f.metricName, f.fieldName}, "_")),
 			Dimensions: BuildDimensions(f.tags),
 			Timestamp:  aws.Time(f.timestamp),
 			StatisticValues: &types.StatisticSet{
-				Minimum:     aws.Float64(min),
-				Maximum:     aws.Float64(max),
-				Sum:         aws.Float64(sum),
-				SampleCount: aws.Float64(count),
+				Minimum:     aws.Float64(vmin),
+				Maximum:     aws.Float64(vmax),
+				Sum:         aws.Float64(vsum),
+				SampleCount: aws.Float64(vcount),
 			},
 			StorageResolution: aws.Int32(int32(f.storageResolution)),
 		}
@@ -148,68 +154,38 @@ func (f *valueField) buildDatum() []types.MetricDatum {
 	}
 }
 
-var sampleConfig = `
-  ## Amazon REGION
-  region = "us-east-1"
-
-  ## Amazon Credentials
-  ## Credentials are loaded in the following order
-  ## 1) Web identity provider credentials via STS if role_arn and web_identity_token_file are specified
-  ## 2) Assumed credentials via STS if role_arn is specified
-  ## 3) explicit credentials from 'access_key' and 'secret_key'
-  ## 4) shared profile from 'profile'
-  ## 5) environment variables
-  ## 6) shared credentials file
-  ## 7) EC2 Instance Profile
-  #access_key = ""
-  #secret_key = ""
-  #token = ""
-  #role_arn = ""
-  #web_identity_token_file = ""
-  #role_session_name = ""
-  #profile = ""
-  #shared_credential_file = ""
-
-  ## Endpoint to make request against, the correct endpoint is automatically
-  ## determined and this option should only be set if you wish to override the
-  ## default.
-  ##   ex: endpoint_url = "http://localhost:8000"
-  # endpoint_url = ""
-
-  ## Namespace for the CloudWatch MetricDatums
-  namespace = "InfluxData/Telegraf"
-
-  ## If you have a large amount of metrics, you should consider to send statistic
-  ## values instead of raw metrics which could not only improve performance but
-  ## also save AWS API cost. If enable this flag, this plugin would parse the required
-  ## CloudWatch statistic fields (count, min, max, and sum) and send them to CloudWatch.
-  ## You could use basicstats aggregator to calculate those fields. If not all statistic
-  ## fields are available, all fields would still be sent as raw metrics.
-  # write_statistics = false
-
-  ## Enable high resolution metrics of 1 second (if not enabled, standard resolution are of 60 seconds precision)
-  # high_resolution_metrics = false
-`
-
-func (c *CloudWatch) SampleConfig() string {
+func (*CloudWatch) SampleConfig() string {
 	return sampleConfig
-}
-
-func (c *CloudWatch) Description() string {
-	return "Configuration for AWS CloudWatch output."
 }
 
 func (c *CloudWatch) Connect() error {
 	cfg, err := c.CredentialConfig.Credentials()
+
 	if err != nil {
 		return err
 	}
 
-	c.svc = cloudwatch.NewFromConfig(cfg)
+	ctx := context.Background()
+	client, err := c.HTTPClientConfig.CreateClient(ctx, c.Log)
+
+	if err != nil {
+		return err
+	}
+
+	c.client = client
+
+	c.svc = cloudwatch.NewFromConfig(cfg, func(options *cloudwatch.Options) {
+		options.HTTPClient = c.client
+	})
+
 	return nil
 }
 
 func (c *CloudWatch) Close() error {
+	if c.client != nil {
+		c.client.CloseIdleConnections()
+	}
+
 	return nil
 }
 
@@ -220,7 +196,9 @@ func (c *CloudWatch) Write(metrics []telegraf.Metric) error {
 		datums = append(datums, d...)
 	}
 
-	const maxDatumsPerCall = 20 // PutMetricData only supports up to 20 data metrics per call
+	// PutMetricData only supports up to 1000 data metrics per call
+	// https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_PutMetricData.html
+	const maxDatumsPerCall = 1000
 
 	for _, partition := range PartitionDatums(maxDatumsPerCall, datums) {
 		err := c.WriteToCloudWatch(partition)
@@ -247,7 +225,7 @@ func (c *CloudWatch) WriteToCloudWatch(datums []types.MetricDatum) error {
 	return err
 }
 
-// Partition the MetricDatums into smaller slices of a max size so that are under the limit
+// PartitionDatums partitions the MetricDatums into smaller slices of a max size so that are under the limit
 // for the AWS API calls.
 func PartitionDatums(size int, datums []types.MetricDatum) [][]types.MetricDatum {
 	numberOfPartitions := len(datums) / size
@@ -270,10 +248,10 @@ func PartitionDatums(size int, datums []types.MetricDatum) [][]types.MetricDatum
 	return partitions
 }
 
-// Make a MetricDatum from telegraf.Metric. It would check if all required fields of
+// BuildMetricDatum makes a MetricDatum from telegraf.Metric. It would check if all required fields of
 // cloudwatch.StatisticSet are available. If so, it would build MetricDatum from statistic values.
 // Otherwise, fields would still been built independently.
-func BuildMetricDatum(buildStatistic bool, highResolutionMetrics bool, point telegraf.Metric) []types.MetricDatum {
+func BuildMetricDatum(buildStatistic, highResolutionMetrics bool, point telegraf.Metric) []types.MetricDatum {
 	fields := make(map[string]cloudwatchField)
 	tags := point.Tags()
 	storageResolution := int64(60)
@@ -332,14 +310,14 @@ func BuildMetricDatum(buildStatistic bool, highResolutionMetrics bool, point tel
 	return datums
 }
 
-// Make a list of Dimensions by using a Point's tags. CloudWatch supports up to
-// 10 dimensions per metric so we only keep up to the first 10 alphabetically.
+// BuildDimensions makes a list of Dimensions by using a Point's tags. CloudWatch supports up to
+// 10 dimensions per metric, so we only keep up to the first 10 alphabetically.
 // This always includes the "host" tag if it exists.
 func BuildDimensions(mTags map[string]string) []types.Dimension {
-	const MaxDimensions = 10
-	dimensions := make([]types.Dimension, 0, MaxDimensions)
+	const maxDimensions = 10
+	dimensions := make([]types.Dimension, 0, maxDimensions)
 
-	// This is pretty ugly but we always want to include the "host" tag if it exists.
+	// This is pretty ugly, but we always want to include the "host" tag if it exists.
 	if host, ok := mTags["host"]; ok {
 		dimensions = append(dimensions, types.Dimension{
 			Name:  aws.String("host"),
@@ -356,7 +334,7 @@ func BuildDimensions(mTags map[string]string) []types.Dimension {
 	sort.Strings(keys)
 
 	for _, k := range keys {
-		if len(dimensions) >= MaxDimensions {
+		if len(dimensions) >= maxDimensions {
 			break
 		}
 
@@ -392,7 +370,8 @@ func getStatisticType(name string) (sType statisticType, fieldName string) {
 		sType = statisticTypeNone
 		fieldName = name
 	}
-	return
+
+	return sType, fieldName
 }
 
 func convert(v interface{}) (value float64, ok bool) {
@@ -420,7 +399,7 @@ func convert(v interface{}) (value float64, ok bool) {
 	default:
 		// Skip unsupported type.
 		ok = false
-		return
+		return value, ok
 	}
 
 	// Do CloudWatch boundary checking
@@ -436,7 +415,7 @@ func convert(v interface{}) (value float64, ok bool) {
 		return 0, false
 	}
 
-	return
+	return value, ok
 }
 
 func init() {

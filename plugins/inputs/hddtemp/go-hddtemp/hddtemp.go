@@ -8,6 +8,7 @@ import (
 	"strings"
 )
 
+// Disk contains disk data gathered from hddtemp
 type Disk struct {
 	DeviceName  string
 	Model       string
@@ -16,19 +17,19 @@ type Disk struct {
 	Status      string
 }
 
-type hddtemp struct {
-}
+type hddtemp struct{}
 
+// New creates hddtemp
 func New() *hddtemp {
 	return &hddtemp{}
 }
 
-func (h *hddtemp) Fetch(address string) ([]Disk, error) {
+// Fetch gathers disks data from hddtemp daemon.
+func (*hddtemp) Fetch(address string) ([]Disk, error) {
 	var (
 		err    error
 		conn   net.Conn
 		buffer bytes.Buffer
-		disks  []Disk
 	)
 
 	if conn, err = net.Dial("tcp", address); err != nil {
@@ -41,7 +42,9 @@ func (h *hddtemp) Fetch(address string) ([]Disk, error) {
 
 	fields := strings.Split(buffer.String(), "|")
 
-	for index := 0; index < len(fields)/5; index++ {
+	size := len(fields) / 5
+	disks := make([]Disk, 0, size)
+	for index := 0; index < size; index++ {
 		status := ""
 		offset := index * 5
 		device := fields[offset+1]

@@ -1,10 +1,10 @@
 //go:build !windows
-// +build !windows
 
 package processes
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,18 +14,18 @@ import (
 	"syscall"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
-	"github.com/influxdata/telegraf/plugins/inputs/linux_sysctl_fs"
 )
 
 type Processes struct {
-	execPS       func() ([]byte, error)
+	UseSudo bool            `toml:"use_sudo"`
+	Log     telegraf.Logger `toml:"-"`
+
+	execPS       func(UseSudo bool) ([]byte, error)
 	readProcFile func(filename string) ([]byte, error)
-
-	Log telegraf.Logger
-
-	forcePS   bool
-	forceProc bool
+	forcePS      bool
+	forceProc    bool
 }
 
 func (p *Processes) Gather(acc telegraf.Accumulator) error {
@@ -88,7 +88,7 @@ func getEmptyFields() map[string]interface{} {
 
 // exec `ps` to get all process states
 func (p *Processes) gatherFromPS(fields map[string]interface{}) error {
-	out, err := p.execPS()
+	out, err := p.execPS(p.UseSudo)
 	if err != nil {
 		return err
 	}
@@ -128,7 +128,7 @@ func (p *Processes) gatherFromPS(fields map[string]interface{}) error {
 
 // get process states from /proc/(pid)/stat files
 func (p *Processes) gatherFromProc(fields map[string]interface{}) error {
-	filenames, err := filepath.Glob(linux_sysctl_fs.GetHostProc() + "/[0-9]*/stat")
+	filenames, err := filepath.Glob(internal.GetProcPath() + "/[0-9]*/stat")
 	if err != nil {
 		return err
 	}
@@ -151,7 +151,7 @@ func (p *Processes) gatherFromProc(fields map[string]interface{}) error {
 
 		stats := bytes.Fields(data)
 		if len(stats) < 3 {
-			return fmt.Errorf("Something is terribly wrong with %s", filename)
+			return fmt.Errorf("something is terribly wrong with %s", filename)
 		}
 		switch stats[0][0] {
 		case 'R':
@@ -199,7 +199,8 @@ func readProcFile(filename string) ([]byte, error) {
 
 		// Reading from /proc/<PID> fails with ESRCH if the process has
 		// been terminated between open() and read().
-		if perr, ok := err.(*os.PathError); ok && perr.Err == syscall.ESRCH {
+		var perr *os.PathError
+		if errors.As(err, &perr) && errors.Is(perr.Err, syscall.ESRCH) {
 			return nil, nil
 		}
 
@@ -209,13 +210,18 @@ func readProcFile(filename string) ([]byte, error) {
 	return data, nil
 }
 
-func execPS() ([]byte, error) {
+func execPS(useSudo bool) ([]byte, error) {
 	bin, err := exec.LookPath("ps")
 	if err != nil {
 		return nil, err
 	}
 
-	out, err := exec.Command(bin, "axo", "state").Output()
+	cmd := []string{bin, "axo", "state"}
+	if useSudo {
+		cmd = append([]string{"sudo", "-n"}, cmd...)
+	}
+
+	out, err := exec.Command(cmd[0], cmd[1:]...).Output()
 	if err != nil {
 		return nil, err
 	}

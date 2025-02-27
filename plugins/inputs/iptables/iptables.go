@@ -1,9 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 //go:build linux
-// +build linux
 
 package iptables
 
 import (
+	_ "embed"
 	"errors"
 	"os/exec"
 	"regexp"
@@ -14,44 +15,34 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-// Iptables is a telegraf plugin to gather packets and bytes throughput from Linux's iptables packet filter.
+//go:embed sample.conf
+var sampleConfig string
+
+var (
+	errParse       = errors.New("cannot parse iptables list information")
+	chainNameRe    = regexp.MustCompile(`^Chain\s+(\S+)`)
+	fieldsHeaderRe = regexp.MustCompile(`^\s*pkts\s+bytes\s+target`)
+	valuesRe       = regexp.MustCompile(`^\s*(\d+)\s+(\d+)\s+(\w+).*?/\*\s*(.+?)\s*\*/\s*`)
+)
+
+const measurement = "iptables"
+
 type Iptables struct {
-	UseSudo bool
-	UseLock bool
-	Binary  string
-	Table   string
-	Chains  []string
-	lister  chainLister
+	UseSudo bool     `toml:"use_sudo"`
+	UseLock bool     `toml:"use_lock"`
+	Binary  string   `toml:"binary"`
+	Table   string   `toml:"table"`
+	Chains  []string `toml:"chains"`
+
+	lister chainLister
 }
 
-// Description returns a short description of the plugin.
-func (ipt *Iptables) Description() string {
-	return "Gather packets and bytes throughput from iptables"
+type chainLister func(table, chain string) (string, error)
+
+func (*Iptables) SampleConfig() string {
+	return sampleConfig
 }
 
-// SampleConfig returns sample configuration options.
-func (ipt *Iptables) SampleConfig() string {
-	return `
-  ## iptables require root access on most systems.
-  ## Setting 'use_sudo' to true will make use of sudo to run iptables.
-  ## Users must configure sudo to allow telegraf user to run iptables with no password.
-  ## iptables can be restricted to only list command "iptables -nvL".
-  use_sudo = false
-  ## Setting 'use_lock' to true runs iptables with the "-w" option.
-  ## Adjust your sudo settings appropriately if using this option ("iptables -w 5 -nvl")
-  use_lock = false
-  ## Define an alternate executable, such as "ip6tables". Default is "iptables".
-  # binary = "ip6tables"
-  ## defines the table to monitor:
-  table = "filter"
-  ## defines the chains to monitor.
-  ## NOTE: iptables rules without a comment will not be monitored.
-  ## Read the plugin documentation for more information.
-  chains = [ "INPUT" ]
-`
-}
-
-// Gather gathers iptables packets and bytes throughput from the configured tables and chains.
 func (ipt *Iptables) Gather(acc telegraf.Accumulator) error {
 	if ipt.Table == "" || len(ipt.Chains) == 0 {
 		return nil
@@ -99,13 +90,6 @@ func (ipt *Iptables) chainList(table, chain string) (string, error) {
 	return string(out), err
 }
 
-const measurement = "iptables"
-
-var errParse = errors.New("Cannot parse iptables list information")
-var chainNameRe = regexp.MustCompile(`^Chain\s+(\S+)`)
-var fieldsHeaderRe = regexp.MustCompile(`^\s*pkts\s+bytes\s+target`)
-var valuesRe = regexp.MustCompile(`^\s*(\d+)\s+(\d+)\s+(\w+).*?/\*\s*(.+?)\s*\*/\s*`)
-
 func (ipt *Iptables) parseAndGather(data string, acc telegraf.Accumulator) error {
 	lines := strings.Split(data, "\n")
 	if len(lines) < 3 {
@@ -146,11 +130,9 @@ func (ipt *Iptables) parseAndGather(data string, acc telegraf.Accumulator) error
 	return nil
 }
 
-type chainLister func(table, chain string) (string, error)
-
 func init() {
 	inputs.Add("iptables", func() telegraf.Input {
-		ipt := new(Iptables)
+		ipt := &Iptables{}
 		ipt.lister = ipt.chainList
 		return ipt
 	})

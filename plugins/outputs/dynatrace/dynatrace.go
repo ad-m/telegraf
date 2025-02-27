@@ -1,31 +1,40 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package dynatrace
 
 import (
 	"bytes"
+	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
+
+	dynatrace_metric "github.com/dynatrace-oss/dynatrace-metric-utils-go/metric"
+	"github.com/dynatrace-oss/dynatrace-metric-utils-go/metric/apiconstants"
+	"github.com/dynatrace-oss/dynatrace-metric-utils-go/metric/dimensions"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/outputs"
-
-	dtMetric "github.com/dynatrace-oss/dynatrace-metric-utils-go/metric"
-	"github.com/dynatrace-oss/dynatrace-metric-utils-go/metric/apiconstants"
-	"github.com/dynatrace-oss/dynatrace-metric-utils-go/metric/dimensions"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 // Dynatrace Configuration for the Dynatrace output plugin
 type Dynatrace struct {
-	URL               string            `toml:"url"`
-	APIToken          string            `toml:"api_token"`
-	Prefix            string            `toml:"prefix"`
-	Log               telegraf.Logger   `toml:"-"`
-	Timeout           config.Duration   `toml:"timeout"`
-	AddCounterMetrics []string          `toml:"additional_counters"`
+	URL                       string          `toml:"url"`
+	APIToken                  config.Secret   `toml:"api_token"`
+	Prefix                    string          `toml:"prefix"`
+	Log                       telegraf.Logger `toml:"-"`
+	Timeout                   config.Duration `toml:"timeout"`
+	AddCounterMetrics         []string        `toml:"additional_counters"`
+	AddCounterMetricsPatterns []string        `toml:"additional_counters_patterns"`
+
 	DefaultDimensions map[string]string `toml:"default_dimensions"`
 
 	normalizedDefaultDimensions dimensions.NormalizedDimensionList
@@ -38,47 +47,12 @@ type Dynatrace struct {
 	loggedMetrics map[string]bool // New empty set
 }
 
-const sampleConfig = `
-  ## For usage with the Dynatrace OneAgent you can omit any configuration,
-  ## the only requirement is that the OneAgent is running on the same host.
-  ## Only setup environment url and token if you want to monitor a Host without the OneAgent present.
-  ##
-  ## Your Dynatrace environment URL.
-  ## For Dynatrace OneAgent you can leave this empty or set it to "http://127.0.0.1:14499/metrics/ingest" (default)
-  ## For Dynatrace SaaS environments the URL scheme is "https://{your-environment-id}.live.dynatrace.com/api/v2/metrics/ingest"
-  ## For Dynatrace Managed environments the URL scheme is "https://{your-domain}/e/{your-environment-id}/api/v2/metrics/ingest"
-  url = ""
-
-  ## Your Dynatrace API token. 
-  ## Create an API token within your Dynatrace environment, by navigating to Settings > Integration > Dynatrace API
-  ## The API token needs data ingest scope permission. When using OneAgent, no API token is required.
-  api_token = "" 
-
-  ## Optional prefix for metric names (e.g.: "telegraf")
-  prefix = "telegraf"
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-
-  ## Optional flag for ignoring tls certificate check
-  # insecure_skip_verify = false
-
-
-  ## Connection timeout, defaults to "5s" if not set.
-  timeout = "5s"
-
-  ## If you want metrics to be treated and reported as delta counters, add the metric names here
-  additional_counters = [ ]
-
-  ## Optional dimensions to be added to every metric
-  # [outputs.dynatrace.default_dimensions]
-  # default_key = "default value"
-`
+func (*Dynatrace) SampleConfig() string {
+	return sampleConfig
+}
 
 // Connect Connects the Dynatrace output plugin to the Telegraf stream
-func (d *Dynatrace) Connect() error {
+func (*Dynatrace) Connect() error {
 	return nil
 }
 
@@ -88,25 +62,14 @@ func (d *Dynatrace) Close() error {
 	return nil
 }
 
-// SampleConfig Returns a sample configuration for the Dynatrace output plugin
-func (d *Dynatrace) SampleConfig() string {
-	return sampleConfig
-}
-
-// Description returns the description for the Dynatrace output plugin
-func (d *Dynatrace) Description() string {
-	return "Send telegraf metrics to a Dynatrace environment"
-}
-
 func (d *Dynatrace) Write(metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
 
-	lines := []string{}
-
+	lines := make([]string, 0, len(metrics))
 	for _, tm := range metrics {
-		dims := []dimensions.Dimension{}
+		dims := make([]dimensions.Dimension, 0, len(tm.TagList()))
 		for _, tag := range tm.TagList() {
 			// Ignore special tags for histogram and summary types.
 			switch tm.Type() {
@@ -137,17 +100,17 @@ func (d *Dynatrace) Write(metrics []telegraf.Metric) error {
 			}
 
 			name := tm.Name() + "." + field.Key
-			dm, err := dtMetric.NewMetric(
+			dm, err := dynatrace_metric.NewMetric(
 				name,
-				dtMetric.WithPrefix(d.Prefix),
-				dtMetric.WithDimensions(
+				dynatrace_metric.WithPrefix(d.Prefix),
+				dynatrace_metric.WithDimensions(
 					dimensions.MergeLists(
 						d.normalizedDefaultDimensions,
 						dimensions.NewNormalizedDimensionList(dims...),
 						d.normalizedStaticDimensions,
 					),
 				),
-				dtMetric.WithTimestamp(tm.Time()),
+				dynatrace_metric.WithTimestamp(tm.Time()),
 				typeOpt,
 			)
 
@@ -174,7 +137,7 @@ func (d *Dynatrace) Write(metrics []telegraf.Metric) error {
 		output := strings.Join(batch, "\n")
 		if output != "" {
 			if err := d.send(output); err != nil {
-				return fmt.Errorf("error processing data:, %s", err.Error())
+				return fmt.Errorf("error processing data: %w", err)
 			}
 		}
 	}
@@ -187,12 +150,17 @@ func (d *Dynatrace) send(msg string) error {
 	req, err := http.NewRequest("POST", d.URL, bytes.NewBufferString(msg))
 	if err != nil {
 		d.Log.Errorf("Dynatrace error: %s", err.Error())
-		return fmt.Errorf("error while creating HTTP request:, %s", err.Error())
+		return fmt.Errorf("error while creating HTTP request: %w", err)
 	}
 	req.Header.Add("Content-Type", "text/plain; charset=UTF-8")
 
-	if len(d.APIToken) != 0 {
-		req.Header.Add("Authorization", "Api-Token "+d.APIToken)
+	if !d.APIToken.Empty() {
+		token, err := d.APIToken.Get()
+		if err != nil {
+			return fmt.Errorf("getting token failed: %w", err)
+		}
+		req.Header.Add("Authorization", "Api-Token "+token.String())
+		token.Destroy()
 	}
 	// add user-agent header to identify metric source
 	req.Header.Add("User-Agent", "telegraf")
@@ -200,12 +168,12 @@ func (d *Dynatrace) send(msg string) error {
 	resp, err := d.client.Do(req)
 	if err != nil {
 		d.Log.Errorf("Dynatrace error: %s", err.Error())
-		return fmt.Errorf("error while sending HTTP request:, %s", err.Error())
+		return fmt.Errorf("error while sending HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusBadRequest {
-		return fmt.Errorf("request failed with response code:, %d", resp.StatusCode)
+		return fmt.Errorf("request failed with response code: %d", resp.StatusCode)
 	}
 
 	// print metric line results as info log
@@ -224,9 +192,9 @@ func (d *Dynatrace) Init() error {
 		d.Log.Infof("Dynatrace URL is empty, defaulting to OneAgent metrics interface")
 		d.URL = apiconstants.GetDefaultOneAgentEndpoint()
 	}
-	if d.URL != apiconstants.GetDefaultOneAgentEndpoint() && len(d.APIToken) == 0 {
+	if d.URL != apiconstants.GetDefaultOneAgentEndpoint() && d.APIToken.Empty() {
 		d.Log.Errorf("Dynatrace api_token is a required field for Dynatrace output")
-		return fmt.Errorf("api_token is a required field for Dynatrace output")
+		return errors.New("api_token is a required field for Dynatrace output")
 	}
 
 	tlsCfg, err := d.ClientConfig.TLSConfig()
@@ -242,7 +210,7 @@ func (d *Dynatrace) Init() error {
 		Timeout: time.Duration(d.Timeout),
 	}
 
-	dims := []dimensions.Dimension{}
+	dims := make([]dimensions.Dimension, 0, len(d.DefaultDimensions))
 	for key, value := range d.DefaultDimensions {
 		dims = append(dims, dimensions.NewDimension(key, value))
 	}
@@ -261,44 +229,53 @@ func init() {
 	})
 }
 
-func (d *Dynatrace) getTypeOption(metric telegraf.Metric, field *telegraf.Field) dtMetric.MetricOption {
+func (d *Dynatrace) getTypeOption(metric telegraf.Metric, field *telegraf.Field) dynatrace_metric.MetricOption {
 	metricName := metric.Name() + "." + field.Key
-	for _, i := range d.AddCounterMetrics {
-		if metricName != i {
-			continue
-		}
+	if isCounterMetricsMatch(d.AddCounterMetrics, metricName) ||
+		isCounterMetricsPatternsMatch(d.AddCounterMetricsPatterns, metricName) {
 		switch v := field.Value.(type) {
 		case float64:
-			return dtMetric.WithFloatCounterValueDelta(v)
+			return dynatrace_metric.WithFloatCounterValueDelta(v)
 		case uint64:
-			return dtMetric.WithIntCounterValueDelta(int64(v))
+			return dynatrace_metric.WithIntCounterValueDelta(int64(v))
 		case int64:
-			return dtMetric.WithIntCounterValueDelta(v)
+			return dynatrace_metric.WithIntCounterValueDelta(v)
 		default:
 			return nil
 		}
 	}
-
 	switch v := field.Value.(type) {
 	case float64:
-		return dtMetric.WithFloatGaugeValue(v)
+		return dynatrace_metric.WithFloatGaugeValue(v)
 	case uint64:
-		return dtMetric.WithIntGaugeValue(int64(v))
+		return dynatrace_metric.WithIntGaugeValue(int64(v))
 	case int64:
-		return dtMetric.WithIntGaugeValue(v)
+		return dynatrace_metric.WithIntGaugeValue(v)
 	case bool:
 		if v {
-			return dtMetric.WithIntGaugeValue(1)
+			return dynatrace_metric.WithIntGaugeValue(1)
 		}
-		return dtMetric.WithIntGaugeValue(0)
+		return dynatrace_metric.WithIntGaugeValue(0)
 	}
 
 	return nil
 }
 
-func min(a, b int) int {
-	if a <= b {
-		return a
+func isCounterMetricsMatch(counterMetrics []string, metricName string) bool {
+	for _, i := range counterMetrics {
+		if i == metricName {
+			return true
+		}
 	}
-	return b
+	return false
+}
+
+func isCounterMetricsPatternsMatch(counterPatterns []string, metricName string) bool {
+	for _, pattern := range counterPatterns {
+		regex, err := regexp.Compile(pattern)
+		if err == nil && regex.MatchString(metricName) {
+			return true
+		}
+	}
+	return false
 }

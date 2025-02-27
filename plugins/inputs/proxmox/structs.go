@@ -2,46 +2,25 @@ package proxmox
 
 import (
 	"encoding/json"
-	"net/http"
-	"net/url"
-
-	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/config"
-	"github.com/influxdata/telegraf/plugins/common/tls"
 )
-
-type Proxmox struct {
-	BaseURL         string          `toml:"base_url"`
-	APIToken        string          `toml:"api_token"`
-	ResponseTimeout config.Duration `toml:"response_timeout"`
-	NodeName        string          `toml:"node_name"`
-
-	tls.ClientConfig
-
-	httpClient       *http.Client
-	nodeSearchDomain string
-
-	requestFunction func(px *Proxmox, apiUrl string, method string, data url.Values) ([]byte, error)
-	Log             telegraf.Logger `toml:"-"`
-}
-
-type ResourceType string
 
 var (
-	QEMU ResourceType = "qemu"
-	LXC  ResourceType = "lxc"
+	qemu resourceType = "qemu"
+	lxc  resourceType = "lxc"
 )
 
-type VMStats struct {
-	Data []VMStat `json:"data"`
+type resourceType string
+
+type vmStats struct {
+	Data []vmStat `json:"data"`
 }
 
-type VMCurrentStats struct {
-	Data VMStat `json:"data"`
+type vmCurrentStats struct {
+	Data vmStat `json:"data"`
 }
 
-type VMStat struct {
-	ID        string      `json:"vmid"`
+type vmStat struct {
+	ID        json.Number `json:"vmid"`
 	Name      string      `json:"name"`
 	Status    string      `json:"status"`
 	UsedMem   json.Number `json:"mem"`
@@ -54,7 +33,7 @@ type VMStat struct {
 	CPULoad   json.Number `json:"cpu"`
 }
 
-type VMConfig struct {
+type vmConfig struct {
 	Data struct {
 		Searchdomain string `json:"searchdomain"`
 		Hostname     string `json:"hostname"`
@@ -62,8 +41,15 @@ type VMConfig struct {
 	} `json:"data"`
 }
 
-type NodeDNS struct {
+type nodeDNS struct {
 	Data struct {
 		Searchdomain string `json:"search"`
 	} `json:"data"`
+}
+
+type metrics struct {
+	total          int64
+	used           int64
+	free           int64
+	usedPercentage float64
 }

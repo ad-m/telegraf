@@ -1,7 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package stackdriver
 
 import (
 	"context"
+	_ "embed"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -10,102 +13,23 @@ import (
 	"time"
 
 	monitoring "cloud.google.com/go/monitoring/apiv3/v2"
-	googlepbduration "github.com/golang/protobuf/ptypes/duration"
-	googlepbts "github.com/golang/protobuf/ptypes/timestamp"
+	"cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
+	"google.golang.org/api/iterator"
+	distributionpb "google.golang.org/genproto/googleapis/api/distribution"
+	metricpb "google.golang.org/genproto/googleapis/api/metric"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal/limiter"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/plugins/inputs" // Imports the Stackdriver Monitoring client package.
 	"github.com/influxdata/telegraf/selfstat"
-	"google.golang.org/api/iterator"
-	distributionpb "google.golang.org/genproto/googleapis/api/distribution"
-	metricpb "google.golang.org/genproto/googleapis/api/metric"
-	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
 
-const (
-	defaultRateLimit = 14
-	description      = "Gather timeseries from Google Cloud Platform v3 monitoring API"
-	sampleConfig     = `
-  ## GCP Project
-  project = "erudite-bloom-151019"
-
-  ## Include timeseries that start with the given metric type.
-  metric_type_prefix_include = [
-    "compute.googleapis.com/",
-  ]
-
-  ## Exclude timeseries that start with the given metric type.
-  # metric_type_prefix_exclude = []
-
-  ## Many metrics are updated once per minute; it is recommended to override
-  ## the agent level interval with a value of 1m or greater.
-  interval = "1m"
-
-  ## Maximum number of API calls to make per second.  The quota for accounts
-  ## varies, it can be viewed on the API dashboard:
-  ##   https://cloud.google.com/monitoring/quotas#quotas_and_limits
-  # rate_limit = 14
-
-  ## The delay and window options control the number of points selected on
-  ## each gather.  When set, metrics are gathered between:
-  ##   start: now() - delay - window
-  ##   end:   now() - delay
-  #
-  ## Collection delay; if set too low metrics may not yet be available.
-  # delay = "5m"
-  #
-  ## If unset, the window will start at 1m and be updated dynamically to span
-  ## the time between calls (approximately the length of the plugin interval).
-  # window = "1m"
-
-  ## TTL for cached list of metric types.  This is the maximum amount of time
-  ## it may take to discover new metrics.
-  # cache_ttl = "1h"
-
-  ## If true, raw bucket counts are collected for distribution value types.
-  ## For a more lightweight collection, you may wish to disable and use
-  ## distribution_aggregation_aligners instead.
-  # gather_raw_distribution_buckets = true
-
-  ## Aggregate functions to be used for metrics whose value type is
-  ## distribution.  These aggregate values are recorded in in addition to raw
-  ## bucket counts; if they are enabled.
-  ##
-  ## For a list of aligner strings see:
-  ##   https://cloud.google.com/monitoring/api/ref_v3/rpc/google.monitoring.v3#aligner
-  # distribution_aggregation_aligners = [
-  # 	"ALIGN_PERCENTILE_99",
-  # 	"ALIGN_PERCENTILE_95",
-  # 	"ALIGN_PERCENTILE_50",
-  # ]
-
-  ## Filters can be added to reduce the number of time series matched.  All
-  ## functions are supported: starts_with, ends_with, has_substring, and
-  ## one_of.  Only the '=' operator is supported.
-  ##
-  ## The logical operators when combining filters are defined statically using
-  ## the following values:
-  ##   filter ::= <resource_labels> {AND <metric_labels>}
-  ##   resource_labels ::= <resource_labels> {OR <resource_label>}
-  ##   metric_labels ::= <metric_labels> {OR <metric_label>}
-  ##
-  ## For more details, see https://cloud.google.com/monitoring/api/v3/filters
-  #
-  ## Resource labels refine the time series selection with the following expression:
-  ##   resource.labels.<key> = <value>
-  # [[inputs.stackdriver.filter.resource_labels]]
-  #   key = "instance_name"
-  #   value = 'starts_with("localhost")'
-  #
-  ## Metric labels refine the time series selection with the following expression:
-  ##   metric.labels.<key> = <value>
-  #  [[inputs.stackdriver.filter.metric_labels]]
-  #  	 key = "device_name"
-  #  	 value = 'one_of("sda", "sdb")'
-`
-)
+//go:embed sample.conf
+var sampleConfig string
 
 var (
 	defaultCacheTTL = config.Duration(1 * time.Hour)
@@ -113,8 +37,11 @@ var (
 	defaultDelay    = config.Duration(5 * time.Minute)
 )
 
+const (
+	defaultRateLimit = 14
+)
+
 type (
-	// Stackdriver is the Google Stackdriver config info.
 	Stackdriver struct {
 		Project                         string                `toml:"project"`
 		RateLimit                       int                   `toml:"rate_limit"`
@@ -125,36 +52,37 @@ type (
 		MetricTypePrefixExclude         []string              `toml:"metric_type_prefix_exclude"`
 		GatherRawDistributionBuckets    bool                  `toml:"gather_raw_distribution_buckets"`
 		DistributionAggregationAligners []string              `toml:"distribution_aggregation_aligners"`
-		Filter                          *ListTimeSeriesFilter `toml:"filter"`
+		Filter                          *listTimeSeriesFilter `toml:"filter"`
 
-		Log telegraf.Logger
+		Log telegraf.Logger `toml:"-"`
 
 		client              metricClient
 		timeSeriesConfCache *timeSeriesConfCache
 		prevEnd             time.Time
 	}
 
-	// ListTimeSeriesFilter contains resource labels and metric labels
-	ListTimeSeriesFilter struct {
-		ResourceLabels []*Label `json:"resource_labels"`
-		MetricLabels   []*Label `json:"metric_labels"`
+	// listTimeSeriesFilter contains resource labels and metric labels
+	listTimeSeriesFilter struct {
+		ResourceLabels []*label `json:"resource_labels"`
+		MetricLabels   []*label `json:"metric_labels"`
+		UserLabels     []*label `json:"user_labels"`
+		SystemLabels   []*label `json:"system_labels"`
 	}
 
-	// Label contains key and value
-	Label struct {
+	// label contains key and value
+	label struct {
 		Key   string `toml:"key"`
 		Value string `toml:"value"`
 	}
 
-	// TimeSeriesConfCache caches generated timeseries configurations
+	// timeSeriesConfCache caches generated timeseries configurations
 	timeSeriesConfCache struct {
 		TTL             time.Duration
 		Generated       time.Time
 		TimeSeriesConfs []*timeSeriesConf
 	}
 
-	// Internal structure which holds our configuration for a particular GCP time
-	// series.
+	// Internal structure which holds our configuration for a particular GCP time series.
 	timeSeriesConf struct {
 		// The influx measurement name this time series maps to
 		measurement string
@@ -177,9 +105,9 @@ type (
 
 	// metricClient is convenient for testing
 	metricClient interface {
-		ListMetricDescriptors(ctx context.Context, req *monitoringpb.ListMetricDescriptorsRequest) (<-chan *metricpb.MetricDescriptor, error)
-		ListTimeSeries(ctx context.Context, req *monitoringpb.ListTimeSeriesRequest) (<-chan *monitoringpb.TimeSeries, error)
-		Close() error
+		listMetricDescriptors(ctx context.Context, req *monitoringpb.ListMetricDescriptorsRequest) (<-chan *metricpb.MetricDescriptor, error)
+		listTimeSeries(ctx context.Context, req *monitoringpb.ListTimeSeriesRequest) (<-chan *monitoringpb.TimeSeries, error)
+		close() error
 	}
 
 	lockedSeriesGrouper struct {
@@ -188,92 +116,10 @@ type (
 	}
 )
 
-func (g *lockedSeriesGrouper) Add(
-	measurement string,
-	tags map[string]string,
-	tm time.Time,
-	field string,
-	fieldValue interface{},
-) error {
-	g.Lock()
-	defer g.Unlock()
-	return g.SeriesGrouper.Add(measurement, tags, tm, field, fieldValue)
-}
-
-// ListMetricDescriptors implements metricClient interface
-func (smc *stackdriverMetricClient) ListMetricDescriptors(
-	ctx context.Context,
-	req *monitoringpb.ListMetricDescriptorsRequest,
-) (<-chan *metricpb.MetricDescriptor, error) {
-	mdChan := make(chan *metricpb.MetricDescriptor, 1000)
-
-	go func() {
-		smc.log.Debugf("List metric descriptor request filter: %s", req.Filter)
-		defer close(mdChan)
-
-		// Iterate over metric descriptors and send them to buffered channel
-		mdResp := smc.conn.ListMetricDescriptors(ctx, req)
-		smc.listMetricDescriptorsCalls.Incr(1)
-		for {
-			mdDesc, mdErr := mdResp.Next()
-			if mdErr != nil {
-				if mdErr != iterator.Done {
-					smc.log.Errorf("Failed iterating metric descriptor responses: %q: %v", req.String(), mdErr)
-				}
-				break
-			}
-			mdChan <- mdDesc
-		}
-	}()
-
-	return mdChan, nil
-}
-
-// ListTimeSeries implements metricClient interface
-func (smc *stackdriverMetricClient) ListTimeSeries(
-	ctx context.Context,
-	req *monitoringpb.ListTimeSeriesRequest,
-) (<-chan *monitoringpb.TimeSeries, error) {
-	tsChan := make(chan *monitoringpb.TimeSeries, 1000)
-
-	go func() {
-		smc.log.Debugf("List time series request filter: %s", req.Filter)
-		defer close(tsChan)
-
-		// Iterate over timeseries and send them to buffered channel
-		tsResp := smc.conn.ListTimeSeries(ctx, req)
-		smc.listTimeSeriesCalls.Incr(1)
-		for {
-			tsDesc, tsErr := tsResp.Next()
-			if tsErr != nil {
-				if tsErr != iterator.Done {
-					smc.log.Errorf("Failed iterating time series responses: %q: %v", req.String(), tsErr)
-				}
-				break
-			}
-			tsChan <- tsDesc
-		}
-	}()
-
-	return tsChan, nil
-}
-
-// Close implements metricClient interface
-func (smc *stackdriverMetricClient) Close() error {
-	return smc.conn.Close()
-}
-
-// Description implements telegraf.Input interface
-func (s *Stackdriver) Description() string {
-	return description
-}
-
-// SampleConfig implements telegraf.Input interface
-func (s *Stackdriver) SampleConfig() string {
+func (*Stackdriver) SampleConfig() string {
 	return sampleConfig
 }
 
-// Gather implements telegraf.Input interface
 func (s *Stackdriver) Gather(acc telegraf.Accumulator) error {
 	ctx := context.Background()
 
@@ -289,7 +135,7 @@ func (s *Stackdriver) Gather(acc telegraf.Accumulator) error {
 	start, end := s.updateWindow(s.prevEnd)
 	s.prevEnd = end
 
-	tsConfs, err := s.generatetimeSeriesConfs(ctx, start, end)
+	tsConfs, err := s.generateTimeSeriesConfs(ctx, start, end)
 	if err != nil {
 		return err
 	}
@@ -312,143 +158,18 @@ func (s *Stackdriver) Gather(acc telegraf.Accumulator) error {
 	}
 	wg.Wait()
 
-	for _, metric := range grouper.Metrics() {
-		acc.AddMetric(metric)
+	for _, groupedMetric := range grouper.Metrics() {
+		acc.AddMetric(groupedMetric)
 	}
 
 	return nil
-}
-
-// Returns the start and end time for the next collection.
-func (s *Stackdriver) updateWindow(prevEnd time.Time) (time.Time, time.Time) {
-	var start time.Time
-	if time.Duration(s.Window) != 0 {
-		start = time.Now().Add(-time.Duration(s.Delay)).Add(-time.Duration(s.Window))
-	} else if prevEnd.IsZero() {
-		start = time.Now().Add(-time.Duration(s.Delay)).Add(-time.Duration(defaultWindow))
-	} else {
-		start = prevEnd
-	}
-	end := time.Now().Add(-time.Duration(s.Delay))
-	return start, end
-}
-
-// Generate filter string for ListTimeSeriesRequest
-func (s *Stackdriver) newListTimeSeriesFilter(metricType string) string {
-	functions := []string{
-		"starts_with",
-		"ends_with",
-		"has_substring",
-		"one_of",
-	}
-	filterString := fmt.Sprintf(`metric.type = "%s"`, metricType)
-	if s.Filter == nil {
-		return filterString
-	}
-
-	var valueFmt string
-	if len(s.Filter.ResourceLabels) > 0 {
-		resourceLabelsFilter := make([]string, len(s.Filter.ResourceLabels))
-		for i, resourceLabel := range s.Filter.ResourceLabels {
-			// check if resource label value contains function
-			if includeExcludeHelper(resourceLabel.Value, functions, nil) {
-				valueFmt = `resource.labels.%s = %s`
-			} else {
-				valueFmt = `resource.labels.%s = "%s"`
-			}
-			resourceLabelsFilter[i] = fmt.Sprintf(valueFmt, resourceLabel.Key, resourceLabel.Value)
-		}
-		if len(resourceLabelsFilter) == 1 {
-			filterString += fmt.Sprintf(" AND %s", resourceLabelsFilter[0])
-		} else {
-			filterString += fmt.Sprintf(" AND (%s)", strings.Join(resourceLabelsFilter, " OR "))
-		}
-	}
-
-	if len(s.Filter.MetricLabels) > 0 {
-		metricLabelsFilter := make([]string, len(s.Filter.MetricLabels))
-		for i, metricLabel := range s.Filter.MetricLabels {
-			// check if metric label value contains function
-			if includeExcludeHelper(metricLabel.Value, functions, nil) {
-				valueFmt = `metric.labels.%s = %s`
-			} else {
-				valueFmt = `metric.labels.%s = "%s"`
-			}
-			metricLabelsFilter[i] = fmt.Sprintf(valueFmt, metricLabel.Key, metricLabel.Value)
-		}
-		if len(metricLabelsFilter) == 1 {
-			filterString += fmt.Sprintf(" AND %s", metricLabelsFilter[0])
-		} else {
-			filterString += fmt.Sprintf(" AND (%s)", strings.Join(metricLabelsFilter, " OR "))
-		}
-	}
-
-	return filterString
-}
-
-// Create and initialize a timeSeriesConf for a given GCP metric type with
-// defaults taken from the gcp_stackdriver plugin configuration.
-func (s *Stackdriver) newTimeSeriesConf(
-	metricType string, startTime, endTime time.Time,
-) *timeSeriesConf {
-	filter := s.newListTimeSeriesFilter(metricType)
-	interval := &monitoringpb.TimeInterval{
-		EndTime:   &googlepbts.Timestamp{Seconds: endTime.Unix()},
-		StartTime: &googlepbts.Timestamp{Seconds: startTime.Unix()},
-	}
-	tsReq := &monitoringpb.ListTimeSeriesRequest{
-		Name:     fmt.Sprintf("projects/%s", s.Project),
-		Filter:   filter,
-		Interval: interval,
-	}
-	cfg := &timeSeriesConf{
-		measurement:           metricType,
-		fieldKey:              "value",
-		listTimeSeriesRequest: tsReq,
-	}
-
-	// GCP metric types have at least one slash, but we'll be defensive anyway.
-	slashIdx := strings.LastIndex(metricType, "/")
-	if slashIdx > 0 {
-		cfg.measurement = metricType[:slashIdx]
-		cfg.fieldKey = metricType[slashIdx+1:]
-	}
-
-	return cfg
-}
-
-// Change this configuration to query an aggregate by specifying an "aligner".
-// In GCP monitoring, "aligning" is aggregation performed *within* a time
-// series, to distill a pile of data points down to a single data point for
-// some given time period (here, we specify 60s as our time period). This is
-// especially useful for scraping GCP "distribution" metric types, whose raw
-// data amounts to a ~60 bucket histogram, which is fairly hard to query and
-// visualize in the TICK stack.
-func (t *timeSeriesConf) initForAggregate(alignerStr string) {
-	// Check if alignerStr is valid
-	alignerInt, isValid := monitoringpb.Aggregation_Aligner_value[alignerStr]
-	if !isValid {
-		alignerStr = monitoringpb.Aggregation_Aligner_name[alignerInt]
-	}
-	aligner := monitoringpb.Aggregation_Aligner(alignerInt)
-	agg := &monitoringpb.Aggregation{
-		AlignmentPeriod:  &googlepbduration.Duration{Seconds: 60},
-		PerSeriesAligner: aligner,
-	}
-	t.fieldKey = t.fieldKey + "_" + strings.ToLower(alignerStr)
-	t.listTimeSeriesRequest.Aggregation = agg
-}
-
-// IsValid checks timeseriesconf cache validity
-func (c *timeSeriesConfCache) IsValid() bool {
-	return c.TimeSeriesConfs != nil && time.Since(c.Generated) < c.TTL
 }
 
 func (s *Stackdriver) initializeStackdriverClient(ctx context.Context) error {
 	if s.client == nil {
 		client, err := monitoring.NewMetricClient(ctx)
 		if err != nil {
-			return fmt.Errorf("failed to create stackdriver monitoring client: %v", err)
+			return fmt.Errorf("failed to create stackdriver monitoring client: %w", err)
 		}
 
 		tags := map[string]string{
@@ -470,60 +191,28 @@ func (s *Stackdriver) initializeStackdriverClient(ctx context.Context) error {
 	return nil
 }
 
-func includeExcludeHelper(key string, includes []string, excludes []string) bool {
-	if len(includes) > 0 {
-		for _, includeStr := range includes {
-			if strings.HasPrefix(key, includeStr) {
-				return true
-			}
-		}
-		return false
+// Returns the start and end time for the next collection.
+func (s *Stackdriver) updateWindow(prevEnd time.Time) (start, end time.Time) {
+	if time.Duration(s.Window) != 0 {
+		start = time.Now().Add(-time.Duration(s.Delay)).Add(-time.Duration(s.Window))
+	} else if prevEnd.IsZero() {
+		start = time.Now().Add(-time.Duration(s.Delay)).Add(-time.Duration(defaultWindow))
+	} else {
+		start = prevEnd
 	}
-	if len(excludes) > 0 {
-		for _, excludeStr := range excludes {
-			if strings.HasPrefix(key, excludeStr) {
-				return false
-			}
-		}
-		return true
-	}
-	return true
+	end = time.Now().Add(-time.Duration(s.Delay))
+
+	return start, end
 }
 
-// Test whether a particular GCP metric type should be scraped by this plugin
-// by checking the plugin name against the configuration's
-// "includeMetricTypePrefixes" and "excludeMetricTypePrefixes"
-func (s *Stackdriver) includeMetricType(metricType string) bool {
-	k := metricType
-	inc := s.MetricTypePrefixInclude
-	exc := s.MetricTypePrefixExclude
-
-	return includeExcludeHelper(k, inc, exc)
-}
-
-// Generates filter for list metric descriptors request
-func (s *Stackdriver) newListMetricDescriptorsFilters() []string {
-	if len(s.MetricTypePrefixInclude) == 0 {
-		return nil
-	}
-
-	metricTypeFilters := make([]string, len(s.MetricTypePrefixInclude))
-	for i, metricTypePrefix := range s.MetricTypePrefixInclude {
-		metricTypeFilters[i] = fmt.Sprintf(`metric.type = starts_with(%q)`, metricTypePrefix)
-	}
-	return metricTypeFilters
-}
-
-// Generate a list of timeSeriesConfig structs by making a ListMetricDescriptors
+// Generate a list of timeSeriesConfig structs by making a listMetricDescriptors
 // API request and filtering the result against our configuration.
-func (s *Stackdriver) generatetimeSeriesConfs(
-	ctx context.Context, startTime, endTime time.Time,
-) ([]*timeSeriesConf, error) {
-	if s.timeSeriesConfCache != nil && s.timeSeriesConfCache.IsValid() {
+func (s *Stackdriver) generateTimeSeriesConfs(ctx context.Context, startTime, endTime time.Time) ([]*timeSeriesConf, error) {
+	if s.timeSeriesConfCache != nil && s.timeSeriesConfCache.isValid() {
 		// Update interval for timeseries requests in timeseries cache
 		interval := &monitoringpb.TimeInterval{
-			EndTime:   &googlepbts.Timestamp{Seconds: endTime.Unix()},
-			StartTime: &googlepbts.Timestamp{Seconds: startTime.Unix()},
+			EndTime:   &timestamppb.Timestamp{Seconds: endTime.Unix()},
+			StartTime: &timestamppb.Timestamp{Seconds: startTime.Unix()},
 		}
 		for _, timeSeriesConf := range s.timeSeriesConfCache.TimeSeriesConfs {
 			timeSeriesConf.listTimeSeriesRequest.Interval = interval
@@ -531,9 +220,9 @@ func (s *Stackdriver) generatetimeSeriesConfs(
 		return s.timeSeriesConfCache.TimeSeriesConfs, nil
 	}
 
-	ret := []*timeSeriesConf{}
+	ret := make([]*timeSeriesConf, 0)
 	req := &monitoringpb.ListMetricDescriptorsRequest{
-		Name: fmt.Sprintf("projects/%s", s.Project),
+		Name: "projects/" + s.Project,
 	}
 
 	filters := s.newListMetricDescriptorsFilters()
@@ -547,7 +236,7 @@ func (s *Stackdriver) generatetimeSeriesConfs(
 		// this is more efficient than iterating over
 		// all metric descriptors
 		req.Filter = filter
-		mdRespChan, err := s.client.ListMetricDescriptors(ctx, req)
+		mdRespChan, err := s.client.listMetricDescriptors(ctx, req)
 		if err != nil {
 			return nil, err
 		}
@@ -585,14 +274,152 @@ func (s *Stackdriver) generatetimeSeriesConfs(
 	return ret, nil
 }
 
-// Do the work to gather an individual time series. Runs inside a
-// timeseries-specific goroutine.
-func (s *Stackdriver) gatherTimeSeries(
-	ctx context.Context, grouper *lockedSeriesGrouper, tsConf *timeSeriesConf,
-) error {
+// Generates filter for list metric descriptors request
+func (s *Stackdriver) newListMetricDescriptorsFilters() []string {
+	if len(s.MetricTypePrefixInclude) == 0 {
+		return nil
+	}
+
+	metricTypeFilters := make([]string, 0, len(s.MetricTypePrefixInclude))
+	for _, metricTypePrefix := range s.MetricTypePrefixInclude {
+		metricTypeFilters = append(metricTypeFilters, fmt.Sprintf(`metric.type = starts_with(%q)`, metricTypePrefix))
+	}
+	return metricTypeFilters
+}
+
+// Generate filter string for ListTimeSeriesRequest
+func (s *Stackdriver) newListTimeSeriesFilter(metricType string) string {
+	functions := []string{
+		"starts_with",
+		"ends_with",
+		"has_substring",
+		"one_of",
+	}
+	filterString := fmt.Sprintf(`metric.type = %q`, metricType)
+	if s.Filter == nil {
+		return filterString
+	}
+
+	var valueFmt string
+	if len(s.Filter.ResourceLabels) > 0 {
+		resourceLabelsFilter := make([]string, 0, len(s.Filter.ResourceLabels))
+		for _, resourceLabel := range s.Filter.ResourceLabels {
+			// check if resource label value contains function
+			if includeExcludeHelper(resourceLabel.Value, functions, nil) {
+				valueFmt = `resource.labels.%s = %s`
+			} else {
+				valueFmt = `resource.labels.%s = "%s"`
+			}
+			resourceLabelsFilter = append(resourceLabelsFilter, fmt.Sprintf(valueFmt, resourceLabel.Key, resourceLabel.Value))
+		}
+		if len(resourceLabelsFilter) == 1 {
+			filterString += " AND " + resourceLabelsFilter[0]
+		} else {
+			filterString += fmt.Sprintf(" AND (%s)", strings.Join(resourceLabelsFilter, " OR "))
+		}
+	}
+
+	if len(s.Filter.MetricLabels) > 0 {
+		metricLabelsFilter := make([]string, 0, len(s.Filter.MetricLabels))
+		for _, metricLabel := range s.Filter.MetricLabels {
+			// check if metric label value contains function
+			if includeExcludeHelper(metricLabel.Value, functions, nil) {
+				valueFmt = `metric.labels.%s = %s`
+			} else {
+				valueFmt = `metric.labels.%s = "%s"`
+			}
+			metricLabelsFilter = append(metricLabelsFilter, fmt.Sprintf(valueFmt, metricLabel.Key, metricLabel.Value))
+		}
+		if len(metricLabelsFilter) == 1 {
+			filterString += " AND " + metricLabelsFilter[0]
+		} else {
+			filterString += fmt.Sprintf(" AND (%s)", strings.Join(metricLabelsFilter, " OR "))
+		}
+	}
+
+	if len(s.Filter.UserLabels) > 0 {
+		userLabelsFilter := make([]string, 0, len(s.Filter.UserLabels))
+		for _, metricLabel := range s.Filter.UserLabels {
+			// check if metric label value contains function
+			if includeExcludeHelper(metricLabel.Value, functions, nil) {
+				valueFmt = `metadata.user_labels."%s" = %s`
+			} else {
+				valueFmt = `metadata.user_labels."%s" = "%s"`
+			}
+			userLabelsFilter = append(userLabelsFilter, fmt.Sprintf(valueFmt, metricLabel.Key, metricLabel.Value))
+		}
+		if len(userLabelsFilter) == 1 {
+			filterString += " AND " + userLabelsFilter[0]
+		} else {
+			filterString += fmt.Sprintf(" AND (%s)", strings.Join(userLabelsFilter, " OR "))
+		}
+	}
+
+	if len(s.Filter.SystemLabels) > 0 {
+		systemLabelsFilter := make([]string, 0, len(s.Filter.SystemLabels))
+		for _, metricLabel := range s.Filter.SystemLabels {
+			// check if metric label value contains function
+			if includeExcludeHelper(metricLabel.Value, functions, nil) {
+				valueFmt = `metadata.system_labels."%s" = %s`
+			} else {
+				valueFmt = `metadata.system_labels."%s" = "%s"`
+			}
+			systemLabelsFilter = append(systemLabelsFilter, fmt.Sprintf(valueFmt, metricLabel.Key, metricLabel.Value))
+		}
+		if len(systemLabelsFilter) == 1 {
+			filterString += " AND " + systemLabelsFilter[0]
+		} else {
+			filterString += fmt.Sprintf(" AND (%s)", strings.Join(systemLabelsFilter, " OR "))
+		}
+	}
+
+	return filterString
+}
+
+// Create and initialize a timeSeriesConf for a given GCP metric type with defaults taken from the gcp_stackdriver plugin configuration.
+func (s *Stackdriver) newTimeSeriesConf(metricType string, startTime, endTime time.Time) *timeSeriesConf {
+	filter := s.newListTimeSeriesFilter(metricType)
+	interval := &monitoringpb.TimeInterval{
+		EndTime:   &timestamppb.Timestamp{Seconds: endTime.Unix()},
+		StartTime: &timestamppb.Timestamp{Seconds: startTime.Unix()},
+	}
+	tsReq := &monitoringpb.ListTimeSeriesRequest{
+		Name:     "projects/" + s.Project,
+		Filter:   filter,
+		Interval: interval,
+	}
+	cfg := &timeSeriesConf{
+		measurement:           metricType,
+		fieldKey:              "value",
+		listTimeSeriesRequest: tsReq,
+	}
+
+	// GCP metric types have at least one slash, but we'll be defensive anyway.
+	slashIdx := strings.LastIndex(metricType, "/")
+	if slashIdx > 0 {
+		cfg.measurement = metricType[:slashIdx]
+		cfg.fieldKey = metricType[slashIdx+1:]
+	}
+
+	return cfg
+}
+
+// Test whether a particular GCP metric type should be scraped by this plugin
+// by checking the plugin name against the configuration's
+// "includeMetricTypePrefixes" and "excludeMetricTypePrefixes"
+func (s *Stackdriver) includeMetricType(metricType string) bool {
+	k := metricType
+	inc := s.MetricTypePrefixInclude
+	exc := s.MetricTypePrefixExclude
+
+	return includeExcludeHelper(k, inc, exc)
+}
+
+// Do the work to gather an individual time series. Runs inside a timeseries-specific goroutine.
+func (s *Stackdriver) gatherTimeSeries(ctx context.Context, grouper *lockedSeriesGrouper, tsConf *timeSeriesConf) error {
 	tsReq := tsConf.listTimeSeriesRequest
 
-	tsRespChan, err := s.client.ListTimeSeries(ctx, tsReq)
+	tsRespChan, err := s.client.listTimeSeries(ctx, tsReq)
 	if err != nil {
 		return err
 	}
@@ -613,7 +440,7 @@ func (s *Stackdriver) gatherTimeSeries(
 
 			if tsDesc.ValueType == metricpb.MetricDescriptor_DISTRIBUTION {
 				dist := p.Value.GetDistributionValue()
-				if err := s.addDistribution(dist, tags, ts, grouper, tsConf); err != nil {
+				if err := addDistribution(dist, tags, ts, grouper, tsConf); err != nil {
 					return err
 				}
 			} else {
@@ -632,9 +459,7 @@ func (s *Stackdriver) gatherTimeSeries(
 					value = p.Value.GetStringValue()
 				}
 
-				if err := grouper.Add(tsConf.measurement, tags, ts, tsConf.fieldKey, value); err != nil {
-					return err
-				}
+				grouper.Add(tsConf.measurement, tags, ts, tsConf.fieldKey, value)
 			}
 		}
 	}
@@ -642,45 +467,27 @@ func (s *Stackdriver) gatherTimeSeries(
 	return nil
 }
 
-// AddDistribution adds metrics from a distribution value type.
-func (s *Stackdriver) addDistribution(
-	metric *distributionpb.Distribution,
-	tags map[string]string, ts time.Time, grouper *lockedSeriesGrouper, tsConf *timeSeriesConf,
+// addDistribution adds metrics from a distribution value type.
+func addDistribution(dist *distributionpb.Distribution, tags map[string]string, ts time.Time,
+	grouper *lockedSeriesGrouper, tsConf *timeSeriesConf,
 ) error {
 	field := tsConf.fieldKey
 	name := tsConf.measurement
 
-	if err := grouper.Add(name, tags, ts, field+"_count", metric.Count); err != nil {
-		return err
-	}
-	if err := grouper.Add(name, tags, ts, field+"_mean", metric.Mean); err != nil {
-		return err
-	}
-	if err := grouper.Add(name, tags, ts, field+"_sum_of_squared_deviation", metric.SumOfSquaredDeviation); err != nil {
-		return err
+	grouper.Add(name, tags, ts, field+"_count", dist.Count)
+	grouper.Add(name, tags, ts, field+"_mean", dist.Mean)
+	grouper.Add(name, tags, ts, field+"_sum_of_squared_deviation", dist.SumOfSquaredDeviation)
+
+	if dist.Range != nil {
+		grouper.Add(name, tags, ts, field+"_range_min", dist.Range.Min)
+		grouper.Add(name, tags, ts, field+"_range_max", dist.Range.Max)
 	}
 
-	if metric.Range != nil {
-		if err := grouper.Add(name, tags, ts, field+"_range_min", metric.Range.Min); err != nil {
-			return err
-		}
-		if err := grouper.Add(name, tags, ts, field+"_range_max", metric.Range.Max); err != nil {
-			return err
-		}
+	bucket, err := newBucket(dist)
+	if err != nil {
+		return err
 	}
-
-	linearBuckets := metric.BucketOptions.GetLinearBuckets()
-	exponentialBuckets := metric.BucketOptions.GetExponentialBuckets()
-	explicitBuckets := metric.BucketOptions.GetExplicitBuckets()
-
-	var numBuckets int32
-	if linearBuckets != nil {
-		numBuckets = linearBuckets.NumFiniteBuckets + 2
-	} else if exponentialBuckets != nil {
-		numBuckets = exponentialBuckets.NumFiniteBuckets + 2
-	} else {
-		numBuckets = int32(len(explicitBuckets.Bounds)) + 1
-	}
+	numBuckets := bucket.amount()
 
 	var i int32
 	var count int64
@@ -690,41 +497,211 @@ func (s *Stackdriver) addDistribution(
 		if i == numBuckets-1 {
 			tags["lt"] = "+Inf"
 		} else {
-			var upperBound float64
-			if linearBuckets != nil {
-				upperBound = linearBuckets.Offset + (linearBuckets.Width * float64(i))
-			} else if exponentialBuckets != nil {
-				width := math.Pow(exponentialBuckets.GrowthFactor, float64(i))
-				upperBound = exponentialBuckets.Scale * width
-			} else if explicitBuckets != nil {
-				upperBound = explicitBuckets.Bounds[i]
-			}
+			upperBound := bucket.upperBound(i)
 			tags["lt"] = strconv.FormatFloat(upperBound, 'f', -1, 64)
 		}
 
 		// Add to the cumulative count; trailing buckets with value 0 are
 		// omitted from the response.
-		if i < int32(len(metric.BucketCounts)) {
-			count += metric.BucketCounts[i]
+		if i < int32(len(dist.BucketCounts)) {
+			count += dist.BucketCounts[i]
 		}
-		if err := grouper.Add(name, tags, ts, field+"_bucket", count); err != nil {
-			return err
-		}
+		grouper.Add(name, tags, ts, field+"_bucket", count)
 	}
 
 	return nil
 }
 
-func init() {
-	f := func() telegraf.Input {
-		return &Stackdriver{
-			CacheTTL:                        defaultCacheTTL,
-			RateLimit:                       defaultRateLimit,
-			Delay:                           defaultDelay,
-			GatherRawDistributionBuckets:    true,
-			DistributionAggregationAligners: []string{},
+// Add adds a field key and value to the series.
+func (g *lockedSeriesGrouper) Add(measurement string, tags map[string]string, tm time.Time, field string, fieldValue interface{}) {
+	g.Lock()
+	defer g.Unlock()
+	g.SeriesGrouper.Add(measurement, tags, tm, field, fieldValue)
+}
+
+// listMetricDescriptors implements metricClient interface
+func (smc *stackdriverMetricClient) listMetricDescriptors(ctx context.Context,
+	req *monitoringpb.ListMetricDescriptorsRequest,
+) (<-chan *metricpb.MetricDescriptor, error) {
+	mdChan := make(chan *metricpb.MetricDescriptor, 1000)
+
+	go func() {
+		smc.log.Debugf("List metric descriptor request filter: %s", req.Filter)
+		defer close(mdChan)
+
+		// Iterate over metric descriptors and send them to buffered channel
+		mdResp := smc.conn.ListMetricDescriptors(ctx, req)
+		smc.listMetricDescriptorsCalls.Incr(1)
+		for {
+			mdDesc, mdErr := mdResp.Next()
+			if mdErr != nil {
+				if !errors.Is(mdErr, iterator.Done) {
+					smc.log.Errorf("Failed iterating metric descriptor responses: %q: %v", req.String(), mdErr)
+				}
+				break
+			}
+			mdChan <- mdDesc
 		}
+	}()
+
+	return mdChan, nil
+}
+
+// listTimeSeries implements metricClient interface
+func (smc *stackdriverMetricClient) listTimeSeries(
+	ctx context.Context,
+	req *monitoringpb.ListTimeSeriesRequest,
+) (<-chan *monitoringpb.TimeSeries, error) {
+	tsChan := make(chan *monitoringpb.TimeSeries, 1000)
+
+	go func() {
+		smc.log.Debugf("List time series request filter: %s", req.Filter)
+		defer close(tsChan)
+
+		// Iterate over timeseries and send them to buffered channel
+		tsResp := smc.conn.ListTimeSeries(ctx, req)
+		smc.listTimeSeriesCalls.Incr(1)
+		for {
+			tsDesc, tsErr := tsResp.Next()
+			if tsErr != nil {
+				if !errors.Is(tsErr, iterator.Done) {
+					smc.log.Errorf("Failed iterating time series responses: %q: %v", req.String(), tsErr)
+				}
+				break
+			}
+			tsChan <- tsDesc
+		}
+	}()
+
+	return tsChan, nil
+}
+
+// close implements metricClient interface
+func (smc *stackdriverMetricClient) close() error {
+	return smc.conn.Close()
+}
+
+// Change this configuration to query an aggregate by specifying an "aligner".
+// In GCP monitoring, "aligning" is aggregation performed *within* a time
+// series, to distill a pile of data points down to a single data point for
+// some given time period (here, we specify 60s as our time period). This is
+// especially useful for scraping GCP "distribution" metric types, whose raw
+// data amounts to a ~60 bucket histogram, which is fairly hard to query and
+// visualize in the TICK stack.
+func (t *timeSeriesConf) initForAggregate(alignerStr string) {
+	// Check if alignerStr is valid
+	alignerInt, isValid := monitoringpb.Aggregation_Aligner_value[alignerStr]
+	if !isValid {
+		alignerStr = monitoringpb.Aggregation_Aligner_name[alignerInt]
+	}
+	aligner := monitoringpb.Aggregation_Aligner(alignerInt)
+	agg := &monitoringpb.Aggregation{
+		AlignmentPeriod:  &durationpb.Duration{Seconds: 60},
+		PerSeriesAligner: aligner,
+	}
+	t.fieldKey = t.fieldKey + "_" + strings.ToLower(alignerStr)
+	t.listTimeSeriesRequest.Aggregation = agg
+}
+
+// isValid checks timeseriesconf cache validity
+func (c *timeSeriesConfCache) isValid() bool {
+	return c.TimeSeriesConfs != nil && time.Since(c.Generated) < c.TTL
+}
+
+func includeExcludeHelper(key string, includes, excludes []string) bool {
+	if len(includes) > 0 {
+		for _, includeStr := range includes {
+			if strings.HasPrefix(key, includeStr) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(excludes) > 0 {
+		for _, excludeStr := range excludes {
+			if strings.HasPrefix(key, excludeStr) {
+				return false
+			}
+		}
+		return true
+	}
+	return true
+}
+
+type buckets interface {
+	amount() int32
+	upperBound(i int32) float64
+}
+
+type linearBuckets struct {
+	*distributionpb.Distribution_BucketOptions_Linear
+}
+
+func (l *linearBuckets) amount() int32 {
+	return l.NumFiniteBuckets + 2
+}
+
+func (l *linearBuckets) upperBound(i int32) float64 {
+	return l.Offset + (l.Width * float64(i))
+}
+
+type exponentialBuckets struct {
+	*distributionpb.Distribution_BucketOptions_Exponential
+}
+
+func (e *exponentialBuckets) amount() int32 {
+	return e.NumFiniteBuckets + 2
+}
+
+func (e *exponentialBuckets) upperBound(i int32) float64 {
+	width := math.Pow(e.GrowthFactor, float64(i))
+	return e.Scale * width
+}
+
+type explicitBuckets struct {
+	*distributionpb.Distribution_BucketOptions_Explicit
+}
+
+func (e *explicitBuckets) amount() int32 {
+	return int32(len(e.Bounds)) + 1
+}
+
+func (e *explicitBuckets) upperBound(i int32) float64 {
+	return e.Bounds[i]
+}
+
+func newBucket(dist *distributionpb.Distribution) (buckets, error) {
+	linBuckets := dist.BucketOptions.GetLinearBuckets()
+	if linBuckets != nil {
+		var l linearBuckets
+		l.Distribution_BucketOptions_Linear = linBuckets
+		return &l, nil
 	}
 
-	inputs.Add("stackdriver", f)
+	expoBuckets := dist.BucketOptions.GetExponentialBuckets()
+	if expoBuckets != nil {
+		var e exponentialBuckets
+		e.Distribution_BucketOptions_Exponential = expoBuckets
+		return &e, nil
+	}
+
+	explBuckets := dist.BucketOptions.GetExplicitBuckets()
+	if explBuckets != nil {
+		var e explicitBuckets
+		e.Distribution_BucketOptions_Explicit = explBuckets
+		return &e, nil
+	}
+
+	return nil, errors.New("no buckets available")
+}
+
+func init() {
+	inputs.Add("stackdriver", func() telegraf.Input {
+		return &Stackdriver{
+			CacheTTL:                     defaultCacheTTL,
+			RateLimit:                    defaultRateLimit,
+			Delay:                        defaultDelay,
+			GatherRawDistributionBuckets: true,
+		}
+	})
 }

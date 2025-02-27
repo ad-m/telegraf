@@ -15,21 +15,16 @@ The review process is roughly structured as follows:
 1. Submit a pull request.
 Please check that you signed the [CLA](https://www.influxdata.com/legal/cla/) (and [Corporate CLA](https://www.influxdata.com/legal/ccla/) if you are contributing code on as an employee of your company). Provide a short description of your submission and reference issues that you potentially close. Make sure the CI tests are all green and there are no linter-issues.
 1. Get feedback from a first reviewer and a `ready for final review` tag.
-Please constructively work with the reviewer to get your code into a mergable state (see also [below](#reviewing-plugin-code)).
+Please constructively work with the reviewer to get your code into a mergeable state (see also [below](#reviewing-plugin-code)).
 1. Get a final review by one of the InfluxData maintainers.
 Please fix any issue raised.
 1. Wait for the pull-request to be merged.
 It might take some time until your PR gets merged, depending on the release cycle and the type of
 your pull-request (bugfix, enhancement of existing code, new plugin, etc). Remember, it might be necessary to rebase your code before merge to resolve conflicts.
 
-Please read the review comments carefully, fix the related part of the code and/or respond in case there is anything unclear. If there is no activity in a pull-request or the contributor does not respond, we apply the following scheme:
+Please read the review comments carefully, fix the related part of the code and/or respond in case there is anything unclear. Maintainers will add the `waiting for response` tag to PRs to make it clear we are waiting on the submitter for updates. __Once the tag is added, if there is no activity on a pull request or the contributor does not respond, our bot will automatically close the PR after two weeks!__ If you expect a longer period of inactivity or you want to abandon a pull request, please let us know.
 
-1. We send a first reminder after at least 2 weeks of inactivity.
-1. After at least another two weeks of inactivity we send a second reminder and are setting the `waiting for response` tag.
-1. Another two weeks later we will ask the community for help setting the `help wanted` reminder.
-1. In case nobody volunteers to take over the PR within the next 30 days, InfluxData will triage the PR and might close it due to inactivity.
-
-So in case you expect a longer period of inactivity or you want to abandon a pull-request, please let us know.
+In case you still want to continue with the PR, feel free to reopen it.
 
 ## Reviewing Plugin Code
 
@@ -75,7 +70,7 @@ So in case you expect a longer period of inactivity or you want to abandon a pul
 
 ## Linting
 
-Each pull request will have the appriopriate linters checking the files for any common mistakes. The github action Super Linter is used: [super-pinter](https://github.com/github/super-linter). If it is failing you can click on the action and read the logs to figure out the issue. You can also run the github action locally by following these instructions: [run-linter-locally.md](https://github.com/github/super-linter/blob/main/docs/run-linter-locally.md). You can find more information on each of the linters in the super linter readme.
+Each pull request will have the appropriate linters checking the files for any common mistakes. The github action Super Linter is used: [super-linter](https://github.com/github/super-linter). If it is failing you can click on the action and read the logs to figure out the issue. You can also run the github action locally by following these instructions: [run-linter-locally.md](https://github.com/github/super-linter/blob/main/docs/run-linter-locally.md). You can find more information on each of the linters in the super linter readme.
 
 ## Testing
 
@@ -159,8 +154,19 @@ one series be item in the list.
 Counters retrieved from other projects often are in one of two styles,
 monotonically increasing without reset and reset on each interval.  No attempt
 should be made to switch between these two styles but if given the option it
-is preferred to use the non-reseting variant.  This style is more resilient in
+is preferred to use the non-resetting variant.  This style is more resilient in
 the face of downtime and does not contain a fixed time element.
+
+### Source tag
+
+When metrics are gathered from another host, the metric schema should have a tag
+named "source" that contains the other host's name. See [this feature
+request](https://github.com/influxdata/telegraf/issues/4413) for details.
+
+The metric schema doesn't need to have a tag for the host running
+telegraf. Telegraf agent code can add a tag named "host" and by default
+containing the hostname reported by the kernel. This can be configured through
+the "hostname" and "omit_hostname" agent settings.
 
 ## Go Best Practices
 

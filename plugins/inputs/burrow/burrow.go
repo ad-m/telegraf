@@ -1,8 +1,11 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package burrow
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,6 +20,9 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 const (
 	defaultBurrowPrefix          = "/v3/kafka"
 	defaultConcurrentConnections = 20
@@ -24,50 +30,8 @@ const (
 	defaultServer                = "http://localhost:8000"
 )
 
-const configSample = `
-  ## Burrow API endpoints in format "schema://host:port".
-  ## Default is "http://localhost:8000".
-  servers = ["http://localhost:8000"]
-
-  ## Override Burrow API prefix.
-  ## Useful when Burrow is behind reverse-proxy.
-  # api_prefix = "/v3/kafka"
-
-  ## Maximum time to receive response.
-  # response_timeout = "5s"
-
-  ## Limit per-server concurrent connections.
-  ## Useful in case of large number of topics or consumer groups.
-  # concurrent_connections = 20
-
-  ## Filter clusters, default is no filtering.
-  ## Values can be specified as glob patterns.
-  # clusters_include = []
-  # clusters_exclude = []
-
-  ## Filter consumer groups, default is no filtering.
-  ## Values can be specified as glob patterns.
-  # groups_include = []
-  # groups_exclude = []
-
-  ## Filter topics, default is no filtering.
-  ## Values can be specified as glob patterns.
-  # topics_include = []
-  # topics_exclude = []
-
-  ## Credentials for basic HTTP authentication.
-  # username = ""
-  # password = ""
-
-  ## Optional SSL config
-  # ssl_ca = "/etc/telegraf/ca.pem"
-  # ssl_cert = "/etc/telegraf/cert.pem"
-  # ssl_key = "/etc/telegraf/key.pem"
-  # insecure_skip_verify = false
-`
-
 type (
-	burrow struct {
+	Burrow struct {
 		tls.ClientConfig
 
 		Servers               []string
@@ -127,21 +91,11 @@ type (
 	}
 )
 
-func init() {
-	inputs.Add("burrow", func() telegraf.Input {
-		return &burrow{}
-	})
+func (*Burrow) SampleConfig() string {
+	return sampleConfig
 }
 
-func (b *burrow) SampleConfig() string {
-	return configSample
-}
-
-func (b *burrow) Description() string {
-	return "Collect Kafka topics and consumers status from Burrow HTTP API."
-}
-
-func (b *burrow) Gather(acc telegraf.Accumulator) error {
+func (b *Burrow) Gather(acc telegraf.Accumulator) error {
 	var wg sync.WaitGroup
 
 	if len(b.Servers) == 0 {
@@ -163,7 +117,7 @@ func (b *burrow) Gather(acc telegraf.Accumulator) error {
 	for _, addr := range b.Servers {
 		u, err := url.Parse(addr)
 		if err != nil {
-			acc.AddError(fmt.Errorf("unable to parse address '%s': %s", addr, err))
+			acc.AddError(fmt.Errorf("unable to parse address %q: %w", addr, err))
 			continue
 		}
 		if u.Path == "" {
@@ -181,7 +135,7 @@ func (b *burrow) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func (b *burrow) setDefaults() {
+func (b *Burrow) setDefaults() {
 	if b.APIPrefix == "" {
 		b.APIPrefix = defaultBurrowPrefix
 	}
@@ -193,7 +147,7 @@ func (b *burrow) setDefaults() {
 	}
 }
 
-func (b *burrow) compileGlobs() error {
+func (b *Burrow) compileGlobs() error {
 	var err error
 
 	// compile glob patterns
@@ -212,23 +166,34 @@ func (b *burrow) compileGlobs() error {
 	return nil
 }
 
-func (b *burrow) createClient() (*http.Client, error) {
+func (b *Burrow) createClient() (*http.Client, error) {
 	tlsCfg, err := b.ClientConfig.TLSConfig()
 	if err != nil {
 		return nil, err
 	}
 
+	timeout := time.Duration(b.ResponseTimeout)
+	dialContext := net.Dialer{Timeout: timeout, DualStack: true}
+	transport := http.Transport{
+		DialContext:     dialContext.DialContext,
+		TLSClientConfig: tlsCfg,
+		// If b.ConcurrentConnections <= 1, then DefaultMaxIdleConnsPerHost is used (=2)
+		MaxIdleConnsPerHost: b.ConcurrentConnections / 2,
+		// If b.ConcurrentConnections == 0, then it is treated as "no limits"
+		MaxConnsPerHost:       b.ConcurrentConnections,
+		ResponseHeaderTimeout: timeout,
+		IdleConnTimeout:       90 * time.Second,
+	}
+
 	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: tlsCfg,
-		},
-		Timeout: time.Duration(b.ResponseTimeout),
+		Transport: &transport,
+		Timeout:   timeout,
 	}
 
 	return client, nil
 }
 
-func (b *burrow) getResponse(u *url.URL) (*apiResponse, error) {
+func (b *Burrow) getResponse(u *url.URL) (*apiResponse, error) {
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
@@ -253,7 +218,7 @@ func (b *burrow) getResponse(u *url.URL) (*apiResponse, error) {
 	return ares, dec.Decode(ares)
 }
 
-func (b *burrow) gatherServer(src *url.URL, acc telegraf.Accumulator) error {
+func (b *Burrow) gatherServer(src *url.URL, acc telegraf.Accumulator) error {
 	var wg sync.WaitGroup
 
 	r, err := b.getResponse(src)
@@ -292,7 +257,7 @@ func (b *burrow) gatherServer(src *url.URL, acc telegraf.Accumulator) error {
 	return nil
 }
 
-func (b *burrow) gatherTopics(guard chan struct{}, src *url.URL, cluster string, acc telegraf.Accumulator) {
+func (b *Burrow) gatherTopics(guard chan struct{}, src *url.URL, cluster string, acc telegraf.Accumulator) {
 	var wg sync.WaitGroup
 
 	r, err := b.getResponse(src)
@@ -324,14 +289,14 @@ func (b *burrow) gatherTopics(guard chan struct{}, src *url.URL, cluster string,
 				return
 			}
 
-			b.genTopicMetrics(tr, cluster, topic, acc)
+			genTopicMetrics(tr, cluster, topic, acc)
 		}(topic)
 	}
 
 	wg.Wait()
 }
 
-func (b *burrow) genTopicMetrics(r *apiResponse, cluster, topic string, acc telegraf.Accumulator) {
+func genTopicMetrics(r *apiResponse, cluster, topic string, acc telegraf.Accumulator) {
 	for i, offset := range r.Offsets {
 		tags := map[string]string{
 			"cluster":   cluster,
@@ -349,7 +314,7 @@ func (b *burrow) genTopicMetrics(r *apiResponse, cluster, topic string, acc tele
 	}
 }
 
-func (b *burrow) gatherGroups(guard chan struct{}, src *url.URL, cluster string, acc telegraf.Accumulator) {
+func (b *Burrow) gatherGroups(guard chan struct{}, src *url.URL, cluster string, acc telegraf.Accumulator) {
 	var wg sync.WaitGroup
 
 	r, err := b.getResponse(src)
@@ -381,7 +346,7 @@ func (b *burrow) gatherGroups(guard chan struct{}, src *url.URL, cluster string,
 				return
 			}
 
-			b.genGroupStatusMetrics(gr, cluster, group, acc)
+			genGroupStatusMetrics(gr, cluster, group, acc)
 			b.genGroupLagMetrics(gr, cluster, group, acc)
 		}(group)
 	}
@@ -389,7 +354,7 @@ func (b *burrow) gatherGroups(guard chan struct{}, src *url.URL, cluster string,
 	wg.Wait()
 }
 
-func (b *burrow) genGroupStatusMetrics(r *apiResponse, cluster, group string, acc telegraf.Accumulator) {
+func genGroupStatusMetrics(r *apiResponse, cluster, group string, acc telegraf.Accumulator) {
 	partitionCount := r.Status.PartitionCount
 	if partitionCount == 0 {
 		partitionCount = len(r.Status.Partitions)
@@ -428,7 +393,7 @@ func (b *burrow) genGroupStatusMetrics(r *apiResponse, cluster, group string, ac
 	)
 }
 
-func (b *burrow) genGroupLagMetrics(r *apiResponse, cluster, group string, acc telegraf.Accumulator) {
+func (b *Burrow) genGroupLagMetrics(r *apiResponse, cluster, group string, acc telegraf.Accumulator) {
 	for _, partition := range r.Status.Partitions {
 		if !b.filterTopics.Match(partition.Topic) {
 			continue
@@ -483,4 +448,10 @@ func mapStatusToCode(src string) int {
 	default:
 		return 0
 	}
+}
+
+func init() {
+	inputs.Add("burrow", func() telegraf.Input {
+		return &Burrow{}
+	})
 }

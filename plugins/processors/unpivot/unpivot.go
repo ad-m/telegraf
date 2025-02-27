@@ -1,46 +1,45 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package unpivot
 
 import (
+	_ "embed"
+	"fmt"
+
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/plugins/processors"
 )
 
-const (
-	description  = "Rotate multi field metric into several single field metrics"
-	sampleConfig = `
-  ## Tag to use for the name.
-  tag_key = "name"
-  ## Field to use for the name of the value.
-  value_key = "value"
-`
-)
+//go:embed sample.conf
+var sampleConfig string
 
 type Unpivot struct {
-	TagKey   string `toml:"tag_key"`
-	ValueKey string `toml:"value_key"`
+	FieldNameAs string `toml:"use_fieldname_as"`
+	TagKey      string `toml:"tag_key"`
+	ValueKey    string `toml:"value_key"`
 }
 
-func (p *Unpivot) SampleConfig() string {
+func (*Unpivot) SampleConfig() string {
 	return sampleConfig
 }
 
-func (p *Unpivot) Description() string {
-	return description
-}
-
-func copyWithoutFields(metric telegraf.Metric) telegraf.Metric {
-	m := metric.Copy()
-
-	fieldKeys := make([]string, 0, len(m.FieldList()))
-	for _, field := range m.FieldList() {
-		fieldKeys = append(fieldKeys, field.Key)
+func (p *Unpivot) Init() error {
+	switch p.FieldNameAs {
+	case "", "tag":
+		p.FieldNameAs = "tag"
+	case "metric":
+	default:
+		return fmt.Errorf("unrecognized metric mode: %q", p.FieldNameAs)
 	}
 
-	for _, fk := range fieldKeys {
-		m.RemoveField(fk)
+	if p.TagKey == "" {
+		p.TagKey = "name"
+	}
+	if p.ValueKey == "" {
+		p.ValueKey = "value"
 	}
 
-	return m
+	return nil
 }
 
 func (p *Unpivot) Apply(metrics ...telegraf.Metric) []telegraf.Metric {
@@ -48,18 +47,30 @@ func (p *Unpivot) Apply(metrics ...telegraf.Metric) []telegraf.Metric {
 	for _, m := range metrics {
 		fieldCount += len(m.FieldList())
 	}
-
 	results := make([]telegraf.Metric, 0, fieldCount)
 
-	for _, m := range metrics {
-		base := copyWithoutFields(m)
-		for _, field := range m.FieldList() {
-			newMetric := base.Copy()
-			newMetric.AddField(p.ValueKey, field.Value)
-			newMetric.AddTag(p.TagKey, field.Key)
-			results = append(results, newMetric)
+	for _, src := range metrics {
+		// Create a copy without fields and tracking information
+		base := metric.New(src.Name(), make(map[string]string), make(map[string]interface{}), src.Time())
+		for _, t := range src.TagList() {
+			base.AddTag(t.Key, t.Value)
 		}
-		m.Accept()
+
+		// Create a new metric per field and add it to the output
+		for _, field := range src.FieldList() {
+			m := base.Copy()
+			m.AddField(p.ValueKey, field.Value)
+
+			switch p.FieldNameAs {
+			case "metric":
+				m.SetName(field.Key)
+			case "tag":
+				m.AddTag(p.TagKey, field.Key)
+			}
+
+			results = append(results, m)
+		}
+		src.Accept()
 	}
 	return results
 }

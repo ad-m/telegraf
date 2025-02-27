@@ -1,11 +1,16 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package quantile
 
 import (
+	_ "embed"
 	"fmt"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/aggregators"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 type Quantile struct {
 	Quantiles     []float64 `toml:"quantiles"`
@@ -16,6 +21,8 @@ type Quantile struct {
 
 	cache    map[uint64]aggregate
 	suffixes []string
+
+	Log telegraf.Logger `toml:"-"`
 }
 
 type aggregate struct {
@@ -26,39 +33,8 @@ type aggregate struct {
 
 type newAlgorithmFunc func(compression float64) (algorithm, error)
 
-var sampleConfig = `
-  ## General Aggregator Arguments:
-  ## The period on which to flush & clear the aggregator.
-  period = "30s"
-
-  ## If true, the original metric will be dropped by the
-  ## aggregator and will not get sent to the output plugins.
-  drop_original = false
-
-  ## Quantiles to output in the range [0,1]
-  # quantiles = [0.25, 0.5, 0.75]
-
-  ## Type of aggregation algorithm
-  ## Supported are:
-  ##  "t-digest" -- approximation using centroids, can cope with large number of samples
-  ##  "exact R7" -- exact computation also used by Excel or NumPy (Hyndman & Fan 1996 R7)
-  ##  "exact R8" -- exact computation (Hyndman & Fan 1996 R8)
-  ## NOTE: Do not use "exact" algorithms with large number of samples
-  ##       to not impair performance or memory consumption!
-  # algorithm = "t-digest"
-
-  ## Compression for approximation (t-digest). The value needs to be
-  ## greater or equal to 1.0. Smaller values will result in more
-  ## performance but less accuracy.
-  # compression = 100.0
-`
-
-func (q *Quantile) SampleConfig() string {
+func (*Quantile) SampleConfig() string {
 	return sampleConfig
-}
-
-func (q *Quantile) Description() string {
-	return "Keep the aggregate quantiles of each metric passing through."
 }
 
 func (q *Quantile) Add(in telegraf.Metric) {
@@ -68,7 +44,10 @@ func (q *Quantile) Add(in telegraf.Metric) {
 		for k, algo := range cached.fields {
 			if field, ok := fields[k]; ok {
 				if v, isconvertible := convert(field); isconvertible {
-					algo.Add(v)
+					err := algo.Add(v)
+					if err != nil {
+						q.Log.Errorf("adding cached field %s: %v", k, err)
+					}
 				}
 			}
 		}
@@ -83,9 +62,14 @@ func (q *Quantile) Add(in telegraf.Metric) {
 	}
 	for k, field := range in.Fields() {
 		if v, isconvertible := convert(field); isconvertible {
-			// This should never error out as we tested it in Init()
-			algo, _ := q.newAlgorithm(q.Compression)
-			algo.Add(v)
+			algo, err := q.newAlgorithm(q.Compression)
+			if err != nil {
+				q.Log.Errorf("generating algorithm %s: %v", k, err)
+			}
+			err = algo.Add(v)
+			if err != nil {
+				q.Log.Errorf("adding field %s: %v", k, err)
+			}
 			a.fields[k] = algo
 		}
 	}
@@ -94,7 +78,7 @@ func (q *Quantile) Add(in telegraf.Metric) {
 
 func (q *Quantile) Push(acc telegraf.Accumulator) {
 	for _, aggregate := range q.cache {
-		fields := map[string]interface{}{}
+		fields := make(map[string]interface{}, len(aggregate.fields)*len(q.Quantiles))
 		for k, algo := range aggregate.fields {
 			for i, qtl := range q.Quantiles {
 				fields[k+q.suffixes[i]] = algo.Quantile(qtl)
@@ -133,7 +117,7 @@ func (q *Quantile) Init() error {
 		return fmt.Errorf("unknown algorithm type %q", q.AlgorithmType)
 	}
 	if _, err := q.newAlgorithm(q.Compression); err != nil {
-		return fmt.Errorf("cannot create %q algorithm: %v", q.AlgorithmType, err)
+		return fmt.Errorf("cannot create %q algorithm: %w", q.AlgorithmType, err)
 	}
 
 	if len(q.Quantiles) == 0 {
@@ -141,8 +125,8 @@ func (q *Quantile) Init() error {
 	}
 
 	duplicates := make(map[float64]bool)
-	q.suffixes = make([]string, len(q.Quantiles))
-	for i, qtl := range q.Quantiles {
+	q.suffixes = make([]string, 0, len(q.Quantiles))
+	for _, qtl := range q.Quantiles {
 		if qtl < 0.0 || qtl > 1.0 {
 			return fmt.Errorf("quantile %v out of range", qtl)
 		}
@@ -150,7 +134,7 @@ func (q *Quantile) Init() error {
 			return fmt.Errorf("duplicate quantile %v", qtl)
 		}
 		duplicates[qtl] = true
-		q.suffixes[i] = fmt.Sprintf("_%03d", int(qtl*100.0))
+		q.suffixes = append(q.suffixes, fmt.Sprintf("_%03d", int(qtl*100.0)))
 	}
 
 	q.Reset()

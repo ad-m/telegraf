@@ -1,19 +1,10 @@
 package powerdns
 
 import (
-	"fmt"
-	"net"
-	"os"
-	"path/filepath"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf/testutil"
 )
-
-type statServer struct{}
 
 var metrics = "corrupt-packets=0,deferred-cache-inserts=0,deferred-cache-lookup=0," +
 	"dnsupdate-answers=0,dnsupdate-changes=0,dnsupdate-queries=0," +
@@ -50,70 +41,12 @@ var intOverflowMetrics = "corrupt-packets=18446744073709550195,deferred-cache-in
 	"key-cache-size=0,latency=26,meta-cache-size=0,qsize-q=0," +
 	"signature-cache-size=0,sys-msec=2889,uptime=86317,user-msec=2167,"
 
-func (s statServer) serverSocket(l net.Listener) {
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			return
-		}
-
-		go func(c net.Conn) {
-			buf := make([]byte, 1024)
-			n, _ := c.Read(buf)
-
-			data := buf[:n]
-			if string(data) == "show * \n" {
-				// Ignore the returned error as we need to close the socket anyway
-				//nolint:errcheck,revive
-				c.Write([]byte(metrics))
-				// Ignore the returned error as we cannot do anything about it anyway
-				//nolint:errcheck,revive
-				c.Close()
-			}
-		}(conn)
-	}
-}
-
-func TestPowerdnsGeneratesMetrics(t *testing.T) {
-	// We create a fake server to return test data
-	randomNumber := int64(5239846799706671610)
-	sockname := filepath.Join(os.TempDir(), fmt.Sprintf("pdns%d.controlsocket", randomNumber))
-	socket, err := net.Listen("unix", sockname)
-	if err != nil {
-		t.Fatal("Cannot initialize server on port ")
-	}
-
-	defer socket.Close()
-
-	s := statServer{}
-	go s.serverSocket(socket)
-
-	p := &Powerdns{
-		UnixSockets: []string{sockname},
-	}
-
-	var acc testutil.Accumulator
-	err = acc.GatherError(p.Gather)
-	require.NoError(t, err)
-
-	intMetrics := []string{"corrupt-packets", "deferred-cache-inserts",
-		"deferred-cache-lookup", "dnsupdate-answers", "dnsupdate-changes",
-		"dnsupdate-queries", "dnsupdate-refused", "packetcache-hit",
-		"packetcache-miss", "packetcache-size", "query-cache-hit", "query-cache-miss",
-		"rd-queries", "recursing-answers", "recursing-questions",
-		"recursion-unanswered", "security-status", "servfail-packets", "signatures",
-		"tcp-answers", "tcp-queries", "timedout-packets", "udp-answers",
-		"udp-answers-bytes", "udp-do-queries", "udp-queries", "udp4-answers",
-		"udp4-queries", "udp6-answers", "udp6-queries", "key-cache-size", "latency",
-		"meta-cache-size", "qsize-q", "signature-cache-size", "sys-msec", "uptime", "user-msec"}
-
-	for _, metric := range intMetrics {
-		assert.True(t, acc.HasInt64Field("powerdns", metric), metric)
-	}
-}
-
 func TestPowerdnsParseMetrics(t *testing.T) {
-	values := parseResponse(metrics)
+	p := &Powerdns{
+		Log: testutil.Logger{},
+	}
+
+	values := p.parseResponse(metrics)
 
 	tests := []struct {
 		key   string
@@ -173,7 +106,11 @@ func TestPowerdnsParseMetrics(t *testing.T) {
 }
 
 func TestPowerdnsParseCorruptMetrics(t *testing.T) {
-	values := parseResponse(corruptMetrics)
+	p := &Powerdns{
+		Log: testutil.Logger{},
+	}
+
+	values := p.parseResponse(corruptMetrics)
 
 	tests := []struct {
 		key   string
@@ -232,7 +169,11 @@ func TestPowerdnsParseCorruptMetrics(t *testing.T) {
 }
 
 func TestPowerdnsParseIntOverflowMetrics(t *testing.T) {
-	values := parseResponse(intOverflowMetrics)
+	p := &Powerdns{
+		Log: testutil.Logger{},
+	}
+
+	values := p.parseResponse(intOverflowMetrics)
 
 	tests := []struct {
 		key   string

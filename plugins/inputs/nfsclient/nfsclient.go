@@ -1,7 +1,10 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package nfsclient
 
 import (
 	"bufio"
+	_ "embed"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -12,6 +15,9 @@ import (
 	"github.com/influxdata/telegraf/internal/choice"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
+
+//go:embed sample.conf
+var sampleConfig string
 
 type NFSClient struct {
 	Fullstat          bool            `toml:"fullstat"`
@@ -25,317 +31,8 @@ type NFSClient struct {
 	mountstatsPath    string
 }
 
-const sampleConfig = `
-  ## Read more low-level metrics (optional, defaults to false)
-  # fullstat = false
-
-  ## List of mounts to explictly include or exclude (optional)
-  ## The pattern (Go regexp) is matched against the mount point (not the
-  ## device being mounted).  If include_mounts is set, all mounts are ignored
-  ## unless present in the list. If a mount is listed in both include_mounts
-  ## and exclude_mounts, it is excluded.  Go regexp patterns can be used.
-  # include_mounts = []
-  # exclude_mounts = []
-
-  ## List of operations to include or exclude from collecting.  This applies
-  ## only when fullstat=true.  Symantics are similar to {include,exclude}_mounts:
-  ## the default is to collect everything; when include_operations is set, only
-  ## those OPs are collected; when exclude_operations is set, all are collected
-  ## except those listed.  If include and exclude are set, the OP is excluded.
-  ## See /proc/self/mountstats for a list of valid operations; note that
-  ## NFSv3 and NFSv4 have different lists.  While it is not possible to
-  ## have different include/exclude lists for NFSv3/4, unused elements
-  ## in the list should be okay.  It is possible to have different lists
-  ## for different mountpoints:  use mulitple [[input.nfsclient]] stanzas,
-  ## with their own lists.  See "include_mounts" above, and be careful of
-  ## duplicate metrics.
-  # include_operations = []
-  # exclude_operations = []
-`
-
-func (n *NFSClient) SampleConfig() string {
+func (*NFSClient) SampleConfig() string {
 	return sampleConfig
-}
-
-func (n *NFSClient) Description() string {
-	return "Read per-mount NFS client metrics from /proc/self/mountstats"
-}
-
-func convertToUint64(line []string) ([]uint64, error) {
-	/* A "line" of input data (a pre-split array of strings) is
-	   processed one field at a time.  Each field is converted to
-	   an uint64 value, and appened to an array of return values.
-	   On an error, check for ErrRange, and returns an error
-	   if found.  This situation indicates a pretty major issue in
-	   the /proc/self/mountstats file, and returning faulty data
-	   is worse than no data.  Other errors are ignored, and append
-	   whatever we got in the first place (probably 0).
-	   Yes, this is ugly. */
-
-	var nline []uint64
-
-	if len(line) < 2 {
-		return nline, nil
-	}
-
-	// Skip the first field; it's handled specially as the "first" variable
-	for _, l := range line[1:] {
-		val, err := strconv.ParseUint(l, 10, 64)
-		if err != nil {
-			if numError, ok := err.(*strconv.NumError); ok {
-				if numError.Err == strconv.ErrRange {
-					return nil, fmt.Errorf("errrange: line:[%v] raw:[%v] -> parsed:[%v]", line, l, val)
-				}
-			}
-		}
-		nline = append(nline, val)
-	}
-	return nline, nil
-}
-
-func (n *NFSClient) parseStat(mountpoint string, export string, version string, line []string, acc telegraf.Accumulator) error {
-	tags := map[string]string{"mountpoint": mountpoint, "serverexport": export}
-	nline, err := convertToUint64(line)
-	if err != nil {
-		return err
-	}
-
-	if len(nline) == 0 {
-		n.Log.Warnf("Parsing Stat line with one field: %s\n", line)
-		return nil
-	}
-
-	first := strings.Replace(line[0], ":", "", 1)
-
-	var eventsFields = []string{
-		"inoderevalidates",
-		"dentryrevalidates",
-		"datainvalidates",
-		"attrinvalidates",
-		"vfsopen",
-		"vfslookup",
-		"vfsaccess",
-		"vfsupdatepage",
-		"vfsreadpage",
-		"vfsreadpages",
-		"vfswritepage",
-		"vfswritepages",
-		"vfsgetdents",
-		"vfssetattr",
-		"vfsflush",
-		"vfsfsync",
-		"vfslock",
-		"vfsrelease",
-		"congestionwait",
-		"setattrtrunc",
-		"extendwrite",
-		"sillyrenames",
-		"shortreads",
-		"shortwrites",
-		"delay",
-		"pnfsreads",
-		"pnfswrites",
-	}
-
-	var bytesFields = []string{
-		"normalreadbytes",
-		"normalwritebytes",
-		"directreadbytes",
-		"directwritebytes",
-		"serverreadbytes",
-		"serverwritebytes",
-		"readpages",
-		"writepages",
-	}
-
-	var xprtudpFields = []string{
-		"bind_count",
-		"rpcsends",
-		"rpcreceives",
-		"badxids",
-		"inflightsends",
-		"backlogutil",
-	}
-
-	var xprttcpFields = []string{
-		"bind_count",
-		"connect_count",
-		"connect_time",
-		"idle_time",
-		"rpcsends",
-		"rpcreceives",
-		"badxids",
-		"inflightsends",
-		"backlogutil",
-	}
-
-	var nfsopFields = []string{
-		"ops",
-		"trans",
-		"timeouts",
-		"bytes_sent",
-		"bytes_recv",
-		"queue_time",
-		"response_time",
-		"total_time",
-		"errors",
-	}
-
-	var fields = make(map[string]interface{})
-
-	switch first {
-	case "READ", "WRITE":
-		fields["ops"] = nline[0]
-		fields["retrans"] = nline[1] - nline[0]
-		fields["bytes"] = nline[3] + nline[4]
-		fields["rtt"] = nline[6]
-		fields["exe"] = nline[7]
-		tags["operation"] = first
-		acc.AddFields("nfsstat", fields, tags)
-	}
-
-	if n.Fullstat {
-		switch first {
-		case "events":
-			if len(nline) >= len(eventsFields) {
-				for i, t := range eventsFields {
-					fields[t] = nline[i]
-				}
-				acc.AddFields("nfs_events", fields, tags)
-			}
-
-		case "bytes":
-			if len(nline) >= len(bytesFields) {
-				for i, t := range bytesFields {
-					fields[t] = nline[i]
-				}
-				acc.AddFields("nfs_bytes", fields, tags)
-			}
-
-		case "xprt":
-			if len(line) > 1 {
-				switch line[1] {
-				case "tcp":
-					if len(nline)+2 >= len(xprttcpFields) {
-						for i, t := range xprttcpFields {
-							fields[t] = nline[i+2]
-						}
-						acc.AddFields("nfs_xprt_tcp", fields, tags)
-					}
-				case "udp":
-					if len(nline)+2 >= len(xprtudpFields) {
-						for i, t := range xprtudpFields {
-							fields[t] = nline[i+2]
-						}
-						acc.AddFields("nfs_xprt_udp", fields, tags)
-					}
-				}
-			}
-		}
-
-		if (version == "3" && n.nfs3Ops[first]) || (version == "4" && n.nfs4Ops[first]) {
-			tags["operation"] = first
-			if len(nline) <= len(nfsopFields) {
-				for i, t := range nline {
-					fields[nfsopFields[i]] = t
-				}
-				acc.AddFields("nfs_ops", fields, tags)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (n *NFSClient) processText(scanner *bufio.Scanner, acc telegraf.Accumulator) error {
-	var mount string
-	var version string
-	var export string
-	var skip bool
-
-	for scanner.Scan() {
-		line := strings.Fields(scanner.Text())
-		lineLength := len(line)
-
-		if lineLength == 0 {
-			continue
-		}
-
-		skip = false
-
-		// This denotes a new mount has been found, so set
-		// mount and export, and stop skipping (for now)
-		if lineLength > 4 && choice.Contains("fstype", line) && (choice.Contains("nfs", line) || choice.Contains("nfs4", line)) {
-			mount = line[4]
-			export = line[1]
-		} else if lineLength > 5 && (choice.Contains("(nfs)", line) || choice.Contains("(nfs4)", line)) {
-			version = strings.Split(line[5], "/")[1]
-		}
-
-		if mount == "" {
-			continue
-		}
-
-		if len(n.IncludeMounts) > 0 {
-			skip = true
-			for _, RE := range n.IncludeMounts {
-				matched, _ := regexp.MatchString(RE, mount)
-				if matched {
-					skip = false
-					break
-				}
-			}
-		}
-
-		if !skip && len(n.ExcludeMounts) > 0 {
-			for _, RE := range n.ExcludeMounts {
-				matched, _ := regexp.MatchString(RE, mount)
-				if matched {
-					skip = true
-					break
-				}
-			}
-		}
-
-		if !skip {
-			err := n.parseStat(mount, export, version, line, acc)
-			if err != nil {
-				return fmt.Errorf("could not parseStat: %w", err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (n *NFSClient) getMountStatsPath() string {
-	path := "/proc/self/mountstats"
-	if os.Getenv("MOUNT_PROC") != "" {
-		path = os.Getenv("MOUNT_PROC")
-	}
-	n.Log.Debugf("using [%s] for mountstats", path)
-	return path
-}
-
-func (n *NFSClient) Gather(acc telegraf.Accumulator) error {
-	file, err := os.Open(n.mountstatsPath)
-	if err != nil {
-		n.Log.Errorf("Failed opening the [%s] file: %s ", file, err)
-		return err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	if err := n.processText(scanner, acc); err != nil {
-		return err
-	}
-
-	if err := scanner.Err(); err != nil {
-		n.Log.Errorf("%s", err)
-		return err
-	}
-
-	return nil
 }
 
 func (n *NFSClient) Init() error {
@@ -495,6 +192,292 @@ func (n *NFSClient) Init() error {
 	}
 
 	return nil
+}
+
+func (n *NFSClient) Gather(acc telegraf.Accumulator) error {
+	if _, err := os.Stat(n.mountstatsPath); os.IsNotExist(err) {
+		return err
+	}
+
+	// Attempt to read the file to see if we have permissions before opening
+	// which can lead to a panic
+	if _, err := os.ReadFile(n.mountstatsPath); err != nil {
+		return err
+	}
+
+	file, err := os.Open(n.mountstatsPath)
+	if err != nil {
+		n.Log.Errorf("Failed opening the %q file: %v ", file.Name(), err)
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if err := n.processText(scanner, acc); err != nil {
+		return err
+	}
+
+	return scanner.Err()
+}
+
+func (n *NFSClient) parseStat(mountpoint, export, version string, line []string, acc telegraf.Accumulator) error {
+	tags := map[string]string{"mountpoint": mountpoint, "serverexport": export}
+	nline, err := convertToUint64(line)
+	if err != nil {
+		return err
+	}
+
+	if len(nline) == 0 {
+		n.Log.Warnf("Parsing Stat line with one field: %s\n", line)
+		return nil
+	}
+
+	first := strings.Replace(line[0], ":", "", 1)
+
+	var eventsFields = []string{
+		"inoderevalidates",
+		"dentryrevalidates",
+		"datainvalidates",
+		"attrinvalidates",
+		"vfsopen",
+		"vfslookup",
+		"vfsaccess",
+		"vfsupdatepage",
+		"vfsreadpage",
+		"vfsreadpages",
+		"vfswritepage",
+		"vfswritepages",
+		"vfsgetdents",
+		"vfssetattr",
+		"vfsflush",
+		"vfsfsync",
+		"vfslock",
+		"vfsrelease",
+		"congestionwait",
+		"setattrtrunc",
+		"extendwrite",
+		"sillyrenames",
+		"shortreads",
+		"shortwrites",
+		"delay",
+		"pnfsreads",
+		"pnfswrites",
+	}
+
+	var bytesFields = []string{
+		"normalreadbytes",
+		"normalwritebytes",
+		"directreadbytes",
+		"directwritebytes",
+		"serverreadbytes",
+		"serverwritebytes",
+		"readpages",
+		"writepages",
+	}
+
+	var xprtudpFields = []string{
+		"bind_count",
+		"rpcsends",
+		"rpcreceives",
+		"badxids",
+		"inflightsends",
+		"backlogutil",
+	}
+
+	var xprttcpFields = []string{
+		"bind_count",
+		"connect_count",
+		"connect_time",
+		"idle_time",
+		"rpcsends",
+		"rpcreceives",
+		"badxids",
+		"inflightsends",
+		"backlogutil",
+	}
+
+	var nfsopFields = []string{
+		"ops",
+		"trans",
+		"timeouts",
+		"bytes_sent",
+		"bytes_recv",
+		"queue_time",
+		"response_time",
+		"total_time",
+		"errors",
+	}
+
+	var fields = make(map[string]interface{})
+
+	switch first {
+	case "READ", "WRITE":
+		fields["ops"] = nline[0]
+		fields["retrans"] = nline[1] - nline[0]
+		fields["bytes"] = nline[3] + nline[4]
+		fields["rtt"] = nline[6]
+		fields["exe"] = nline[7]
+		fields["rtt_per_op"] = 0.0
+		if nline[0] > 0 {
+			fields["rtt_per_op"] = float64(nline[6]) / float64(nline[0])
+		}
+		tags["operation"] = first
+		acc.AddFields("nfsstat", fields, tags)
+	}
+
+	if n.Fullstat {
+		switch first {
+		case "events":
+			if len(nline) >= len(eventsFields) {
+				for i, t := range eventsFields {
+					fields[t] = nline[i]
+				}
+				acc.AddFields("nfs_events", fields, tags)
+			}
+
+		case "bytes":
+			if len(nline) >= len(bytesFields) {
+				for i, t := range bytesFields {
+					fields[t] = nline[i]
+				}
+				acc.AddFields("nfs_bytes", fields, tags)
+			}
+
+		case "xprt":
+			if len(line) > 1 {
+				switch line[1] {
+				case "tcp":
+					if len(nline)+2 >= len(xprttcpFields) {
+						for i, t := range xprttcpFields {
+							fields[t] = nline[i+2]
+						}
+						acc.AddFields("nfs_xprt_tcp", fields, tags)
+					}
+				case "udp":
+					if len(nline)+2 >= len(xprtudpFields) {
+						for i, t := range xprtudpFields {
+							fields[t] = nline[i+2]
+						}
+						acc.AddFields("nfs_xprt_udp", fields, tags)
+					}
+				}
+			}
+		}
+
+		if (version == "3" && n.nfs3Ops[first]) || (version == "4" && n.nfs4Ops[first]) {
+			tags["operation"] = first
+			if len(nline) <= len(nfsopFields) {
+				for i, t := range nline {
+					fields[nfsopFields[i]] = t
+				}
+				acc.AddFields("nfs_ops", fields, tags)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (n *NFSClient) processText(scanner *bufio.Scanner, acc telegraf.Accumulator) error {
+	var mount string
+	var version string
+	var export string
+	var skip bool
+
+	for scanner.Scan() {
+		line := strings.Fields(scanner.Text())
+		lineLength := len(line)
+
+		if lineLength == 0 {
+			continue
+		}
+
+		skip = false
+
+		// This denotes a new mount has been found, so set
+		// mount and export, and stop skipping (for now)
+		if lineLength > 4 && choice.Contains("fstype", line) && (choice.Contains("nfs", line) || choice.Contains("nfs4", line)) {
+			mount = line[4]
+			export = line[1]
+		} else if lineLength > 5 && (choice.Contains("(nfs)", line) || choice.Contains("(nfs4)", line)) {
+			version = strings.Split(line[5], "/")[1]
+		}
+
+		if mount == "" {
+			continue
+		}
+
+		if len(n.IncludeMounts) > 0 {
+			skip = true
+			for _, RE := range n.IncludeMounts {
+				matched, err := regexp.MatchString(RE, mount)
+				if matched && err != nil {
+					skip = false
+					break
+				}
+			}
+		}
+
+		if !skip && len(n.ExcludeMounts) > 0 {
+			for _, RE := range n.ExcludeMounts {
+				matched, err := regexp.MatchString(RE, mount)
+				if matched && err != nil {
+					skip = true
+					break
+				}
+			}
+		}
+
+		if !skip {
+			err := n.parseStat(mount, export, version, line, acc)
+			if err != nil {
+				return fmt.Errorf("could not parseStat: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (n *NFSClient) getMountStatsPath() string {
+	path := "/proc/self/mountstats"
+	if os.Getenv("MOUNT_PROC") != "" {
+		path = os.Getenv("MOUNT_PROC")
+	}
+	n.Log.Debugf("using [%s] for mountstats", path)
+	return path
+}
+
+func convertToUint64(line []string) ([]uint64, error) {
+	/* A "line" of input data (a pre-split array of strings) is
+	   processed one field at a time.  Each field is converted to
+	   an uint64 value, and appended to an array of return values.
+	   On an error, check for ErrRange, and returns an error
+	   if found.  This situation indicates a pretty major issue in
+	   the /proc/self/mountstats file, and returning faulty data
+	   is worse than no data.  Other errors are ignored, and append
+	   whatever we got in the first place (probably 0).
+	   Yes, this is ugly. */
+
+	if len(line) < 2 {
+		return nil, nil
+	}
+
+	nline := make([]uint64, 0, len(line[1:]))
+	// Skip the first field; it's handled specially as the "first" variable
+	for _, l := range line[1:] {
+		val, err := strconv.ParseUint(l, 10, 64)
+		if err != nil {
+			var numError *strconv.NumError
+			if errors.As(err, &numError) {
+				if errors.Is(numError.Err, strconv.ErrRange) {
+					return nil, fmt.Errorf("errrange: line:[%v] raw:[%v] -> parsed:[%v]", line, l, val)
+				}
+			}
+		}
+		nline = append(nline, val)
+	}
+	return nline, nil
 }
 
 func init() {

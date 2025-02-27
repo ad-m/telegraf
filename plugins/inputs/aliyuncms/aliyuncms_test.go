@@ -2,6 +2,8 @@ package aliyuncms
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -12,7 +14,6 @@ import (
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/responses"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/cms"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
@@ -25,10 +26,10 @@ const inputTitle = "inputs.aliyuncms"
 
 type mockGatherAliyunCMSClient struct{}
 
-func (m *mockGatherAliyunCMSClient) DescribeMetricList(request *cms.DescribeMetricListRequest) (*cms.DescribeMetricListResponse, error) {
+func (*mockGatherAliyunCMSClient) DescribeMetricList(request *cms.DescribeMetricListRequest) (*cms.DescribeMetricListResponse, error) {
 	resp := new(cms.DescribeMetricListResponse)
 
-	//switch request.Metric {
+	// switch request.Metric {
 	switch request.MetricName {
 	case "InstanceActiveConnection":
 		resp.Code = "200"
@@ -93,13 +94,13 @@ func getDiscoveryTool(project string, discoverRegions []string) (*discoveryTool,
 	}
 	credential, err = providers.NewChainProvider(credentialProviders).Retrieve()
 	if err != nil {
-		return nil, errors.Errorf("failed to retrieve credential: %v", err)
+		return nil, fmt.Errorf("failed to retrieve credential: %w", err)
 	}
 
 	dt, err := newDiscoveryTool(discoverRegions, project, testutil.Logger{Name: inputTitle}, credential, 1, time.Minute*2)
 
 	if err != nil {
-		return nil, errors.Errorf("Can't create discovery tool object: %v", err)
+		return nil, fmt.Errorf("can't create discovery tool object: %w", err)
 	}
 	return dt, nil
 }
@@ -107,7 +108,7 @@ func getDiscoveryTool(project string, discoverRegions []string) (*discoveryTool,
 func getMockSdkCli(httpResp *http.Response) (mockAliyunSDKCli, error) {
 	resp := responses.NewCommonResponse()
 	if err := responses.Unmarshal(resp, httpResp, "JSON"); err != nil {
-		return mockAliyunSDKCli{}, errors.Errorf("Can't parse response: %v", err)
+		return mockAliyunSDKCli{}, fmt.Errorf("can't parse response: %w", err)
 	}
 	return mockAliyunSDKCli{resp: resp}, nil
 }
@@ -190,17 +191,116 @@ func TestPluginInitialize(t *testing.T) {
 			if tt.expectedErrorString != "" {
 				require.EqualError(t, plugin.Init(), tt.expectedErrorString)
 			} else {
-				require.Equal(t, nil, plugin.Init())
+				require.NoError(t, plugin.Init())
 			}
-			if len(tt.regions) == 0 { //Check if set to default
+			if len(tt.regions) == 0 { // Check if set to default
 				require.Equal(t, plugin.Regions, aliyunRegionList)
 			}
 		})
 	}
 }
 
+func TestPluginMetricsInitialize(t *testing.T) {
+	var err error
+
+	plugin := new(AliyunCMS)
+	plugin.Log = testutil.Logger{Name: inputTitle}
+	plugin.Regions = []string{"cn-shanghai"}
+	plugin.dt, err = getDiscoveryTool("acs_slb_dashboard", plugin.Regions)
+	if err != nil {
+		t.Fatalf("Can't create discovery tool object: %v", err)
+	}
+
+	httpResp := &http.Response{
+		StatusCode: 200,
+		Body: io.NopCloser(bytes.NewBufferString(
+			`{
+				"LoadBalancers":
+					{
+						"LoadBalancer": [
+ 							{"LoadBalancerId":"bla"}
+                        ]
+                    },
+				"TotalCount": 1,
+				"PageSize": 1,
+				"PageNumber": 1
+			}`)),
+	}
+	mockCli, err := getMockSdkCli(httpResp)
+	if err != nil {
+		t.Fatalf("Can't create mock sdk cli: %v", err)
+	}
+	plugin.dt.cli = map[string]aliyunSdkClient{plugin.Regions[0]: &mockCli}
+
+	tests := []struct {
+		name                string
+		project             string
+		accessKeyID         string
+		accessKeySecret     string
+		expectedErrorString string
+		regions             []string
+		discoveryRegions    []string
+		metrics             []*metric
+	}{
+		{
+			name:            "Valid project",
+			project:         "acs_slb_dashboard",
+			regions:         []string{"cn-shanghai"},
+			accessKeyID:     "dummy",
+			accessKeySecret: "dummy",
+			metrics: []*metric{
+				{
+					Dimensions: `{"instanceId": "i-abcdefgh123456"}`,
+				},
+			},
+		},
+		{
+			name:            "Valid project",
+			project:         "acs_slb_dashboard",
+			regions:         []string{"cn-shanghai"},
+			accessKeyID:     "dummy",
+			accessKeySecret: "dummy",
+			metrics: []*metric{
+				{
+					Dimensions: `[{"instanceId": "p-example"},{"instanceId": "q-example"}]`,
+				},
+			},
+		},
+		{
+			name:                "Valid project",
+			project:             "acs_slb_dashboard",
+			regions:             []string{"cn-shanghai"},
+			accessKeyID:         "dummy",
+			accessKeySecret:     "dummy",
+			expectedErrorString: `cannot parse dimensions (neither obj, nor array) "[": unexpected end of JSON input`,
+			metrics: []*metric{
+				{
+					Dimensions: `[`,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugin.Project = tt.project
+			plugin.AccessKeyID = tt.accessKeyID
+			plugin.AccessKeySecret = tt.accessKeySecret
+			plugin.Regions = tt.regions
+			plugin.Metrics = tt.metrics
+
+			if tt.expectedErrorString != "" {
+				require.EqualError(t, plugin.Init(), tt.expectedErrorString)
+			} else {
+				require.NoError(t, plugin.Init())
+			}
+		})
+	}
+}
+
 func TestUpdateWindow(t *testing.T) {
-	duration, _ := time.ParseDuration("1m")
+	duration, err := time.ParseDuration("1m")
+	require.NoError(t, err)
 	internalDuration := config.Duration(duration)
 
 	plugin := &AliyunCMS{
@@ -240,9 +340,8 @@ func TestGatherMetric(t *testing.T) {
 		Regions:     []string{"cn-shanghai"},
 	}
 
-	metric := &Metric{
-		MetricNames: []string{},
-		Dimensions:  `"instanceId": "i-abcdefgh123456"`,
+	metric := &metric{
+		Dimensions: `"instanceId": "i-abcdefgh123456"`,
 	}
 
 	tests := []struct {
@@ -271,15 +370,14 @@ func TestGatherMetric(t *testing.T) {
 }
 
 func TestGather(t *testing.T) {
-	metric := &Metric{
-		MetricNames: []string{},
-		Dimensions:  `{"instanceId": "i-abcdefgh123456"}`,
+	m := &metric{
+		Dimensions: `{"instanceId": "i-abcdefgh123456"}`,
 	}
 	plugin := &AliyunCMS{
 		AccessKeyID:     "my_access_key_id",
 		AccessKeySecret: "my_access_key_secret",
 		Project:         "acs_slb_dashboard",
-		Metrics:         []*Metric{metric},
+		Metrics:         []*metric{m},
 		RateLimit:       200,
 		measurement:     formatMeasurement("acs_slb_dashboard"),
 		Regions:         []string{"cn-shanghai"},
@@ -287,12 +385,12 @@ func TestGather(t *testing.T) {
 		Log:             testutil.Logger{Name: inputTitle},
 	}
 
-	//test table:
+	// test table:
 	tests := []struct {
-		name          string
-		hasMeasurment bool
-		metricNames   []string
-		expected      []telegraf.Metric
+		name           string
+		hasMeasurement bool
+		metricNames    []string
+		expected       []telegraf.Metric
 	}{
 		{
 			name:        "Empty data point",
@@ -306,9 +404,9 @@ func TestGather(t *testing.T) {
 			},
 		},
 		{
-			name:          "Data point with fields & tags",
-			hasMeasurment: true,
-			metricNames:   []string{"InstanceActiveConnection"},
+			name:           "Data point with fields & tags",
+			hasMeasurement: true,
+			metricNames:    []string{"InstanceActiveConnection"},
 			expected: []telegraf.Metric{
 				testutil.MustMetric(
 					"aliyuncms_acs_slb_dashboard",
@@ -331,9 +429,9 @@ func TestGather(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var acc testutil.Accumulator
 			plugin.Metrics[0].MetricNames = tt.metricNames
-			require.Empty(t, acc.GatherError(plugin.Gather))
-			require.Equal(t, acc.HasMeasurement("aliyuncms_acs_slb_dashboard"), tt.hasMeasurment)
-			if tt.hasMeasurment {
+			require.NoError(t, acc.GatherError(plugin.Gather))
+			require.Equal(t, acc.HasMeasurement("aliyuncms_acs_slb_dashboard"), tt.hasMeasurement)
+			if tt.hasMeasurement {
 				acc.AssertContainsTaggedFields(t, "aliyuncms_acs_slb_dashboard", tt.expected[0].Fields(), tt.expected[0].Tags())
 			}
 		})
@@ -341,7 +439,7 @@ func TestGather(t *testing.T) {
 }
 
 func TestGetDiscoveryDataAcrossRegions(t *testing.T) {
-	//test table:
+	// test table:
 	tests := []struct {
 		name                string
 		project             string
@@ -364,7 +462,7 @@ func TestGetDiscoveryDataAcrossRegions(t *testing.T) {
 			totalCount:          0,
 			pageSize:            0,
 			pageNumber:          0,
-			expectedErrorString: `Didn't find root key "LoadBalancers" in discovery response`,
+			expectedErrorString: `didn't find root key "LoadBalancers" in discovery response`,
 		},
 		{
 			name:    "1 object discovered",

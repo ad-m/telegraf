@@ -6,11 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
-	"github.com/influxdata/telegraf/plugins/serializers"
+	"github.com/influxdata/telegraf/plugins/serializers/influx"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
 )
 
 func TestOutputShim(t *testing.T) {
@@ -27,12 +28,14 @@ func TestOutputShim(t *testing.T) {
 
 	wg.Add(1)
 	go func() {
-		err := s.RunOutput()
-		require.NoError(t, err)
+		if err := s.RunOutput(); err != nil {
+			t.Error(err)
+		}
 		wg.Done()
 	}()
 
-	serializer, _ := serializers.NewInfluxSerializer()
+	serializer := &influx.Serializer{}
+	require.NoError(t, serializer.Init())
 
 	m := metric.New("thing",
 		map[string]string{
@@ -62,10 +65,10 @@ type testOutput struct {
 	MetricsWritten []telegraf.Metric
 }
 
-func (o *testOutput) Connect() error {
+func (*testOutput) Connect() error {
 	return nil
 }
-func (o *testOutput) Close() error {
+func (*testOutput) Close() error {
 	return nil
 }
 func (o *testOutput) Write(metrics []telegraf.Metric) error {
@@ -73,10 +76,6 @@ func (o *testOutput) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (o *testOutput) SampleConfig() string {
-	return ""
-}
-
-func (o *testOutput) Description() string {
+func (*testOutput) SampleConfig() string {
 	return ""
 }

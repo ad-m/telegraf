@@ -9,15 +9,16 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/agent"
+	"github.com/influxdata/telegraf/models"
 )
 
 // AddInput adds the input to the shim. Later calls to Run() will run this input.
 func (s *Shim) AddInput(input telegraf.Input) error {
-	setLoggerOnPlugin(input, s.Log())
+	models.SetLoggerOnPlugin(input, s.Log())
 	if p, ok := input.(telegraf.Initializer); ok {
 		err := p.Init()
 		if err != nil {
-			return fmt.Errorf("failed to init input: %s", err)
+			return fmt.Errorf("failed to init input: %w", err)
 		}
 	}
 
@@ -38,7 +39,7 @@ func (s *Shim) RunInput(pollInterval time.Duration) error {
 
 	if serviceInput, ok := s.Input.(telegraf.ServiceInput); ok {
 		if err := serviceInput.Start(acc); err != nil {
-			return fmt.Errorf("failed to start input: %s", err)
+			return fmt.Errorf("failed to start input: %w", err)
 		}
 	}
 	s.gatherPromptCh = make(chan empty, 1)
@@ -54,7 +55,10 @@ func (s *Shim) RunInput(pollInterval time.Duration) error {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
-		s.writeProcessedMetrics()
+		err := s.writeProcessedMetrics()
+		if err != nil {
+			s.log.Warn(err.Error())
+		}
 		wg.Done()
 	}()
 

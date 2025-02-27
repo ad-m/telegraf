@@ -1,7 +1,9 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package interrupts
 
 import (
 	"bufio"
+	_ "embed"
 	"fmt"
 	"io"
 	"os"
@@ -12,46 +14,39 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
+//go:embed sample.conf
+var sampleConfig string
+
 type Interrupts struct {
 	CPUAsTag bool `toml:"cpu_as_tag"`
 }
 
-type IRQ struct {
-	ID     string
-	Type   string
-	Device string
-	Total  int64
-	Cpus   []int64
+type irq struct {
+	id     string
+	typ    string
+	device string
+	total  int64
+	cpus   []int64
 }
 
-func NewIRQ(id string) *IRQ {
-	return &IRQ{ID: id, Cpus: []int64{}}
-}
-
-const sampleConfig = `
-  ## When set to true, cpu metrics are tagged with the cpu.  Otherwise cpu is
-  ## stored as a field.
-  ##
-  ## The default is false for backwards compatibility, and will be changed to
-  ## true in a future version.  It is recommended to set to true on new
-  ## deployments.
-  # cpu_as_tag = false
-
-  ## To filter which IRQs to collect, make use of tagpass / tagdrop, i.e.
-  # [inputs.interrupts.tagdrop]
-  #   irq = [ "NET_RX", "TASKLET" ]
-`
-
-func (s *Interrupts) Description() string {
-	return "This plugin gathers interrupts data from /proc/interrupts and /proc/softirqs."
-}
-
-func (s *Interrupts) SampleConfig() string {
+func (*Interrupts) SampleConfig() string {
 	return sampleConfig
 }
 
-func parseInterrupts(r io.Reader) ([]IRQ, error) {
-	var irqs []IRQ
+func (s *Interrupts) Gather(acc telegraf.Accumulator) error {
+	for measurement, file := range map[string]string{"interrupts": "/proc/interrupts", "soft_interrupts": "/proc/softirqs"} {
+		irqs, err := parseFile(file)
+		if err != nil {
+			acc.AddError(err)
+			continue
+		}
+		reportMetrics(measurement, irqs, acc, s.CPUAsTag)
+	}
+	return nil
+}
+
+func parseInterrupts(r io.Reader) ([]irq, error) {
+	var irqs []irq
 	var cpucount int
 	scanner := bufio.NewScanner(r)
 	if scanner.Scan() {
@@ -69,7 +64,7 @@ scan:
 			continue
 		}
 		irqid := strings.TrimRight(fields[0], ":")
-		irq := NewIRQ(irqid)
+		irq := newIRQ(irqid)
 		irqvals := fields[1:]
 		for i := 0; i < cpucount; i++ {
 			if i < len(irqvals) {
@@ -77,50 +72,38 @@ scan:
 				if err != nil {
 					continue scan
 				}
-				irq.Cpus = append(irq.Cpus, irqval)
+				irq.cpus = append(irq.cpus, irqval)
 			}
 		}
-		for _, irqval := range irq.Cpus {
-			irq.Total += irqval
+		for _, irqval := range irq.cpus {
+			irq.total += irqval
 		}
 		_, err := strconv.ParseInt(irqid, 10, 64)
 		if err == nil && len(fields) >= cpucount+2 {
-			irq.Type = fields[cpucount+1]
-			irq.Device = strings.Join(fields[cpucount+2:], " ")
+			irq.typ = fields[cpucount+1]
+			irq.device = strings.Join(fields[cpucount+2:], " ")
 		} else if len(fields) > cpucount {
-			irq.Type = strings.Join(fields[cpucount+1:], " ")
+			irq.typ = strings.Join(fields[cpucount+1:], " ")
 		}
 		irqs = append(irqs, *irq)
 	}
 	if scanner.Err() != nil {
-		return nil, fmt.Errorf("error scanning file: %s", scanner.Err())
+		return nil, fmt.Errorf("error scanning file: %w", scanner.Err())
 	}
 	return irqs, nil
 }
 
-func gatherTagsFields(irq IRQ) (map[string]string, map[string]interface{}) {
-	tags := map[string]string{"irq": irq.ID, "type": irq.Type, "device": irq.Device}
-	fields := map[string]interface{}{"total": irq.Total}
-	for i := 0; i < len(irq.Cpus); i++ {
+func gatherTagsFields(irq irq) (map[string]string, map[string]interface{}) {
+	tags := map[string]string{"irq": irq.id, "type": irq.typ, "device": irq.device}
+	fields := map[string]interface{}{"total": irq.total}
+	for i := 0; i < len(irq.cpus); i++ {
 		cpu := fmt.Sprintf("CPU%d", i)
-		fields[cpu] = irq.Cpus[i]
+		fields[cpu] = irq.cpus[i]
 	}
 	return tags, fields
 }
 
-func (s *Interrupts) Gather(acc telegraf.Accumulator) error {
-	for measurement, file := range map[string]string{"interrupts": "/proc/interrupts", "soft_interrupts": "/proc/softirqs"} {
-		irqs, err := parseFile(file)
-		if err != nil {
-			acc.AddError(err)
-			continue
-		}
-		reportMetrics(measurement, irqs, acc, s.CPUAsTag)
-	}
-	return nil
-}
-
-func parseFile(file string) ([]IRQ, error) {
+func parseFile(file string) ([]irq, error) {
 	f, err := os.Open(file)
 	if err != nil {
 		return nil, fmt.Errorf("could not open file: %s", file)
@@ -129,16 +112,16 @@ func parseFile(file string) ([]IRQ, error) {
 
 	irqs, err := parseInterrupts(f)
 	if err != nil {
-		return nil, fmt.Errorf("parsing %s: %s", file, err)
+		return nil, fmt.Errorf("parsing %q: %w", file, err)
 	}
 	return irqs, nil
 }
 
-func reportMetrics(measurement string, irqs []IRQ, acc telegraf.Accumulator, cpusAsTags bool) {
+func reportMetrics(measurement string, irqs []irq, acc telegraf.Accumulator, cpusAsTags bool) {
 	for _, irq := range irqs {
 		tags, fields := gatherTagsFields(irq)
 		if cpusAsTags {
-			for cpu, count := range irq.Cpus {
+			for cpu, count := range irq.cpus {
 				cpuTags := map[string]string{"cpu": fmt.Sprintf("cpu%d", cpu)}
 				for k, v := range tags {
 					cpuTags[k] = v
@@ -149,6 +132,10 @@ func reportMetrics(measurement string, irqs []IRQ, acc telegraf.Accumulator, cpu
 			acc.AddFields(measurement, fields, tags)
 		}
 	}
+}
+
+func newIRQ(id string) *irq {
+	return &irq{id: id}
 }
 
 func init() {

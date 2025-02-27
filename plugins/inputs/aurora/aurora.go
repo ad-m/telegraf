@@ -1,7 +1,9 @@
+//go:generate ../../../tools/readme_config_includer/generator
 package aurora
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,19 +18,22 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-type RoleType int
+//go:embed sample.conf
+var sampleConfig string
+
+type roleType int
 
 const (
-	Unknown RoleType = iota
-	Leader
-	Follower
+	unknown roleType = iota
+	leader
+	follower
 )
 
-func (r RoleType) String() string {
+func (r roleType) String() string {
 	switch r {
-	case Leader:
+	case leader:
 		return "leader"
-	case Follower:
+	case follower:
 		return "follower"
 	default:
 		return "unknown"
@@ -40,7 +45,7 @@ var (
 	defaultRoles   = []string{"leader", "follower"}
 )
 
-type Vars map[string]interface{}
+type vars map[string]interface{}
 
 type Aurora struct {
 	Schedulers []string        `toml:"schedulers"`
@@ -54,37 +59,8 @@ type Aurora struct {
 	urls   []*url.URL
 }
 
-var sampleConfig = `
-  ## Schedulers are the base addresses of your Aurora Schedulers
-  schedulers = ["http://127.0.0.1:8081"]
-
-  ## Set of role types to collect metrics from.
-  ##
-  ## The scheduler roles are checked each interval by contacting the
-  ## scheduler nodes; zookeeper is not contacted.
-  # roles = ["leader", "follower"]
-
-  ## Timeout is the max time for total network operations.
-  # timeout = "5s"
-
-  ## Username and password are sent using HTTP Basic Auth.
-  # username = "username"
-  # password = "pa$$word"
-
-  ## Optional TLS Config
-  # tls_ca = "/etc/telegraf/ca.pem"
-  # tls_cert = "/etc/telegraf/cert.pem"
-  # tls_key = "/etc/telegraf/key.pem"
-  ## Use TLS but skip chain & host verification
-  # insecure_skip_verify = false
-`
-
-func (a *Aurora) SampleConfig() string {
+func (*Aurora) SampleConfig() string {
 	return sampleConfig
-}
-
-func (a *Aurora) Description() string {
-	return "Gather metrics from Apache Aurora schedulers"
 }
 
 func (a *Aurora) Gather(acc telegraf.Accumulator) error {
@@ -105,7 +81,7 @@ func (a *Aurora) Gather(acc telegraf.Accumulator) error {
 			defer wg.Done()
 			role, err := a.gatherRole(ctx, u)
 			if err != nil {
-				acc.AddError(fmt.Errorf("%s: %v", u, err))
+				acc.AddError(fmt.Errorf("%s: %w", u, err))
 				return
 			}
 
@@ -115,7 +91,7 @@ func (a *Aurora) Gather(acc telegraf.Accumulator) error {
 
 			err = a.gatherScheduler(ctx, u, role, acc)
 			if err != nil {
-				acc.AddError(fmt.Errorf("%s: %v", u, err))
+				acc.AddError(fmt.Errorf("%s: %w", u, err))
 			}
 		}(u)
 	}
@@ -160,7 +136,7 @@ func (a *Aurora) initialize() error {
 	return nil
 }
 
-func (a *Aurora) roleEnabled(role RoleType) bool {
+func (a *Aurora) roleEnabled(role roleType) bool {
 	if len(a.Roles) == 0 {
 		return true
 	}
@@ -173,12 +149,12 @@ func (a *Aurora) roleEnabled(role RoleType) bool {
 	return false
 }
 
-func (a *Aurora) gatherRole(ctx context.Context, origin *url.URL) (RoleType, error) {
+func (a *Aurora) gatherRole(ctx context.Context, origin *url.URL) (roleType, error) {
 	loc := *origin
 	loc.Path = "leaderhealth"
 	req, err := http.NewRequest("GET", loc.String(), nil)
 	if err != nil {
-		return Unknown, err
+		return unknown, err
 	}
 
 	if a.Username != "" || a.Password != "" {
@@ -188,26 +164,26 @@ func (a *Aurora) gatherRole(ctx context.Context, origin *url.URL) (RoleType, err
 
 	resp, err := a.client.Do(req.WithContext(ctx))
 	if err != nil {
-		return Unknown, err
+		return unknown, err
 	}
 	if err := resp.Body.Close(); err != nil {
-		return Unknown, fmt.Errorf("closing body failed: %v", err)
+		return unknown, fmt.Errorf("closing body failed: %w", err)
 	}
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return Leader, nil
+		return leader, nil
 	case http.StatusBadGateway:
 		fallthrough
 	case http.StatusServiceUnavailable:
-		return Follower, nil
+		return follower, nil
 	default:
-		return Unknown, fmt.Errorf("%v", resp.Status)
+		return unknown, fmt.Errorf("%v", resp.Status)
 	}
 }
 
 func (a *Aurora) gatherScheduler(
-	ctx context.Context, origin *url.URL, role RoleType, acc telegraf.Accumulator,
+	ctx context.Context, origin *url.URL, role roleType, acc telegraf.Accumulator,
 ) error {
 	loc := *origin
 	loc.Path = "vars.json"
@@ -231,16 +207,16 @@ func (a *Aurora) gatherScheduler(
 		return fmt.Errorf("%v", resp.Status)
 	}
 
-	var vars Vars
+	var metrics vars
 	decoder := json.NewDecoder(resp.Body)
 	decoder.UseNumber()
-	err = decoder.Decode(&vars)
+	err = decoder.Decode(&metrics)
 	if err != nil {
-		return fmt.Errorf("decoding response: %v", err)
+		return fmt.Errorf("decoding response: %w", err)
 	}
 
-	var fields = make(map[string]interface{}, len(vars))
-	for k, v := range vars {
+	var fields = make(map[string]interface{}, len(metrics))
+	for k, v := range metrics {
 		switch v := v.(type) {
 		case json.Number:
 			// Aurora encodes numbers as you would specify them as a literal,

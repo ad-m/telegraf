@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/influxdata/telegraf"
+	logging "github.com/influxdata/telegraf/logger"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/selfstat"
 )
@@ -30,11 +31,13 @@ func NewRunningAggregator(aggregator telegraf.Aggregator, config *AggregatorConf
 	}
 
 	aggErrorsRegister := selfstat.Register("aggregate", "errors", tags)
-	logger := NewLogger("aggregators", config.Name, config.Alias)
-	logger.OnErr(func() {
+	logger := logging.New("aggregators", config.Name, config.Alias)
+	logger.RegisterErrorCallback(func() {
 		aggErrorsRegister.Incr(1)
 	})
-
+	if err := logger.SetLogLevel(config.LogLevel); err != nil {
+		logger.Error(err)
+	}
 	SetLoggerOnPlugin(aggregator, logger)
 
 	return &RunningAggregator{
@@ -67,11 +70,14 @@ func NewRunningAggregator(aggregator telegraf.Aggregator, config *AggregatorConf
 // AggregatorConfig is the common config for all aggregators.
 type AggregatorConfig struct {
 	Name         string
+	Source       string
 	Alias        string
+	ID           string
 	DropOriginal bool
 	Period       time.Duration
 	Delay        time.Duration
 	Grace        time.Duration
+	LogLevel     string
 
 	NameOverride      string
 	MeasurementPrefix string
@@ -94,6 +100,13 @@ func (r *RunningAggregator) Init() error {
 	return nil
 }
 
+func (r *RunningAggregator) ID() string {
+	if p, ok := r.Aggregator.(telegraf.PluginWithID); ok {
+		return p.ID()
+	}
+	return r.Config.ID
+}
+
 func (r *RunningAggregator) Period() time.Duration {
 	return r.Config.Period
 }
@@ -108,9 +121,9 @@ func (r *RunningAggregator) UpdateWindow(start, until time.Time) {
 	r.log.Debugf("Updated aggregation range [%s, %s]", start, until)
 }
 
-func (r *RunningAggregator) MakeMetric(metric telegraf.Metric) telegraf.Metric {
-	m := makemetric(
-		metric,
+func (r *RunningAggregator) MakeMetric(telegrafMetric telegraf.Metric) telegraf.Metric {
+	m := makeMetric(
+		telegrafMetric,
 		r.Config.NameOverride,
 		r.Config.MeasurementPrefix,
 		r.Config.MeasurementSuffix,
@@ -125,7 +138,10 @@ func (r *RunningAggregator) MakeMetric(metric telegraf.Metric) telegraf.Metric {
 // Add a metric to the aggregator and return true if the original metric
 // should be dropped.
 func (r *RunningAggregator) Add(m telegraf.Metric) bool {
-	if ok := r.Config.Filter.Select(m); !ok {
+	ok, err := r.Config.Filter.Select(m)
+	if err != nil {
+		r.log.Errorf("filtering failed: %v", err)
+	} else if !ok {
 		return false
 	}
 
@@ -163,15 +179,11 @@ func (r *RunningAggregator) Push(acc telegraf.Accumulator) {
 	until := r.periodEnd.Add(r.Config.Period)
 	r.UpdateWindow(since, until)
 
-	r.push(acc)
-	r.Aggregator.Reset()
-}
-
-func (r *RunningAggregator) push(acc telegraf.Accumulator) {
 	start := time.Now()
 	r.Aggregator.Push(acc)
 	elapsed := time.Since(start)
 	r.PushTime.Incr(elapsed.Nanoseconds())
+	r.Aggregator.Reset()
 }
 
 func (r *RunningAggregator) Log() telegraf.Logger {

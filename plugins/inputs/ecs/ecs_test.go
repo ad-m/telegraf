@@ -1,11 +1,10 @@
 package ecs
 
 import (
-	"os"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/stretchr/testify/require"
 )
 
@@ -15,19 +14,27 @@ import (
 const pauseStatsKey = "e6af031b91deb3136a2b7c42f262ed2ab554e2fe2736998c7d8edf4afe708dba"
 const nginxStatsKey = "fffe894e232d46c76475cfeabf4907f712e8b92618a37fca3ef0805bbbfb0299"
 
-var pauseStatsRead, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:40:00.936081344Z")
-var pauseStatsPreRead, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:39:59.933000984Z")
+var pauseStatsRead = mustParseNano("2018-11-19T15:40:00.936081344Z")
+var pauseStatsPreRead = mustParseNano("2018-11-19T15:39:59.933000984Z")
 
-var nginxStatsRead, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:40:00.93733207Z")
-var nginxStatsPreRead, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:39:59.934291009Z")
+var nginxStatsRead = mustParseNano("2018-11-19T15:40:00.93733207Z")
+var nginxStatsPreRead = mustParseNano("2018-11-19T15:39:59.934291009Z")
 
-var validStats = map[string]types.StatsJSON{
+func mustParseNano(value string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+var validStats = map[string]*container.StatsResponse{
 	pauseStatsKey: {
-		Stats: types.Stats{
+		Stats: container.Stats{
 			Read:    pauseStatsRead,
 			PreRead: pauseStatsPreRead,
-			BlkioStats: types.BlkioStats{
-				IoServiceBytesRecursive: []types.BlkioStatEntry{
+			BlkioStats: container.BlkioStats{
+				IoServiceBytesRecursive: []container.BlkioStatEntry{
 					{
 						Major: 202,
 						Minor: 26368,
@@ -141,7 +148,7 @@ var validStats = map[string]types.StatsJSON{
 						Value: 790528,
 					},
 				},
-				IoServicedRecursive: []types.BlkioStatEntry{
+				IoServicedRecursive: []container.BlkioStatEntry{
 					{
 						Major: 202,
 						Minor: 26368,
@@ -256,8 +263,8 @@ var validStats = map[string]types.StatsJSON{
 					},
 				},
 			},
-			CPUStats: types.CPUStats{
-				CPUUsage: types.CPUUsage{
+			CPUStats: container.CPUStats{
+				CPUUsage: container.CPUUsage{
 					PercpuUsage: []uint64{
 						26426156,
 						0,
@@ -280,10 +287,10 @@ var validStats = map[string]types.StatsJSON{
 				},
 				SystemUsage:    2336100000000,
 				OnlineCPUs:     1,
-				ThrottlingData: types.ThrottlingData{},
+				ThrottlingData: container.ThrottlingData{},
 			},
-			PreCPUStats: types.CPUStats{
-				CPUUsage: types.CPUUsage{
+			PreCPUStats: container.CPUStats{
+				CPUUsage: container.CPUUsage{
 					PercpuUsage: []uint64{
 						26426156,
 						0,
@@ -306,9 +313,9 @@ var validStats = map[string]types.StatsJSON{
 				},
 				SystemUsage:    2335090000000,
 				OnlineCPUs:     1,
-				ThrottlingData: types.ThrottlingData{},
+				ThrottlingData: container.ThrottlingData{},
 			},
-			MemoryStats: types.MemoryStats{
+			MemoryStats: container.MemoryStats{
 				Stats: map[string]uint64{
 					"cache":                     790528,
 					"mapped_file":               618496,
@@ -337,7 +344,7 @@ var validStats = map[string]types.StatsJSON{
 				Limit:    1033658368,
 			},
 		},
-		Networks: map[string]types.NetworkStats{
+		Networks: map[string]container.NetworkStats{
 			"eth0": {
 				RxBytes:   uint64(5338),
 				RxDropped: uint64(0),
@@ -361,11 +368,11 @@ var validStats = map[string]types.StatsJSON{
 		},
 	},
 	nginxStatsKey: {
-		Stats: types.Stats{
+		Stats: container.Stats{
 			Read:    nginxStatsRead,
 			PreRead: nginxStatsPreRead,
-			BlkioStats: types.BlkioStats{
-				IoServiceBytesRecursive: []types.BlkioStatEntry{
+			BlkioStats: container.BlkioStats{
+				IoServiceBytesRecursive: []container.BlkioStatEntry{
 					{
 						Major: 202,
 						Minor: 26368,
@@ -479,7 +486,7 @@ var validStats = map[string]types.StatsJSON{
 						Value: 5730304,
 					},
 				},
-				IoServicedRecursive: []types.BlkioStatEntry{
+				IoServicedRecursive: []container.BlkioStatEntry{
 					{
 						Major: 202,
 						Minor: 26368,
@@ -594,8 +601,8 @@ var validStats = map[string]types.StatsJSON{
 					},
 				},
 			},
-			CPUStats: types.CPUStats{
-				CPUUsage: types.CPUUsage{
+			CPUStats: container.CPUStats{
+				CPUUsage: container.CPUUsage{
 					PercpuUsage: []uint64{
 						65599511,
 						0,
@@ -619,10 +626,10 @@ var validStats = map[string]types.StatsJSON{
 				},
 				SystemUsage:    2336100000000,
 				OnlineCPUs:     1,
-				ThrottlingData: types.ThrottlingData{},
+				ThrottlingData: container.ThrottlingData{},
 			},
-			PreCPUStats: types.CPUStats{
-				CPUUsage: types.CPUUsage{
+			PreCPUStats: container.CPUStats{
+				CPUUsage: container.CPUUsage{
 					PercpuUsage: []uint64{
 						65599511,
 						0,
@@ -646,9 +653,9 @@ var validStats = map[string]types.StatsJSON{
 				},
 				SystemUsage:    2335090000000,
 				OnlineCPUs:     1,
-				ThrottlingData: types.ThrottlingData{},
+				ThrottlingData: container.ThrottlingData{},
 			},
-			MemoryStats: types.MemoryStats{
+			MemoryStats: container.MemoryStats{
 				Stats: map[string]uint64{
 					"cache":                     5787648,
 					"mapped_file":               3616768,
@@ -683,21 +690,21 @@ var validStats = map[string]types.StatsJSON{
 }
 
 // meta
-var metaPauseCreated, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:31:26.641964373Z")
-var metaPauseStarted, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:31:27.035698679Z")
-var metaCreated, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:31:27.614884084Z")
-var metaStarted, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:31:27.975996351Z")
-var metaPullStart, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:31:27.197327103Z")
-var metaPullStop, _ = time.Parse(time.RFC3339Nano, "2018-11-19T15:31:27.609089471Z")
+var metaPauseCreated = mustParseNano("2018-11-19T15:31:26.641964373Z")
+var metaPauseStarted = mustParseNano("2018-11-19T15:31:27.035698679Z")
+var metaCreated = mustParseNano("2018-11-19T15:31:27.614884084Z")
+var metaStarted = mustParseNano("2018-11-19T15:31:27.975996351Z")
+var metaPullStart = mustParseNano("2018-11-19T15:31:27.197327103Z")
+var metaPullStop = mustParseNano("2018-11-19T15:31:27.609089471Z")
 
-var validMeta = Task{
+var validMeta = ecsTask{
 	Cluster:       "test",
 	TaskARN:       "arn:aws:ecs:aws-region-1:012345678901:task/a1234abc-a0a0-0a01-ab01-0abc012a0a0a",
 	Family:        "nginx",
 	Revision:      "2",
 	DesiredStatus: "RUNNING",
 	KnownStatus:   "RUNNING",
-	Containers: []Container{
+	Containers: []ecsContainer{
 		{
 			ID:         pauseStatsKey,
 			Name:       "~internal~ecs~pause",
@@ -720,7 +727,7 @@ var validMeta = Task{
 			CreatedAt: metaPauseCreated,
 			StartedAt: metaPauseStarted,
 			Type:      "CNI_PAUSE",
-			Networks: []Network{
+			Networks: []network{
 				{
 					NetworkMode: "awsvpc",
 					IPv4Addresses: []string{
@@ -751,7 +758,7 @@ var validMeta = Task{
 			CreatedAt: metaCreated,
 			StartedAt: metaStarted,
 			Type:      "NORMAL",
-			Networks: []Network{
+			Networks: []network{
 				{
 					NetworkMode: "awsvpc",
 					IPv4Addresses: []string{
@@ -774,8 +781,7 @@ func TestResolveEndpoint(t *testing.T) {
 		name   string
 		given  Ecs
 		exp    Ecs
-		preF   func()
-		afterF func()
+		setEnv func(*testing.T)
 	}{
 		{
 			name: "Endpoint is explicitly set => use v2 metadata",
@@ -799,11 +805,8 @@ func TestResolveEndpoint(t *testing.T) {
 		},
 		{
 			name: "Endpoint is not set, ECS_CONTAINER_METADATA_URI is set => use v3 metadata",
-			preF: func() {
-				require.NoError(t, os.Setenv("ECS_CONTAINER_METADATA_URI", "v3-endpoint.local"))
-			},
-			afterF: func() {
-				require.NoError(t, os.Unsetenv("ECS_CONTAINER_METADATA_URI"))
+			setEnv: func(t *testing.T) {
+				t.Setenv("ECS_CONTAINER_METADATA_URI", "v3-endpoint.local")
 			},
 			given: Ecs{
 				EndpointURL: "",
@@ -813,14 +816,24 @@ func TestResolveEndpoint(t *testing.T) {
 				metadataVersion: 3,
 			},
 		},
+		{
+			name: "Endpoint is not set, ECS_CONTAINER_METADATA_URI_V4 is set => use v4 metadata",
+			setEnv: func(t *testing.T) {
+				t.Setenv("ECS_CONTAINER_METADATA_URI_V4", "v4-endpoint.local")
+			},
+			given: Ecs{
+				EndpointURL: "",
+			},
+			exp: Ecs{
+				EndpointURL:     "v4-endpoint.local",
+				metadataVersion: 4,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.preF != nil {
-				tt.preF()
-			}
-			if tt.afterF != nil {
-				defer tt.afterF()
+			if tt.setEnv != nil {
+				tt.setEnv(t)
 			}
 
 			act := tt.given

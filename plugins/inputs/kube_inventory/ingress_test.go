@@ -4,18 +4,15 @@ import (
 	"testing"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
+	"github.com/stretchr/testify/require"
 	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/testutil"
-	"github.com/stretchr/testify/require"
 )
 
 func TestIngress(t *testing.T) {
-	cli := &client{}
-
 	now := time.Now()
 	now = time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 1, 36, 0, now.Location())
 
@@ -42,8 +39,8 @@ func TestIngress(t *testing.T) {
 						Items: []netv1.Ingress{
 							{
 								Status: netv1.IngressStatus{
-									LoadBalancer: v1.LoadBalancerStatus{
-										Ingress: []v1.LoadBalancerIngress{
+									LoadBalancer: netv1.IngressLoadBalancerStatus{
+										Ingress: []netv1.IngressLoadBalancerIngress{
 											{
 												Hostname: "chron-1",
 												IP:       "1.0.0.127",
@@ -117,8 +114,8 @@ func TestIngress(t *testing.T) {
 						Items: []netv1.Ingress{
 							{
 								Status: netv1.IngressStatus{
-									LoadBalancer: v1.LoadBalancerStatus{
-										Ingress: []v1.LoadBalancerIngress{
+									LoadBalancer: netv1.IngressLoadBalancerStatus{
+										Ingress: []netv1.IngressLoadBalancerIngress{
 											{
 												Hostname: "chron-1",
 												IP:       "1.0.0.127",
@@ -157,8 +154,8 @@ func TestIngress(t *testing.T) {
 						Items: []netv1.Ingress{
 							{
 								Status: netv1.IngressStatus{
-									LoadBalancer: v1.LoadBalancerStatus{
-										Ingress: []v1.LoadBalancerIngress{
+									LoadBalancer: netv1.IngressLoadBalancerStatus{
+										Ingress: []netv1.IngressLoadBalancerIngress{
 											{
 												Hostname: "chron-1",
 												IP:       "1.0.0.127",
@@ -220,12 +217,9 @@ func TestIngress(t *testing.T) {
 	}
 
 	for _, v := range tests {
-		ks := &KubernetesInventory{
-			client: cli,
-		}
 		acc := new(testutil.Accumulator)
 		for _, ingress := range ((v.handler.responseMap["/ingress/"]).(netv1.IngressList)).Items {
-			ks.gatherIngress(ingress, acc)
+			gatherIngress(ingress, acc)
 		}
 
 		err := acc.FirstError()

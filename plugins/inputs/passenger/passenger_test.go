@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf/testutil"
@@ -20,13 +19,14 @@ func fakePassengerStatus(stat string) (string, error) {
 		fileExtension = ".bat"
 		content = "@echo off\n"
 		for _, line := range strings.Split(strings.TrimSuffix(stat, "\n"), "\n") {
-			content += "for /f \"delims=\" %%A in (\"" + line + "\") do echo %%~A\n" //my eyes are bleeding
+			content += "for /f \"delims=\" %%A in (\"" + line + "\") do echo %%~A\n" // my eyes are bleeding
 		}
 	} else {
 		content = fmt.Sprintf("#!/bin/sh\ncat << EOF\n%s\nEOF", stat)
 	}
 
 	tempFilePath := filepath.Join(os.TempDir(), "passenger-status"+fileExtension)
+	//nolint:gosec // G306: Expect WriteFile permissions to be 0640 or less - this file needs to be executed
 	if err := os.WriteFile(tempFilePath, []byte(content), 0700); err != nil {
 		return "", err
 	}
@@ -35,13 +35,11 @@ func fakePassengerStatus(stat string) (string, error) {
 }
 
 func teardown(tempFilePath string) {
-	// Ignore the returned error as we want to remove the file and ignore missing file errors
-	//nolint:errcheck,revive
 	os.Remove(tempFilePath)
 }
 
 func Test_Invalid_Passenger_Status_Cli(t *testing.T) {
-	r := &passenger{
+	r := &Passenger{
 		Command: "an-invalid-command passenger-status",
 	}
 
@@ -49,7 +47,7 @@ func Test_Invalid_Passenger_Status_Cli(t *testing.T) {
 
 	err := r.Gather(&acc)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `exec: "an-invalid-command": executable file not found in `)
+	require.Contains(t, err.Error(), `exec: "an-invalid-command": executable file not found in `)
 }
 
 func Test_Invalid_Xml(t *testing.T) {
@@ -57,7 +55,7 @@ func Test_Invalid_Xml(t *testing.T) {
 	require.NoError(t, err)
 	defer teardown(tempFilePath)
 
-	r := &passenger{
+	r := &Passenger{
 		Command: tempFilePath,
 	}
 
@@ -65,7 +63,7 @@ func Test_Invalid_Xml(t *testing.T) {
 
 	err = r.Gather(&acc)
 	require.Error(t, err)
-	assert.Equal(t, "cannot parse input with error: EOF", err.Error())
+	require.Equal(t, "cannot parse input with error: EOF", err.Error())
 }
 
 // We test this by ensure that the error message match the path of default cli
@@ -74,13 +72,13 @@ func Test_Default_Config_Load_Default_Command(t *testing.T) {
 	require.NoError(t, err)
 	defer teardown(tempFilePath)
 
-	r := &passenger{}
+	r := &Passenger{}
 
 	var acc testutil.Accumulator
 
 	err = r.Gather(&acc)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exec: \"passenger-status\": executable file not found in ")
+	require.Contains(t, err.Error(), "exec: \"passenger-status\": executable file not found in ")
 }
 
 func TestPassengerGenerateMetric(t *testing.T) {
@@ -88,8 +86,8 @@ func TestPassengerGenerateMetric(t *testing.T) {
 	require.NoError(t, err)
 	defer teardown(tempFilePath)
 
-	//Now we tested again above server, with our authentication data
-	r := &passenger{
+	// Now we tested again above server, with our authentication data
+	r := &Passenger{
 		Command: tempFilePath,
 	}
 
